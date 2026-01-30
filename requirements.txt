@@ -1,0 +1,44 @@
+# ============================================
+# Hi-Control Backend - Requirements (Vercel Serverless)
+# ============================================
+# Versão FLEXÍVEL para resolução automática do UV
+# ============================================
+
+# Core
+fastapi>=0.111.0
+uvicorn>=0.30.0
+python-multipart
+
+# Pydantic
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# Security
+bcrypt
+passlib
+python-jose
+cryptography
+pyOpenSSL
+
+# Supabase - Deixar resolver deps transitivas (gotrue, storage3, etc)
+supabase>=2.5.0
+
+# Utils
+python-dotenv
+python-dateutil
+typing_extensions
+annotated-types
+
+# Common
+anyio
+click
+sniffio
+h11
+starlette  # Deixar o FastAPI puxar a versão correta
+
+# XML & Validation (No C deps)
+lxml==5.1.0
+defusedxml
+# Validation
+validate-docbr
+email-validator

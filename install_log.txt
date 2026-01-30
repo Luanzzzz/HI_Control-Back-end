@@ -1,0 +1,79 @@
+Collecting fastapi==0.104.1
+  Using cached fastapi-0.104.1-py3-none-any.whl.metadata (24 kB)
+Collecting uvicorn==0.24.0
+  Using cached uvicorn-0.24.0-py3-none-any.whl.metadata (6.4 kB)
+Collecting pydantic==2.5.0
+  Using cached pydantic-2.5.0-py3-none-any.whl.metadata (174 kB)
+Collecting pydantic-settings==2.1.0
+  Using cached pydantic_settings-2.1.0-py3-none-any.whl.metadata (2.9 kB)
+Collecting python-multipart==0.0.6
+  Using cached python_multipart-0.0.6-py3-none-any.whl.metadata (2.5 kB)
+Collecting python-jose==3.3.0 (from python-jose[cryptography]==3.3.0)
+  Using cached python_jose-3.3.0-py2.py3-none-any.whl.metadata (5.4 kB)
+Collecting passlib==1.7.4
+  Using cached passlib-1.7.4-py2.py3-none-any.whl.metadata (1.7 kB)
+Requirement already satisfied: supabase==2.3.0 in d:\projetos\hi_control\backend\venv\lib\site-packages (2.3.0)
+Collecting python-dotenv==1.0.0
+  Using cached python_dotenv-1.0.0-py3-none-any.whl.metadata (21 kB)
+Collecting httpx==0.25.2
+  Using cached httpx-0.25.2-py3-none-any.whl.metadata (6.9 kB)
+Collecting anyio<4.0.0,>=3.7.1 (from fastapi==0.104.1)
+  Using cached anyio-3.7.1-py3-none-any.whl.metadata (4.7 kB)
+Collecting starlette<0.28.0,>=0.27.0 (from fastapi==0.104.1)
+  Using cached starlette-0.27.0-py3-none-any.whl.metadata (5.8 kB)
+Requirement already satisfied: typing-extensions>=4.8.0 in d:\projetos\hi_control\backend\venv\lib\site-packages (from fastapi==0.104.1) (4.15.0)
+Requirement already satisfied: annotated-types>=0.4.0 in d:\projetos\hi_control\backend\venv\lib\site-packages (from pydantic==2.5.0) (0.7.0)
+Collecting pydantic-core==2.14.1 (from pydantic==2.5.0)
+  Using cached pydantic_core-2.14.1.tar.gz (359 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Installing backend dependencies: started
+  Installing backend dependencies: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  Preparing metadata (pyproject.toml) did not run successfully.
+  exit code: 1
+  
+  [24 lines of output]
+  Python reports SOABI: cp313-win_amd64
+  Computed rustc target triple: x86_64-pc-windows-msvc
+  Installation directory: C:\Users\Luan\AppData\Local\puccinialin\puccinialin\Cache
+  Rustup already downloaded
+  Installing rust to C:\Users\Luan\AppData\Local\puccinialin\puccinialin\Cache\rustup
+  warn: It looks like you have an existing rustup settings file at:
+  warn: C:\Users\Luan\.rustup\settings.toml
+  warn: Rustup will install the default toolchain as specified in the settings file,
+  warn: instead of the one inferred from the default host triple.
+  warn: installing msvc toolchain without its prerequisites
+  info: profile set to 'minimal'
+  info: default host triple is x86_64-pc-windows-msvc
+  warn: Updating existing toolchain, profile choice will be ignored
+  info: syncing channel updates for 'stable-x86_64-pc-windows-msvc'
+  info: default toolchain set to 'stable-x86_64-pc-windows-msvc'
+  Checking if cargo is installed
+  cargo 1.93.0 (083ac5135 2025-12-15)
+  
+  Cargo, the Rust package manager, is not installed or is not on PATH.
+  This package requires Rust and Cargo to compile extensions. Install it through
+  the system's package manager or via https://rustup.rs/
+  
+  Checking for Rust toolchain....
+  Rust not found, installing into a temporary directory
+  [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+
+[notice] A new release of pip is available: 25.1.1 -> 25.3
+[notice] To update, run: D:\Projetos\Hi_Control\backend\venv\Scripts\python.exe -m pip install --upgrade pip
+error: metadata-generation-failed
+
+Encountered error while generating package metadata.
+
+See above for output.
+
+note: This is an issue with the package mentioned above, not pip.
+hint: See above for details.
