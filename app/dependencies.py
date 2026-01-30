@@ -111,6 +111,17 @@ async def verificar_acesso_modulo(
     Raises:
         HTTPException 403: Se usuário não tem acesso ao módulo
     """
+    # 🚧 BYPASS para desenvolvimento: permite acesso a todos os módulos
+    # Em produção, DEVE ter DISABLE_MODULE_CHECK=false ou não definido
+    import os
+    if os.getenv("DISABLE_MODULE_CHECK", "false").lower() == "true":
+        logger.warning(
+            f"⚠️ MÓDULO '{modulo}' - Verificação DESABILITADA (DISABLE_MODULE_CHECK=true). "
+            f"Usuário {usuario.get('email')} tem acesso IRRESTRITO. "
+            f"ATENÇÃO: Isso NÃO deve estar ativo em produção!"
+        )
+        return True
+
     try:
         # Buscar assinatura ativa do usuário
         response = db.table("assinaturas")\
