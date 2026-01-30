@@ -30,7 +30,7 @@ from app.services.certificado_service import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/certificados", tags=["Certificados Digitais"])
+router = APIRouter(tags=["Certificados Digitais"])
 
 
 # ============================================

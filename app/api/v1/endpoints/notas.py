@@ -17,7 +17,7 @@ from app.models.nota_fiscal import (
 )
 from app.services.busca_nf_service import busca_nf_service
 
-router = APIRouter(prefix="/notas", tags=["Notas Fiscais"])
+router = APIRouter(tags=["Notas Fiscais"])
 
 
 @router.get("/buscar", response_model=List[NotaFiscalResponse])
