@@ -44,17 +44,32 @@ class PlanLimits:
 async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
     """
     Busca plano ativo do usuário com seus limites.
-    
+
     Args:
         usuario_id: UUID do usuário
         db: Cliente Supabase
-    
+
     Returns:
         Dict com 'nome', 'limites', 'assinatura_id', 'modulos'
-    
+
     Raises:
         HTTPException 403: Se nenhuma assinatura ativa encontrada
     """
+    # BYPASS PARA DESENVOLVIMENTO - Retornar plano Enterprise fictício
+    import os
+    if os.getenv("ENVIRONMENT") == "development":
+        logger.warning(
+            f"🔓 [DEV MODE] Bypass de validação de assinatura ativo para usuário {usuario_id}. "
+            f"Retornando plano ENTERPRISE fictício. "
+            f"⚠️ ATENÇÃO: Isso NÃO deve estar ativo em produção!"
+        )
+        return {
+            "nome": "enterprise",
+            "limites": PlanLimits.ENTERPRISE,
+            "assinatura_id": "dev-mock-assinatura-id",
+            "modulos": ["nfe_emissao", "nfe_consulta", "certificados", "relatorios", "api_acesso"]
+        }
+
     try:
         # Buscar assinatura ativa com plano
         response = db.table("assinaturas")\
@@ -63,7 +78,7 @@ async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
             .eq("status", "ativa")\
             .gte("data_fim", datetime.now().date().isoformat())\
             .execute()
-        
+
         if not response.data or len(response.data) == 0:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

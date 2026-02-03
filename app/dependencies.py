@@ -114,11 +114,15 @@ async def verificar_acesso_modulo(
     # 🚧 BYPASS para desenvolvimento: permite acesso a todos os módulos
     # Em produção, DEVE ter DISABLE_MODULE_CHECK=false ou não definido
     import os
-    if os.getenv("DISABLE_MODULE_CHECK", "false").lower() == "true":
+    # Bypass em ambiente de desenvolvimento OU se DISABLE_MODULE_CHECK=true
+    if (os.getenv("ENVIRONMENT") == "development" or
+        os.getenv("DISABLE_MODULE_CHECK", "false").lower() == "true"):
         logger.warning(
-            f"⚠️ MÓDULO '{modulo}' - Verificação DESABILITADA (DISABLE_MODULE_CHECK=true). "
+            f"🔓 [DEV MODE] MÓDULO '{modulo}' - Verificação DESABILITADA. "
             f"Usuário {usuario.get('email')} tem acesso IRRESTRITO. "
-            f"ATENÇÃO: Isso NÃO deve estar ativo em produção!"
+            f"Ambiente: {os.getenv('ENVIRONMENT', 'unknown')} | "
+            f"DISABLE_MODULE_CHECK: {os.getenv('DISABLE_MODULE_CHECK', 'false')} | "
+            f"⚠️ ATENÇÃO: Isso NÃO deve estar ativo em produção!"
         )
         return True
 
