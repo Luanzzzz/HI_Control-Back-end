@@ -514,20 +514,34 @@ async def _validar_empresa_usuario(
     Raises:
         HTTPException: Se empresa não encontrada ou não pertence ao usuário
     """
-    response = db.table("empresas") \
-        .select("*") \
-        .eq("id", empresa_id) \
-        .eq("usuario_id", user_id) \
-        .single() \
-        .execute()
+    try:
+        # Remover .single() para evitar erro PGRST116 quando não há resultados
+        response = db.table("empresas") \
+            .select("*") \
+            .eq("id", empresa_id) \
+            .eq("usuario_id", user_id) \
+            .execute()
 
-    if not response.data:
+        # Verificar se há dados
+        if not response.data or len(response.data) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Empresa não encontrada ou não pertence ao usuário"
+            )
+
+        # Retornar primeiro (e único) resultado
+        return response.data[0]
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        # Log e lançar erro genérico para outros erros
+        logging.getLogger(__name__).error(f"Erro ao validar empresa {empresa_id}: {str(e)}")
         raise HTTPException(
-            status_code=404,
-            detail="Empresa não encontrada ou não pertence ao usuário"
+            status_code=500,
+            detail=f"Erro ao validar empresa: {str(e)}"
         )
-
-    return response.data
 
 
 async def _salvar_nfe_banco(
