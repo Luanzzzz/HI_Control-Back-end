@@ -9,15 +9,12 @@ Funcionalidades:
 """
 import base64
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.x509 import NameOID
 import logging
-
-try:
-    from OpenSSL import crypto
-except ImportError:
-    crypto = None  # Será necessário para produção
 
 from app.core.config import settings
 
@@ -98,55 +95,43 @@ class CertificadoService:
         """
         Valida certificado .pfx/.p12 e extrai informações.
 
+        Usa cryptography.hazmat.primitives.serialization.pkcs12 (compatível
+        com todas as versões modernas, sem depender de pyOpenSSL).
+
         Args:
             cert_bytes: Bytes do arquivo .pfx/.p12
             senha: Senha do certificado
 
         Returns:
-            Dict com informações do certificado:
-            - valido: bool
-            - data_inicio: date
-            - data_fim: date
-            - dias_restantes: int
-            - titular: str (CN do subject)
-            - emissor: str (CN do issuer)
-            - serial_number: str
+            Dict com informações do certificado
 
         Raises:
             CertificadoInvalidoError: Se certificado inválido
             SenhaIncorretaError: Se senha incorreta
             CertificadoExpiradoError: Se certificado expirado
         """
-        if crypto is None:
-            raise CertificadoError(
-                "pyOpenSSL não instalado. Execute: pip install pyOpenSSL"
-            )
-
         try:
-            # Tentar carregar o certificado
-            p12 = crypto.load_pkcs12(cert_bytes, senha.encode())
-        except crypto.Error as e:
+            private_key, certificate, additional_certs = pkcs12.load_key_and_certificates(
+                cert_bytes, senha.encode()
+            )
+        except ValueError as e:
             error_msg = str(e).lower()
-            if 'mac verify' in error_msg or 'password' in error_msg:
+            if 'mac' in error_msg or 'password' in error_msg or 'invalid' in error_msg:
                 raise SenhaIncorretaError("Senha do certificado incorreta")
             else:
                 raise CertificadoInvalidoError(f"Certificado inválido: {e}")
         except Exception as e:
             raise CertificadoInvalidoError(f"Erro ao carregar certificado: {e}")
 
-        # Extrair certificado X509
-        certificate = p12.get_certificate()
-
-        if not certificate:
+        if certificate is None:
             raise CertificadoInvalidoError("Certificado não encontrado no arquivo .pfx")
 
-        # Extrair datas de validade
-        not_before = certificate.get_notBefore().decode('ascii')
-        not_after = certificate.get_notAfter().decode('ascii')
+        if private_key is None:
+            raise CertificadoInvalidoError("Chave privada não encontrada no certificado")
 
-        # Converter para date
-        data_inicio = datetime.strptime(not_before, "%Y%m%d%H%M%SZ").date()
-        data_fim = datetime.strptime(not_after, "%Y%m%d%H%M%SZ").date()
+        # Extrair datas de validade
+        data_inicio = certificate.not_valid_before_utc.date() if hasattr(certificate, 'not_valid_before_utc') else certificate.not_valid_before.date()
+        data_fim = certificate.not_valid_after_utc.date() if hasattr(certificate, 'not_valid_after_utc') else certificate.not_valid_after.date()
 
         # Calcular dias restantes
         hoje = date.today()
@@ -163,20 +148,20 @@ class CertificadoService:
                 f"Certificado expirado em {data_fim} ({abs(dias_restantes)} dias atrás)"
             )
 
-        # Extrair informações do titular
-        subject = certificate.get_subject()
-        issuer = certificate.get_issuer()
+        # Extrair informações do titular (CN do subject)
+        try:
+            titular = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        except (IndexError, Exception):
+            titular = "Não identificado"
 
-        titular = subject.CN if hasattr(subject, 'CN') else "Não identificado"
-        emissor = issuer.CN if hasattr(issuer, 'CN') else "Não identificado"
+        # Extrair informações do emissor (CN do issuer)
+        try:
+            emissor = certificate.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        except (IndexError, Exception):
+            emissor = "Não identificado"
 
         # Serial number
-        serial_number = certificate.get_serial_number()
-
-        # Verificar chave privada
-        private_key = p12.get_privatekey()
-        if not private_key:
-            raise CertificadoInvalidoError("Chave privada não encontrada no certificado")
+        serial_number = certificate.serial_number
 
         logger.info(
             f"Certificado validado: Titular={titular}, "
@@ -191,7 +176,7 @@ class CertificadoService:
             "titular": titular,
             "emissor": emissor,
             "serial_number": str(serial_number),
-            "requer_atencao": dias_restantes < 30,  # Alerta se expira em menos de 30 dias
+            "requer_atencao": dias_restantes < 30,
         }
 
     # ============================================
@@ -411,12 +396,12 @@ class CertificadoService:
         """
         try:
             # Tentar carregar sem senha (falhará, mas valida formato)
-            crypto.load_pkcs12(file_bytes, b'')
+            pkcs12.load_key_and_certificates(file_bytes, b'')
             return True
-        except crypto.Error:
-            # Error é esperado (senha incorreta), mas formato está OK
+        except ValueError:
+            # ValueError é esperado (senha incorreta), mas formato está OK
             return True
-        except:
+        except Exception:
             return False
 
 
