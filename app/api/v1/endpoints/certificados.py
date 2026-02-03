@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 import logging
 
 from app.dependencies import (
-    get_db,
+    get_admin_db,
     get_current_user,
     require_modules,
 )
@@ -95,7 +95,7 @@ async def upload_certificado(
     empresa_id: str = Path(..., description="ID da empresa"),
     request: CertificadoUploadRequest = Body(...),
     usuario: dict = Depends(get_current_user),
-    db: Client = Depends(get_db),
+    db: Client = Depends(get_admin_db),
 ):
     """
     Upload de certificado digital A1 (.pfx/.p12).
@@ -249,7 +249,7 @@ async def upload_certificado(
 async def verificar_status_certificado(
     empresa_id: str = Path(..., description="ID da empresa"),
     usuario: dict = Depends(get_current_user),
-    db: Client = Depends(get_db),
+    db: Client = Depends(get_admin_db),
 ):
     """
     Verifica status de validade do certificado digital.
