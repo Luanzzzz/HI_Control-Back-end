@@ -50,7 +50,7 @@ from app.models.nfe_completa import (
     SefazResponseModel,
     SefazRejeicao,
 )
-from app.adapters.pynfe_adapter import pynfe_adapter
+from app.adapters.pynfe_adapter import PyNFeAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -480,10 +480,20 @@ class SefazService:
                 # Campos adicionais podem ser passados se disponíveis
             }
 
+            # Verificar disponibilidade do PyNFE
+            if not PyNFeAdapter.is_available():
+                raise SefazException(
+                    "PyNFE não disponível - sistema de emissão NF-e indisponível",
+                    codigo_erro="PYNFE_INDISPONIVEL"
+                )
+
+            # Criar adapter instance
+            adapter = PyNFeAdapter()
+
             # Converter para objetos PyNFE
-            emitente = pynfe_adapter.to_pynfe_emitente(empresa_dados)
-            cliente = pynfe_adapter.to_pynfe_cliente(nfe_data.destinatario)
-            nota_fiscal = pynfe_adapter.to_pynfe_nota_fiscal(
+            emitente = adapter.to_pynfe_emitente(empresa_dados)
+            cliente = adapter.to_pynfe_cliente(nfe_data.destinatario)
+            nota_fiscal = adapter.to_pynfe_nota_fiscal(
                 nfe_data=nfe_data,
                 emitente=emitente,
                 cliente=cliente,
@@ -491,7 +501,7 @@ class SefazService:
             )
 
             # Gerar XML usando PyNFE
-            xml_nfe = pynfe_adapter.gerar_xml_nfe(
+            xml_nfe = adapter.gerar_xml_nfe(
                 nota_fiscal=nota_fiscal,
                 ambiente=nfe_data.ambiente
             )
@@ -585,13 +595,21 @@ class SefazService:
         """
         try:
             import hashlib
-            
+
             # Hash do certificado para rastreamento (seguro para logs)
             cert_fingerprint = hashlib.sha256(cert_bytes).hexdigest()[:16]
-            
+
             logger.info(f"Assinando XML digitalmente (cert fingerprint: {cert_fingerprint})")
 
-            xml_assinado = pynfe_adapter.assinar_xml(
+            # Verificar disponibilidade do PyNFE
+            if not PyNFeAdapter.is_available():
+                raise SefazException(
+                    "PyNFE não disponível - sistema de assinatura NF-e indisponível",
+                    codigo_erro="PYNFE_INDISPONIVEL"
+                )
+
+            adapter = PyNFeAdapter()
+            xml_assinado = adapter.assinar_xml(
                 xml_string=xml,
                 cert_bytes=cert_bytes,
                 senha_cert=senha
@@ -730,7 +748,15 @@ class SefazService:
         try:
             logger.info("Parseando resposta de autorização SEFAZ")
 
-            response = pynfe_adapter.parsear_resposta_sefaz(
+            # Verificar disponibilidade do PyNFE
+            if not PyNFeAdapter.is_available():
+                raise SefazException(
+                    "PyNFE não disponível - sistema de parse NF-e indisponível",
+                    codigo_erro="PYNFE_INDISPONIVEL"
+                )
+
+            adapter = PyNFeAdapter()
+            response = adapter.parsear_resposta_sefaz(
                 xml_retorno=xml,
                 uf=empresa_uf,  # Corrigido: passar UF do emitente, não o ambiente
                 ambiente='2' if self.ambiente == 'homologacao' else '1'

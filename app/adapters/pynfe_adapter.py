@@ -8,6 +8,8 @@ Responsabilidades:
 - Converter NotaFiscalCompletaCreate → objetos PyNFE (Emitente, Cliente, NotaFiscal)
 - Converter XML de resposta SEFAZ → SefazResponseModel
 - Extrair informações de XMLs (chave de acesso, protocolo, rejeições)
+
+IMPORTANTE: Usa lazy loading para imports PyNFE - módulos só são importados quando necessários.
 """
 import logging
 from typing import Dict, Any, Optional, List
@@ -20,27 +22,6 @@ try:
     from lxml import etree
 except ImportError:
     etree = None
-
-try:
-    from pynfe.entidades.emitente import Emitente
-    from pynfe.entidades.cliente import Cliente
-    from pynfe.entidades.notafiscal import NotaFiscal
-    from pynfe.entidades.produto import Produto
-    from pynfe.entidades.transporte import Transportadora, TransporteVolume
-    from pynfe.processamento.serializacao import SerializacaoXML
-    from pynfe.processamento.assinatura import AssinaturaA1
-    from pynfe.utils.flags import CODIGO_BRASIL
-except ImportError:
-    # Mock para desenvolvimento sem PyNFE instalado
-    Emitente = None
-    Cliente = None
-    NotaFiscal = None
-    Produto = None
-    Transportadora = None
-    TransporteVolume = None
-    SerializacaoXML = None
-    AssinaturaA1 = None
-    CODIGO_BRASIL = '1058'
 
 from app.models.nfe_completa import (
     NotaFiscalCompletaCreate,
@@ -59,14 +40,111 @@ NAMESPACE_NFE = "http://www.portalfiscal.inf.br/nfe"
 class PyNFeAdapter:
     """
     Adapter para conversão bidirecional entre modelos Hi-Control e PyNFE.
+
+    ARQUITETURA:
+    - Lazy loading: imports PyNFE apenas quando usado (primeira chamada)
+    - Thread-safe: usa class variables para cache
+    - Testável: permite mock de módulos PyNFE
     """
 
-    def __init__(self):
-        if SerializacaoXML:
-            self.serializador = SerializacaoXML()
-        else:
-            self.serializador = None
-            logger.warning("PyNFE não disponível - adapter em modo mock")
+    # Class variables para lazy loading e cache
+    _initialization_attempted = False
+    _pynfe_available = False
+    _modules = {}
+
+    @classmethod
+    def _lazy_import_pynfe(cls) -> bool:
+        """
+        Tenta importar PyNFE lazy (apenas na primeira chamada).
+
+        Returns:
+            True se sucesso, False se PyNFE não disponível.
+        """
+        if cls._initialization_attempted:
+            return cls._pynfe_available
+
+        cls._initialization_attempted = True
+        logger.info("🔍 [PyNFE] Iniciando lazy import...")
+
+        try:
+            from pynfe.entidades.emitente import Emitente
+            from pynfe.entidades.cliente import Cliente
+            from pynfe.entidades.notafiscal import NotaFiscal
+            from pynfe.entidades.produto import Produto, ICMS, IPI, PIS, COFINS
+            from pynfe.entidades.transporte import Transportadora, TransporteVolume
+            from pynfe.processamento.serializacao import SerializacaoXML
+            from pynfe.processamento.assinatura import AssinaturaA1
+            from pynfe.utils.flags import CODIGO_BRASIL
+
+            cls._modules = {
+                'Emitente': Emitente,
+                'Cliente': Cliente,
+                'NotaFiscal': NotaFiscal,
+                'Produto': Produto,
+                'ICMS': ICMS,
+                'IPI': IPI,
+                'PIS': PIS,
+                'COFINS': COFINS,
+                'Transportadora': Transportadora,
+                'TransporteVolume': TransporteVolume,
+                'SerializacaoXML': SerializacaoXML,
+                'AssinaturaA1': AssinaturaA1,
+                'CODIGO_BRASIL': CODIGO_BRASIL,
+            }
+
+            cls._pynfe_available = True
+            logger.info("✅ [PyNFE] Lazy import bem-sucedido!")
+            return True
+
+        except ImportError as e:
+            logger.error(f"❌ [PyNFE] Import falhou: {str(e)}")
+            logger.error(f"📍 Tipo: {type(e).__name__}")
+            import traceback
+            logger.error(f"📍 Traceback:\n{traceback.format_exc()}")
+            cls._pynfe_available = False
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ [PyNFE] Erro inesperado: {str(e)}")
+            import traceback
+            logger.error(f"📍 Traceback:\n{traceback.format_exc()}")
+            cls._pynfe_available = False
+            return False
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """
+        Verifica se PyNFE está disponível (com lazy loading).
+
+        Returns:
+            True se PyNFE foi carregado com sucesso.
+        """
+        return cls._lazy_import_pynfe()
+
+    @classmethod
+    def get_module(cls, name: str):
+        """
+        Retorna módulo PyNFE específico (com lazy loading).
+
+        Args:
+            name: Nome do módulo (ex: 'Emitente', 'Cliente', 'CODIGO_BRASIL')
+
+        Returns:
+            Classe ou constante do PyNFE
+
+        Raises:
+            ValueError: Se PyNFE não disponível ou módulo não encontrado.
+        """
+        if not cls._lazy_import_pynfe():
+            raise ValueError(
+                f"PyNFE não disponível - módulo '{name}' não pode ser carregado. "
+                "Verifique se 'pynfe-brasil' está instalado (pip install pynfe-brasil)."
+            )
+
+        if name not in cls._modules:
+            raise ValueError(f"Módulo '{name}' não encontrado em PyNFE cache. Módulos disponíveis: {list(cls._modules.keys())}")
+
+        return cls._modules[name]
 
     # ============================================
     # CONVERSÃO: Hi-Control → PyNFE
@@ -82,8 +160,8 @@ class PyNFeAdapter:
         Returns:
             Objeto Emitente do PyNFE
         """
-        if Emitente is None:
-            raise ValueError("PyNFE não instalado")
+        Emitente = self.get_module('Emitente')
+        CODIGO_BRASIL = self.get_module('CODIGO_BRASIL')
 
         # Extrair apenas números do CNPJ
         cnpj = ''.join(filter(str.isdigit, empresa_dados.get('cnpj', '')))
@@ -118,8 +196,8 @@ class PyNFeAdapter:
         Returns:
             Objeto Cliente do PyNFE
         """
-        if Cliente is None:
-            raise ValueError("PyNFE não instalado")
+        Cliente = self.get_module('Cliente')
+        CODIGO_BRASIL = self.get_module('CODIGO_BRASIL')
 
         # Determinar tipo de documento
         if destinatario.cpf:
@@ -164,14 +242,11 @@ class PyNFeAdapter:
         Returns:
             Objeto Produto do PyNFE configurado
         """
-        if Produto is None:
-            raise ValueError("PyNFE não instalado")
-
-        # Importar classes de impostos
-        try:
-            from pynfe.entidades.produto import ICMS, IPI, PIS, COFINS
-        except ImportError:
-            raise ValueError("Módulo pynfe.entidades.produto não disponível")
+        Produto = self.get_module('Produto')
+        ICMS = self.get_module('ICMS')
+        IPI = self.get_module('IPI')
+        PIS = self.get_module('PIS')
+        COFINS = self.get_module('COFINS')
 
         # Criar produto base
         produto = Produto(
@@ -264,8 +339,7 @@ class PyNFeAdapter:
         Returns:
             Objeto NotaFiscal do PyNFE pronto para serialização
         """
-        if NotaFiscal is None:
-            raise ValueError("PyNFE não instalado")
+        NotaFiscal = self.get_module('NotaFiscal')
 
         # Calcular totais
         totais = nfe_data.calcular_totais()
@@ -323,8 +397,7 @@ class PyNFeAdapter:
 
     def _criar_transportadora(self, transp_data) -> Any:
         """Cria objeto Transportadora do PyNFE"""
-        if Transportadora is None:
-            return None
+        Transportadora = self.get_module('Transportadora')
 
         return Transportadora(
             razao_social=transp_data.razao_social or '',
@@ -370,10 +443,10 @@ class PyNFeAdapter:
         Returns:
             String XML da NF-e
         """
-        if self.serializador is None:
-            raise ValueError("SerializacaoXML não disponível")
+        SerializacaoXML = self.get_module('SerializacaoXML')
+        serializador = SerializacaoXML()
 
-        xml_nfe = self.serializador._serializar_nfe(
+        xml_nfe = serializador._serializar_nfe(
             nota_fiscal,
             ambiente=int(ambiente),
         )
@@ -401,8 +474,7 @@ class PyNFeAdapter:
         Raises:
             ValueError: Se assinatura falhar
         """
-        if AssinaturaA1 is None:
-            raise ValueError("AssinaturaA1 não disponível")
+        AssinaturaA1 = self.get_module('AssinaturaA1')
 
         try:
             # PyNFE AssinaturaA1 precisa de arquivo, não bytes
@@ -540,6 +612,13 @@ class PyNFeAdapter:
 
 
 # ============================================
-# INSTÂNCIA GLOBAL
+# INSTÂNCIA LAZY (não mais singleton global)
 # ============================================
-pynfe_adapter = PyNFeAdapter()
+# REMOVIDO: pynfe_adapter = PyNFeAdapter()
+#
+# MOTIVO: Singleton global causava inicialização no import, travando o adapter
+# em modo mock permanentemente se PyNFE não estava disponível naquele momento.
+#
+# NOVO PADRÃO: Usar PyNFeAdapter() diretamente ou usar métodos de classe:
+#   - PyNFeAdapter.is_available()
+#   - PyNFeAdapter().to_pynfe_emitente(...)

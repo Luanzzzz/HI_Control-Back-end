@@ -1,8 +1,9 @@
 """
 Router agregador da API v1
 """
+import os
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, certificados, emissao_nfe, buscar_notas, notas, empresas, perfil, perfil_contador
+from app.api.v1.endpoints import auth, certificados, emissao_nfe, buscar_notas, notas, empresas, perfil, perfil_contador, debug
 
 # Criar router principal da v1
 api_router = APIRouter()
@@ -30,3 +31,7 @@ api_router.include_router(perfil.router, prefix="/perfil", tags=["Perfil"])
 
 # Perfil do Contador (Dados da Firma + Certificado)
 api_router.include_router(perfil_contador.router, tags=["Perfil Contador"])
+
+# Debug (apenas em desenvolvimento)
+if os.getenv("ENVIRONMENT") == "development":
+    api_router.include_router(debug.router, prefix="/debug", tags=["Debug 🔧"])
