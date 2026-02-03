@@ -32,6 +32,6 @@ api_router.include_router(perfil.router, prefix="/perfil", tags=["Perfil"])
 # Perfil do Contador (Dados da Firma + Certificado)
 api_router.include_router(perfil_contador.router, tags=["Perfil Contador"])
 
-# Debug (apenas em desenvolvimento)
-if os.getenv("ENVIRONMENT") == "development":
+# Debug (apenas em desenvolvimento - ENVIRONMENT != "production")
+if os.getenv("ENVIRONMENT", "development") != "production":
     api_router.include_router(debug.router, prefix="/debug", tags=["Debug 🔧"])

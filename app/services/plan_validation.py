@@ -57,10 +57,12 @@ async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
     """
     # BYPASS PARA DESENVOLVIMENTO - Retornar plano Enterprise fictício
     import os
-    if os.getenv("ENVIRONMENT") == "development":
+    env = os.getenv("ENVIRONMENT", "development")  # Default to development se não definido
+    if env != "production":
         logger.warning(
             f"🔓 [DEV MODE] Bypass de validação de assinatura ativo para usuário {usuario_id}. "
             f"Retornando plano ENTERPRISE fictício. "
+            f"Ambiente: {env} | "
             f"⚠️ ATENÇÃO: Isso NÃO deve estar ativo em produção!"
         )
         return {
