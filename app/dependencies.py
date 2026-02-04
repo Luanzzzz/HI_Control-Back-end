@@ -179,3 +179,89 @@ def require_modules(*modulos: str):
         return usuario
 
     return Depends(dependency)
+
+
+async def verificar_acesso_empresa(
+    contador_id: str,
+    empresa_id: str,
+    db: Client = None
+) -> bool:
+    """
+    Valida se contador tem permissão para acessar empresa.
+    
+    Args:
+        contador_id: ID do usuário (contador)
+        empresa_id: ID da empresa
+        db: Cliente Supabase (opcional, usa admin se não fornecido)
+    
+    Returns:
+        True se contador tem acesso à empresa
+    """
+    if db is None:
+        db = supabase_admin
+    
+    try:
+        resultado = db.table("empresas")\
+            .select("id")\
+            .eq("id", empresa_id)\
+            .eq("usuario_id", contador_id)\
+            .execute()
+        
+        return len(resultado.data) > 0
+    except Exception as e:
+        logger.error(f"Erro ao verificar acesso à empresa: {e}")
+        return False
+
+
+async def require_empresa_access(
+    empresa_id: str,
+    usuario: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+) -> dict:
+    """
+    Dependency reutilizável para endpoints que requerem acesso a uma empresa específica.
+    
+    Args:
+        empresa_id: ID da empresa (do path parameter)
+        usuario: Usuário autenticado (injetado)
+        db: Cliente Supabase (injetado)
+    
+    Returns:
+        Dados do usuário se autorizado
+    
+    Raises:
+        HTTPException 403: Se usuário não tem acesso à empresa
+    """
+    if not await verificar_acesso_empresa(usuario["id"], empresa_id, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para acessar esta empresa"
+        )
+    return usuario
+
+
+def get_empresa_access_dependency(empresa_id_param: str = "empresa_id"):
+    """
+    Factory para criar dependency de acesso a empresa com nome de parâmetro customizado.
+    
+    Uso:
+        @router.get("/empresas/{empresa_id}/notas")
+        async def listar_notas(
+            empresa_id: str,
+            usuario: dict = Depends(get_empresa_access_dependency("empresa_id"))
+        ):
+            ...
+    """
+    async def dependency(
+        empresa_id: str,
+        usuario: dict = Depends(get_current_user),
+        db: Client = Depends(get_admin_db)
+    ) -> dict:
+        if not await verificar_acesso_empresa(usuario["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Você não tem permissão para acessar esta empresa"
+            )
+        return usuario
+    
+    return dependency

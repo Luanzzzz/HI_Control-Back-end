@@ -1,0 +1,15 @@
+{
+    "detected_routes": [
+        {
+            "method": "POST",
+            "path": "/api/v1/certificados/empresas/{empresa_id}/certificado",
+            "file": "app/api/v1/endpoints/certificados.py",
+            "note": "Prefix mismatch detected. Expected likely: /api/v1/empresas/{id}/certificado"
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/certificados/empresas/{empresa_id}/certificado/status",
+            "file": "app/api/v1/endpoints/certificados.py"
+        }
+    ]
+}

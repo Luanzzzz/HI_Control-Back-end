@@ -329,3 +329,325 @@ async def verificar_status_busca(
     except Exception as e:
         logger.error(f"Erro ao verificar status job {job_id}: {e}")
         raise HTTPException(500, "Erro ao verificar status")
+
+
+# ============================================
+# ENDPOINTS POR EMPRESA (Sprint NFe Integration)
+# ============================================
+
+from app.services.cache_service import cache_service
+from app.services.certificado_service import (
+    certificado_service,
+    CertificadoAusenteError,
+    CertificadoExpiradoError,
+    CertificadoError
+)
+from app.dependencies import verificar_acesso_empresa
+from datetime import datetime, timedelta
+
+
+@router.get(
+    "/empresas/{empresa_id}/certificado/status",
+    summary="Status do certificado de uma empresa",
+    description="""
+    Retorna o status do certificado digital da empresa.
+    
+    **Status possíveis:**
+    - `ativo`: Certificado válido
+    - `expirando`: Válido mas vence em menos de 30 dias
+    - `vencido`: Certificado expirado
+    - `ausente`: Empresa não possui certificado
+    
+    **Fallback:**
+    Se a empresa não tiver certificado, verifica se o contador tem
+    certificado válido que pode ser usado como fallback.
+    """,
+    tags=["NFe - Busca por Empresa"]
+)
+async def obter_status_certificado_empresa(
+    empresa_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Retorna status do certificado de uma empresa.
+    """
+    try:
+        # Validar acesso à empresa
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Você não tem permissão para acessar esta empresa"
+            )
+        
+        # Obter status usando serviço híbrido
+        status_cert = await certificado_service.validar_status_empresa(empresa_id)
+        
+        return {
+            "empresa_id": empresa_id,
+            **status_cert
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao verificar certificado empresa {empresa_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao verificar certificado: {str(e)}"
+        )
+
+
+@router.post(
+    "/empresas/{empresa_id}/notas/buscar",
+    summary="Buscar notas fiscais de uma empresa",
+    description="""
+    Busca notas fiscais usando o certificado da empresa (ou fallback do contador).
+    
+    **Cache:**
+    - Resultados são cacheados por 24 horas
+    - Indica se dados vieram do cache ou SEFAZ
+    
+    **Certificado:**
+    - Prioriza certificado da empresa
+    - Fallback: usa certificado do contador se empresa não tiver
+    
+    **Auditoria:**
+    - Todas as consultas são registradas no histórico
+    """,
+    tags=["NFe - Busca por Empresa"]
+)
+async def buscar_notas_empresa(
+    empresa_id: str,
+    request: ConsultaDistribuicaoRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Busca notas usando certificado da empresa com cache.
+    """
+    inicio = datetime.now()
+    filtros = request.model_dump() if hasattr(request, 'model_dump') else request.dict()
+    
+    try:
+        # 1. Validar acesso à empresa
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Você não tem permissão para acessar esta empresa"
+            )
+        
+        # 2. Verificar módulo
+        await verificar_acesso_modulo("buscador_notas", current_user, db)
+        
+        # 3. Verificar certificado
+        status_cert = await certificado_service.validar_status_empresa(empresa_id)
+        
+        if status_cert["status"] == "vencido":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "certificado_vencido",
+                    "mensagem": status_cert["mensagem"],
+                    "tem_fallback": status_cert.get("tem_fallback", False)
+                }
+            )
+        
+        if status_cert["status"] == "ausente" and not status_cert.get("tem_fallback"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "certificado_ausente",
+                    "mensagem": "Empresa sem certificado e contador sem fallback disponível"
+                }
+            )
+        
+        # 4. Verificar cache
+        chave_cache = cache_service.gerar_chave_cache(empresa_id, filtros)
+        cache_hit = await cache_service.buscar(chave_cache)
+        
+        if cache_hit:
+            # Registrar no histórico (source: cache)
+            tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
+            await _registrar_historico(
+                db, empresa_id, current_user["id"], filtros,
+                cache_hit.get("quantidade", 0), "cache", tempo_ms, True, None,
+                status_cert.get("usando_fallback") and "contador_fallback" or "empresa"
+            )
+            
+            return {
+                "success": True,
+                "fonte": "cache",
+                "cached_at": cache_hit["cached_at"],
+                "empresa_id": empresa_id,
+                "certificado_status": status_cert["status"],
+                "usando_fallback": status_cert.get("usando_fallback", False),
+                **cache_hit["dados"]
+            }
+        
+        # 5. Obter certificado (híbrido)
+        try:
+            cert_bytes, senha, tipo_cert = await certificado_service.obter_certificado_para_busca(
+                empresa_id, current_user["id"]
+            )
+        except CertificadoAusenteError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "certificado_ausente", "mensagem": str(e)}
+            )
+        except CertificadoExpiradoError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "certificado_vencido", "mensagem": str(e)}
+            )
+        
+        # 6. Buscar na SEFAZ
+        cnpj = request.cnpj.replace(".", "").replace("/", "").replace("-", "")
+        
+        response = sefaz_service.buscar_notas_por_cnpj(
+            cnpj=cnpj,
+            empresa_id=empresa_id,
+            nsu_inicial=request.nsu_inicial,
+            cert_bytes=cert_bytes,
+            senha_cert=senha
+        )
+        
+        # 7. Formatar resultado
+        resultado = {
+            "notas": [
+                {
+                    "chave_acesso": nota.chave_acesso,
+                    "nsu": nota.nsu,
+                    "data_emissao": nota.data_emissao.isoformat(),
+                    "tipo_operacao": "saída" if nota.tipo_operacao == "1" else "entrada",
+                    "valor_total": float(nota.valor_total),
+                    "cnpj_emitente": nota.cnpj_emitente,
+                    "nome_emitente": nota.nome_emitente,
+                    "situacao": nota.situacao,
+                }
+                for nota in response.notas_encontradas
+            ],
+            "ultimo_nsu": response.ultimo_nsu,
+            "max_nsu": response.max_nsu,
+            "total_notas": response.total_notas,
+            "tem_mais_notas": response.tem_mais_notas,
+        }
+        
+        # 8. Salvar no cache
+        await cache_service.salvar(empresa_id, chave_cache, resultado)
+        
+        # 9. Registrar no histórico
+        tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
+        await _registrar_historico(
+            db, empresa_id, current_user["id"], filtros,
+            response.total_notas, "sefaz", tempo_ms, True, None, tipo_cert
+        )
+        
+        return {
+            "success": True,
+            "fonte": "sefaz",
+            "empresa_id": empresa_id,
+            "certificado_status": status_cert["status"],
+            "certificado_usado": tipo_cert,
+            **resultado
+        }
+        
+    except HTTPException:
+        raise
+    except SefazException as e:
+        # Registrar erro no histórico
+        tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
+        await _registrar_historico(
+            db, empresa_id, current_user["id"], filtros,
+            0, "sefaz", tempo_ms, False, str(e), None
+        )
+        
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "sefaz_error", "codigo": e.codigo, "mensagem": e.mensagem}
+        )
+    except Exception as e:
+        logger.error(f"Erro ao buscar notas empresa {empresa_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "internal_error", "mensagem": str(e)}
+        )
+
+
+@router.get(
+    "/empresas/{empresa_id}/notas/historico",
+    summary="Histórico de consultas de uma empresa",
+    description="Retorna o histórico de consultas SEFAZ para auditoria.",
+    tags=["NFe - Busca por Empresa"]
+)
+async def obter_historico_empresa(
+    empresa_id: str,
+    limite: int = 50,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Retorna histórico de consultas para auditoria.
+    """
+    try:
+        # Validar acesso
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Você não tem permissão para acessar esta empresa"
+            )
+        
+        # Buscar histórico
+        response = db.table("historico_consultas")\
+            .select("*")\
+            .eq("empresa_id", empresa_id)\
+            .order("created_at", desc=True)\
+            .limit(limite)\
+            .execute()
+        
+        return {
+            "empresa_id": empresa_id,
+            "total": len(response.data) if response.data else 0,
+            "historico": response.data or []
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao buscar histórico empresa {empresa_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao buscar histórico: {str(e)}"
+        )
+
+
+async def _registrar_historico(
+    db: Client,
+    empresa_id: str,
+    contador_id: str,
+    filtros: dict,
+    quantidade_notas: int,
+    fonte: str,
+    tempo_resposta_ms: int,
+    sucesso: bool,
+    erro_mensagem: str = None,
+    certificado_tipo: str = None
+):
+    """
+    Registra consulta no histórico para auditoria.
+    """
+    try:
+        db.table("historico_consultas").insert({
+            "empresa_id": empresa_id,
+            "contador_id": contador_id,
+            "filtros": filtros,
+            "quantidade_notas": quantidade_notas,
+            "fonte": fonte,
+            "tempo_resposta_ms": tempo_resposta_ms,
+            "sucesso": sucesso,
+            "erro_mensagem": erro_mensagem,
+            "certificado_tipo": certificado_tipo
+        }).execute()
+    except Exception as e:
+        logger.warning(f"Erro ao registrar histórico: {e}")
+

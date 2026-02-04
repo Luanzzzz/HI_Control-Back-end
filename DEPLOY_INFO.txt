@@ -1,0 +1,3 @@
+Git command failed: "fatal: not a git repository"
+No recent deploy info available from local git history.
+Vercel deployment assumes logic from vercel.json.

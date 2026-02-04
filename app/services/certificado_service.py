@@ -406,11 +406,278 @@ class CertificadoService:
 
 
 # ============================================
+# EXCEÇÃO ADICIONAL PARA CERTIFICADO AUSENTE
+# ============================================
+
+class CertificadoAusenteError(CertificadoError):
+    """Certificado não encontrado (empresa e contador)"""
+    pass
+
+
+# ============================================
+# EXTENSÕES PARA ESTRATÉGIA HÍBRIDA
+# ============================================
+
+class CertificadoServiceHibrido(CertificadoService):
+    """
+    Extensão do CertificadoService com lógica híbrida.
+    
+    Prioridade:
+    1. Certificado da EMPRESA (se existir e válido)
+    2. Fallback: Certificado do CONTADOR (se empresa não tiver)
+    """
+    
+    def __init__(self):
+        super().__init__()
+        from app.db.supabase_client import supabase_admin
+        self.db = supabase_admin
+    
+    async def validar_status_empresa(
+        self,
+        empresa_id: str
+    ) -> Dict[str, any]:
+        """
+        Valida status do certificado de uma empresa.
+        
+        Args:
+            empresa_id: ID da empresa
+        
+        Returns:
+            Dict com:
+            - status: 'ativo' | 'vencido' | 'ausente' | 'expirando'
+            - dias_para_vencer: int | None
+            - data_validade: str | None
+            - tem_fallback: bool (se contador tem certificado válido)
+        """
+        try:
+            # Buscar empresa com dados de certificado
+            resultado = self.db.table("empresas")\
+                .select("certificado_a1, certificado_validade, usuario_id")\
+                .eq("id", empresa_id)\
+                .single()\
+                .execute()
+            
+            if not resultado.data:
+                return {
+                    "status": "ausente",
+                    "dias_para_vencer": None,
+                    "data_validade": None,
+                    "tem_fallback": False,
+                    "mensagem": "Empresa não encontrada"
+                }
+            
+            empresa = resultado.data
+            
+            # Se empresa não tem certificado
+            if not empresa.get("certificado_a1"):
+                # Verificar fallback do contador
+                tem_fallback = await self._verificar_fallback_contador(empresa["usuario_id"])
+                
+                return {
+                    "status": "ausente",
+                    "dias_para_vencer": None,
+                    "data_validade": None,
+                    "tem_fallback": tem_fallback,
+                    "usando_fallback": tem_fallback,
+                    "mensagem": "Empresa sem certificado. " + (
+                        "Usando certificado do contador." if tem_fallback 
+                        else "Cadastre um certificado para buscar notas."
+                    )
+                }
+            
+            # Verificar validade do certificado da empresa
+            data_validade = empresa.get("certificado_validade")
+            if data_validade:
+                if isinstance(data_validade, str):
+                    data_validade = datetime.fromisoformat(data_validade.replace('Z', '+00:00')).date()
+                
+                status_exp = self.verificar_expiracao(data_validade)
+                
+                # Mapear status
+                status_map = {
+                    "valido": "ativo",
+                    "expirando_em_breve": "expirando",
+                    "expirado": "vencido",
+                    "ausente": "ausente"
+                }
+                
+                return {
+                    "status": status_map.get(status_exp["status"], status_exp["status"]),
+                    "dias_para_vencer": status_exp["dias_restantes"],
+                    "data_validade": data_validade.isoformat() if data_validade else None,
+                    "tem_fallback": False,
+                    "usando_fallback": False,
+                    "mensagem": status_exp["alerta"]
+                }
+            
+            return {
+                "status": "ausente",
+                "dias_para_vencer": None,
+                "data_validade": None,
+                "tem_fallback": False,
+                "mensagem": "Validade do certificado não informada"
+            }
+            
+        except Exception as e:
+            logger.error(f"Erro ao validar status do certificado: {e}")
+            return {
+                "status": "erro",
+                "dias_para_vencer": None,
+                "data_validade": None,
+                "tem_fallback": False,
+                "mensagem": f"Erro ao verificar certificado: {str(e)}"
+            }
+    
+    async def obter_certificado_para_busca(
+        self,
+        empresa_id: str,
+        contador_id: str
+    ) -> Tuple[bytes, str, str]:
+        """
+        Obtém certificado para busca usando estratégia híbrida.
+        
+        Prioridade:
+        1. Certificado da EMPRESA (se existir e válido)
+        2. Fallback: Certificado do CONTADOR (se empresa não tiver)
+        
+        Args:
+            empresa_id: ID da empresa
+            contador_id: ID do contador (para fallback)
+        
+        Returns:
+            Tupla (cert_bytes, senha, tipo_usado)
+            - tipo_usado: 'empresa' | 'contador_fallback'
+        
+        Raises:
+            CertificadoAusenteError: Se nem empresa nem contador têm certificado
+            CertificadoExpiradoError: Se certificado está vencido
+        """
+        try:
+            # 1. Tentar certificado da empresa
+            empresa_cert = self.db.table("empresas")\
+                .select("certificado_a1, certificado_senha_hash, certificado_validade, usuario_id")\
+                .eq("id", empresa_id)\
+                .single()\
+                .execute()
+            
+            if empresa_cert.data and empresa_cert.data.get("certificado_a1"):
+                # Verificar validade
+                data_validade = empresa_cert.data.get("certificado_validade")
+                if data_validade:
+                    if isinstance(data_validade, str):
+                        data_validade = datetime.fromisoformat(data_validade.replace('Z', '+00:00')).date()
+                    
+                    if data_validade < date.today():
+                        logger.warning(f"Certificado da empresa {empresa_id} está vencido")
+                        # Tentar fallback
+                        return await self._tentar_fallback_contador(
+                            empresa_cert.data.get("usuario_id", contador_id),
+                            empresa_id
+                        )
+                
+                # Usar certificado da empresa
+                cert_bytes = self.descriptografar_certificado(
+                    empresa_cert.data["certificado_a1"]
+                )
+                senha = empresa_cert.data.get("certificado_senha_hash", "")
+                
+                logger.info(f"✅ Usando certificado da EMPRESA {empresa_id}")
+                return (cert_bytes, senha, "empresa")
+            
+            # 2. Fallback: Certificado do contador
+            return await self._tentar_fallback_contador(contador_id, empresa_id)
+            
+        except CertificadoAusenteError:
+            raise
+        except CertificadoExpiradoError:
+            raise
+        except Exception as e:
+            logger.error(f"Erro ao obter certificado: {e}")
+            raise CertificadoError(f"Erro ao buscar certificado: {str(e)}")
+    
+    async def _tentar_fallback_contador(
+        self,
+        contador_id: str,
+        empresa_id: str
+    ) -> Tuple[bytes, str, str]:
+        """
+        Tenta usar certificado do contador como fallback.
+        """
+        try:
+            contador_cert = self.db.table("usuarios")\
+                .select("certificado_contador_a1, certificado_contador_validade")\
+                .eq("id", contador_id)\
+                .single()\
+                .execute()
+            
+            if contador_cert.data and contador_cert.data.get("certificado_contador_a1"):
+                # Verificar validade
+                data_validade = contador_cert.data.get("certificado_contador_validade")
+                if data_validade:
+                    if isinstance(data_validade, str):
+                        data_validade = datetime.fromisoformat(data_validade.replace('Z', '+00:00')).date()
+                    
+                    if data_validade < date.today():
+                        raise CertificadoExpiradoError(
+                            "Certificado do contador também está vencido. "
+                            "Renove o certificado para continuar."
+                        )
+                
+                # Usar certificado do contador
+                cert_bytes = self.descriptografar_certificado(
+                    contador_cert.data["certificado_contador_a1"]
+                )
+                
+                logger.warning(
+                    f"⚠️ Usando certificado do CONTADOR como fallback "
+                    f"para empresa {empresa_id}"
+                )
+                return (cert_bytes, "", "contador_fallback")
+            
+            raise CertificadoAusenteError(
+                "Nem a empresa nem o contador possuem certificado válido. "
+                "Cadastre um certificado A1 para buscar notas fiscais."
+            )
+            
+        except CertificadoAusenteError:
+            raise
+        except CertificadoExpiradoError:
+            raise
+        except Exception as e:
+            raise CertificadoAusenteError(
+                f"Erro ao buscar certificado fallback: {str(e)}"
+            )
+    
+    async def _verificar_fallback_contador(self, contador_id: str) -> bool:
+        """
+        Verifica se contador tem certificado válido para fallback.
+        """
+        try:
+            resultado = self.db.table("usuarios")\
+                .select("certificado_contador_a1, certificado_contador_validade")\
+                .eq("id", contador_id)\
+                .single()\
+                .execute()
+            
+            if resultado.data and resultado.data.get("certificado_contador_a1"):
+                data_validade = resultado.data.get("certificado_contador_validade")
+                if data_validade:
+                    if isinstance(data_validade, str):
+                        data_validade = datetime.fromisoformat(data_validade.replace('Z', '+00:00')).date()
+                    return data_validade >= date.today()
+                return True
+            
+            return False
+        except:
+            return False
+
+
+# ============================================
 # INSTÂNCIA SINGLETON
 # ============================================
 
 # Criar instância global para uso em toda a aplicação
-certificado_service = CertificadoService()
+certificado_service = CertificadoServiceHibrido()
 
 
 # ============================================
