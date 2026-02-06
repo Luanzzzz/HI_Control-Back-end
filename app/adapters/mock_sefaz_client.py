@@ -180,8 +180,8 @@ def get_distribuicao_client():
     Returns:
         MockDistribuicaoDFeClient ou None
     """
-    use_mock = os.getenv("USE_MOCK_SEFAZ", "true").lower() == "true"
-    
+    use_mock = os.getenv("USE_MOCK_SEFAZ", "false").lower() == "true"  # ALTERADO: false por padrao
+
     if use_mock:
         logger.warning("⚠️ USANDO MOCK SEFAZ - NÃO usar em produção!")
         return MockDistribuicaoDFeClient()

@@ -981,7 +981,7 @@ class SefazService:
             else:
                 logger.info("✅ Consultando SEFAZ REAL - Dados autênticos")
                 logger.info(f"   CNPJ: {cnpj}, NSU Inicial: {nsu}, UF: {uf}")
-                endpoint = self._obter_endpoint(uf, "distribuicao")
+                endpoint = self._obter_url_sefaz(uf, "distribuicao")
                 xml_response = self._enviar_para_sefaz(
                     url=endpoint,
                     xml=xml_request,

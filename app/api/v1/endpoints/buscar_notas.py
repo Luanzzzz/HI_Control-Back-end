@@ -509,7 +509,17 @@ async def buscar_notas_empresa(
                     "mensagem": "Empresa sem certificado e contador sem fallback disponível"
                 }
             )
-        
+
+        # Validar status de erro na verificacao do certificado
+        if status_cert.get("status") == "erro":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": "certificado_validation_error",
+                    "mensagem": status_cert.get("mensagem", "Erro ao validar certificado")
+                }
+            )
+
         # 4. Verificar cache
         chave_cache = cache_service.gerar_chave_cache(empresa_id, filtros)
         cache_hit = await cache_service.buscar(chave_cache)
@@ -783,5 +793,65 @@ async def baixar_xml_nota(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erro ao processar XML: {str(e)}"
+        )
+
+
+# ============================================
+# ENDPOINT: Limpar Cache de Teste
+# ============================================
+
+@router.post("/cache/limpar-teste", tags=["NFe - Cache"])
+async def limpar_cache_teste(
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Remove entradas de cache que contem dados de teste.
+
+    Identifica e remove registros com:
+    - "EMPRESA TESTE" no nome do emitente
+    - CNPJ "12345678000190" (teste)
+
+    Returns:
+        Dict com quantidade de registros removidos
+    """
+    try:
+        logger.info("🗑️ Iniciando limpeza de cache de teste...")
+
+        # Buscar todos os caches
+        resultado = db.table("cache_notas_fiscais")\
+            .select("id, dados")\
+            .execute()
+
+        if not resultado.data:
+            return {"message": "Nenhum cache encontrado", "removidos": 0}
+
+        ids_remover = []
+        for entry in resultado.data:
+            dados_str = str(entry.get("dados", ""))
+            # Identificar dados de teste
+            if "TESTE" in dados_str or "12345678000190" in dados_str:
+                ids_remover.append(entry["id"])
+
+        # Deletar caches de teste
+        if ids_remover:
+            db.table("cache_notas_fiscais")\
+                .delete()\
+                .in_("id", ids_remover)\
+                .execute()
+
+        logger.info(f"✅ Cache de teste limpo: {len(ids_remover)} entradas removidas")
+
+        return {
+            "success": True,
+            "message": f"{len(ids_remover)} entradas de cache de teste removidas",
+            "removidos": len(ids_remover)
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao limpar cache: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao limpar cache: {str(e)}"
         )
 
