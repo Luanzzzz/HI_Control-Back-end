@@ -15,6 +15,13 @@ from app.models.nfe_busca import (
 )
 from app.services.sefaz_service import sefaz_service, SefazException
 from app.dependencies import get_current_user, get_admin_db, verificar_acesso_modulo
+from app.services.nfe_mapper import (
+    extrair_numero_da_chave,
+    extrair_serie_da_chave,
+    extrair_modelo_da_chave,
+    modelo_to_tipo_nf,
+    gerar_id_from_chave
+)
 from app.services.plan_validation import (
     obter_plano_usuario,
     validar_limite_historico,
@@ -25,6 +32,53 @@ from app.services.plan_validation import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/nfe", tags=["NFe - Busca"])
+
+
+# ============================================
+# FUNÇÕES AUXILIARES
+# ============================================
+
+def _enriquecer_nota(nota: NFeBuscadaMetadata) -> dict:
+    """
+    Helper para enriquecer nota com dados extraídos da chave de acesso.
+
+    Args:
+        nota: Metadata da nota fiscal buscada
+
+    Returns:
+        Dict com campos originais + campos extraídos da chave
+    """
+    try:
+        numero_nf = extrair_numero_da_chave(nota.chave_acesso)
+        serie = extrair_serie_da_chave(nota.chave_acesso)
+        modelo = extrair_modelo_da_chave(nota.chave_acesso)
+        tipo_nf = modelo_to_tipo_nf(modelo, nota.tipo_operacao)
+        id_nota = gerar_id_from_chave(nota.chave_acesso)
+    except (ValueError, IndexError) as e:
+        logger.warning(f"⚠️ Erro ao extrair dados da chave {nota.chave_acesso}: {e}")
+        # Fallback para valores padrão
+        numero_nf = "N/A"
+        serie = "N/A"
+        tipo_nf = f"NFe {nota.tipo_operacao.capitalize()}"
+        id_nota = nota.chave_acesso[-12:]
+
+    return {
+        # Campos originais
+        "chave_acesso": nota.chave_acesso,
+        "nsu": nota.nsu,
+        "data_emissao": nota.data_emissao.isoformat(),
+        "tipo_operacao": "saída" if nota.tipo_operacao == "1" else "entrada",
+        "valor_total": float(nota.valor_total),
+        "cnpj_emitente": nota.cnpj_emitente,
+        "nome_emitente": nota.nome_emitente,
+        "situacao": nota.situacao,
+
+        # Campos extraídos
+        "id": id_nota,
+        "numero_nf": numero_nf,
+        "serie": serie,
+        "tipo_nf": tipo_nf,
+    }
 
 
 # ============================================
@@ -121,30 +175,14 @@ async def buscar_notas_fiscais(
             nsu_inicial=request.nsu_inicial,
         )
         
-        # 6. Formatar resposta
+        # 6. Formatar resposta (com enriquecimento de dados da chave)
         return {
             "success": response.sucesso,
             "status_codigo": response.status_codigo,
             "motivo": response.motivo,
             "plano": plano_info["nome"],
             "plano_limites": obter_resumo_plano(plano_info),
-            "notas": [
-                {
-                    "chave_acesso": nota.chave_acesso,
-                    "nsu": nota.nsu,
-                    "data_emissao": nota.data_emissao.isoformat(),
-                    "tipo_operacao": "saída" if nota.tipo_operacao == "1" else "entrada",
-                    "valor_total": float(nota.valor_total),
-                    "cnpj_emitente": nota.cnpj_emitente,
-                    "nome_emitente": nota.nome_emitente,
-                    "cnpj_destinatario": nota.cnpj_destinatario,
-                    "cpf_destinatario": nota.cpf_destinatario,
-                    "nome_destinatario": nota.nome_destinatario,
-                    "situacao": nota.situacao,
-                    "protocolo": nota.protocolo,
-                }
-                for nota in response.notas_encontradas
-            ],
+            "notas": [_enriquecer_nota(nota) for nota in response.notas_encontradas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
             "total_notas": response.total_notas,
@@ -497,21 +535,9 @@ async def buscar_notas_empresa(
         # Tipo de certificado usado (consulta pública não usa certificado)
         tipo_cert = "publico_distribuicao_dfe"
 
-        # 7. Formatar resultado
+        # 7. Formatar resultado (com enriquecimento de dados da chave)
         resultado = {
-            "notas": [
-                {
-                    "chave_acesso": nota.chave_acesso,
-                    "nsu": nota.nsu,
-                    "data_emissao": nota.data_emissao.isoformat(),
-                    "tipo_operacao": "saída" if nota.tipo_operacao == "1" else "entrada",
-                    "valor_total": float(nota.valor_total),
-                    "cnpj_emitente": nota.cnpj_emitente,
-                    "nome_emitente": nota.nome_emitente,
-                    "situacao": nota.situacao,
-                }
-                for nota in response.notas_encontradas
-            ],
+            "notas": [_enriquecer_nota(nota) for nota in response.notas_encontradas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
             "total_notas": response.total_notas,

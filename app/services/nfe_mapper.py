@@ -126,17 +126,97 @@ def extrair_uf_da_chave(chave: str) -> str:
 def validar_chave_acesso(chave: str) -> bool:
     """
     Valida estrutura básica da chave de acesso.
-    
+
     Args:
         chave: Chave a validar
-    
+
     Returns:
         True se válida, False caso contrário
     """
     if not chave or len(chave) != 44:
         return False
-    
+
     if not chave.isdigit():
         return False
-    
+
     return True
+
+
+def extrair_modelo_da_chave(chave: str) -> str:
+    """
+    Extrai o modelo da NFe da chave de acesso (posições 20-21).
+
+    Args:
+        chave: Chave de acesso de 44 dígitos
+
+    Returns:
+        str: Código do modelo (ex: "55" para NFe, "65" para NFCe)
+
+    Raises:
+        ValueError: Se chave inválida
+
+    Examples:
+        >>> extrair_modelo_da_chave("35241111222333000199550010000123451234567890")
+        "55"
+    """
+    if not chave or len(chave) != 44:
+        raise ValueError(f"Chave de acesso inválida (deve ter 44 dígitos): {chave}")
+
+    modelo_raw = chave[20:22]
+
+    if not modelo_raw.isdigit():
+        raise ValueError(f"Modelo inválido na chave: {modelo_raw}")
+
+    return modelo_raw
+
+
+def modelo_to_tipo_nf(modelo: str, tipo_operacao: str) -> str:
+    """
+    Converte código do modelo e tipo de operação em tipo de NFe.
+
+    Args:
+        modelo: Código do modelo ("55", "65", etc)
+        tipo_operacao: "ENTRADA" ou "SAIDA"
+
+    Returns:
+        str: Tipo formatado (ex: "NFe Entrada", "NFCe Saída")
+
+    Examples:
+        >>> modelo_to_tipo_nf("55", "ENTRADA")
+        "NFe Entrada"
+        >>> modelo_to_tipo_nf("65", "SAIDA")
+        "NFCe Saída"
+    """
+    modelos = {
+        "55": "NFe",
+        "65": "NFCe",
+        "57": "CT-e",
+        "58": "MDF-e",
+    }
+
+    tipo_doc = modelos.get(modelo, f"Modelo {modelo}")
+    tipo_op = tipo_operacao.capitalize() if tipo_operacao else "Entrada"
+
+    return f"{tipo_doc} {tipo_op}"
+
+
+def gerar_id_from_chave(chave: str) -> str:
+    """
+    Gera um ID único para a nota baseado na chave de acesso.
+    Usa os últimos 12 dígitos da chave (mais variáveis).
+
+    Args:
+        chave: Chave de acesso de 44 dígitos
+
+    Returns:
+        str: ID único (últimos 12 dígitos)
+
+    Examples:
+        >>> gerar_id_from_chave("35241111222333000199550010000123451234567890")
+        "234567890"
+    """
+    if not chave or len(chave) != 44:
+        return chave  # Fallback para chave completa se inválida
+
+    # Usar últimos 12 dígitos (série + número + dígitos verificadores)
+    return chave[-12:]
