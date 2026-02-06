@@ -55,44 +55,50 @@ class ConsultaDistribuicaoRequest(BaseModel):
 class NFeBuscadaMetadata(BaseModel):
     """
     Metadados de uma NFe encontrada via DistribuicaoDFe (resNFe).
-    
+
     Representa o resumo da nota retornado pela SEFAZ.
     """
     # Identificação
     chave_acesso: str = Field(..., min_length=44, max_length=44)
     nsu: int = Field(..., description="Número Sequencial Único SEFAZ")
-    
+
     # Datas
     data_emissao: datetime = Field(..., description="Data/hora de emissão")
-    
+
     # Tipo e valor
     tipo_operacao: Literal["0", "1"] = Field(
-        ..., 
+        ...,
         description="0=Entrada, 1=Saída"
     )
     valor_total: Decimal = Field(..., ge=0, decimal_places=2)
-    
+
     # Emitente
     cnpj_emitente: str = Field(..., pattern=r'^\d{14}$')
     nome_emitente: str = Field(..., max_length=255)
-    
+
     # Destinatário (opcional, pode não estar no resNFe)
     cnpj_destinatario: Optional[str] = Field(None, pattern=r'^\d{14}$')
     cpf_destinatario: Optional[str] = Field(None, pattern=r'^\d{11}$')
     nome_destinatario: Optional[str] = Field(None, max_length=255)
-    
+
     # Status
     situacao: str = Field(
-        ..., 
+        ...,
         description="Situação da NFe: autorizada, cancelada, denegada"
     )
     situacao_codigo: str = Field(
         ...,
         description="Código situação SEFAZ (1=Autorizada, 2=Denegada, 3=Cancelada)"
     )
-    
+
     # Protocolo (opcional)
     protocolo: Optional[str] = Field(None, max_length=50)
+
+    # XML (opcional - armazena o resNFe completo para download)
+    xml_resumo: Optional[str] = Field(
+        None,
+        description="XML resNFe completo retornado pela SEFAZ"
+    )
 
     @field_validator('chave_acesso')
     @classmethod

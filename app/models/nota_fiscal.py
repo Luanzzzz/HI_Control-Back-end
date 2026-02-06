@@ -37,6 +37,7 @@ class NotaFiscalBase(BaseModel):
 
     xml_url: Optional[str] = Field(None, description="URL do XML no Supabase Storage")
     pdf_url: Optional[str] = Field(None, description="URL do DANFE em PDF")
+    xml_resumo: Optional[str] = Field(None, description="XML resumo (resNFe) da DistribuicaoDFe")
 
     observacoes: Optional[str] = None
 

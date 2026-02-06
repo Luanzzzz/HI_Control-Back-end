@@ -175,17 +175,27 @@ async def buscar_notas_fiscais(
             nsu_inicial=request.nsu_inicial,
         )
         
-        # 6. Formatar resposta (com enriquecimento de dados da chave)
+        # 6. Aplicar limite de quantidade solicitado
+        notas_limitadas = response.notas_encontradas[:request.max_notas]
+
+        logger.info(
+            f"[RESULTADO] Total encontradas: {len(response.notas_encontradas)} | "
+            f"Limite aplicado: {request.max_notas} | "
+            f"Retornando: {len(notas_limitadas)} notas"
+        )
+
+        # 7. Formatar resposta (com enriquecimento de dados da chave)
         return {
             "success": response.sucesso,
             "status_codigo": response.status_codigo,
             "motivo": response.motivo,
             "plano": plano_info["nome"],
             "plano_limites": obter_resumo_plano(plano_info),
-            "notas": [_enriquecer_nota(nota) for nota in response.notas_encontradas],
+            "notas": [_enriquecer_nota(nota) for nota in notas_limitadas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
-            "total_notas": response.total_notas,
+            "total_notas": len(notas_limitadas),  # Total retornado (limitado)
+            "total_encontradas": response.total_notas,  # Total SEFAZ (sem limite)
             "tem_mais_notas": response.tem_mais_notas,
         }
         
@@ -535,12 +545,22 @@ async def buscar_notas_empresa(
         # Tipo de certificado usado (consulta pública não usa certificado)
         tipo_cert = "publico_distribuicao_dfe"
 
+        # 6. Aplicar limite de quantidade solicitado
+        notas_limitadas = response.notas_encontradas[:request.max_notas]
+
+        logger.info(
+            f"[RESULTADO EMPRESA] Total encontradas: {len(response.notas_encontradas)} | "
+            f"Limite aplicado: {request.max_notas} | "
+            f"Retornando: {len(notas_limitadas)} notas"
+        )
+
         # 7. Formatar resultado (com enriquecimento de dados da chave)
         resultado = {
-            "notas": [_enriquecer_nota(nota) for nota in response.notas_encontradas],
+            "notas": [_enriquecer_nota(nota) for nota in notas_limitadas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
-            "total_notas": response.total_notas,
+            "total_notas": len(notas_limitadas),  # Total retornado (limitado)
+            "total_encontradas": response.total_notas,  # Total SEFAZ (sem limite)
             "tem_mais_notas": response.tem_mais_notas,
         }
         
@@ -661,4 +681,107 @@ async def _registrar_historico(
         }).execute()
     except Exception as e:
         logger.warning(f"Erro ao registrar histórico: {e}")
+
+
+# ============================================
+# ENDPOINT: Download XML da Nota
+# ============================================
+
+@router.get("/notas/{chave_acesso}/xml")
+async def baixar_xml_nota(
+    chave_acesso: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Baixa o XML resumido (resNFe) da nota fiscal.
+
+    O XML completo da nota pode ser obtido consultando diretamente
+    a SEFAZ com certificado digital. Este endpoint retorna o resNFe
+    (resumo) que foi retornado pela DistribuicaoDFe.
+
+    Args:
+        chave_acesso: Chave de acesso de 44 dígitos
+
+    Returns:
+        Response com XML para download
+
+    Raises:
+        404: XML não encontrado
+        422: Chave de acesso inválida
+    """
+    from fastapi.responses import Response
+
+    try:
+        logger.info(f"📥 Download XML solicitado - Chave: {chave_acesso}")
+
+        # 1. Validar chave de acesso
+        if not chave_acesso or len(chave_acesso) != 44 or not chave_acesso.isdigit():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Chave de acesso inválida. Deve ter 44 dígitos numéricos."
+            )
+
+        # 2. Buscar nota no banco de dados
+        try:
+            resultado = db.table("notas_fiscais")\
+                .select("xml_resumo, numero_nf, serie, tipo_nf, nome_emitente")\
+                .eq("chave_acesso", chave_acesso)\
+                .limit(1)\
+                .execute()
+
+            if not resultado.data or len(resultado.data) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Nota fiscal com chave {chave_acesso} não encontrada no banco de dados."
+                )
+
+            nota = resultado.data[0]
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Erro ao buscar nota no banco: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Erro ao buscar nota: {str(e)}"
+            )
+
+        # 3. Validar se tem XML
+        xml_content = nota.get("xml_resumo")
+        if not xml_content:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="XML não disponível para esta nota. Pode ter sido consultada antes da funcionalidade de armazenamento de XML."
+            )
+
+        # 4. Preparar nome do arquivo
+        tipo = nota.get("tipo_nf", "NFe").replace(" ", "_")
+        numero = nota.get("numero_nf", "000000")
+        serie = nota.get("serie", "1")
+        emitente = (nota.get("nome_emitente", "Nota") or "Nota").replace(" ", "_")[:30]
+
+        filename = f"{tipo}_{numero}_Serie{serie}_{emitente}.xml"
+
+        logger.info(f"✅ XML encontrado - Arquivo: {filename}")
+
+        # 5. Retornar XML como arquivo para download
+        return Response(
+            content=xml_content.encode('utf-8') if isinstance(xml_content, str) else xml_content,
+            media_type='application/xml',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Type': 'application/xml; charset=utf-8',
+                'X-Content-Type-Options': 'nosniff'
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro ao processar download de XML: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao processar XML: {str(e)}"
+        )
 

@@ -70,6 +70,7 @@ def map_nfe_buscada_to_nota_fiscal(
         nome_destinatario=nfe.nome_destinatario,
         situacao=situacao,
         protocolo=nfe.protocolo,
+        xml_resumo=nfe.xml_resumo,  # Armazenar XML resumo para download
         observacoes=f"Importada via DistribuicaoDFe | NSU: {nfe.nsu}"
     )
 

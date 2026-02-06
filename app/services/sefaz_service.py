@@ -970,14 +970,17 @@ class SefazService:
         try:
             # Verificar se deve usar mock
             import os
-            use_mock = os.getenv("USE_MOCK_SEFAZ", "true").lower() == "true"
-            
+            use_mock = os.getenv("USE_MOCK_SEFAZ", "false").lower() == "true"  # ALTERADO: false por padrão
+
             if use_mock:
                 from app.adapters.mock_sefaz_client import get_distribuicao_client
                 mock_client = get_distribuicao_client()
                 xml_response = mock_client.consultar(cnpj=cnpj, nsu_inicial=nsu, uf=uf)
-                logger.info("Usando mock SEFAZ para DistribuicaoDFe")
+                logger.warning("⚠️  USANDO MOCK SEFAZ - Dados de teste! ⚠️")
+                logger.warning("⚠️  Para usar dados REAIS, configure: USE_MOCK_SEFAZ=false ⚠️")
             else:
+                logger.info("✅ Consultando SEFAZ REAL - Dados autênticos")
+                logger.info(f"   CNPJ: {cnpj}, NSU Inicial: {nsu}, UF: {uf}")
                 endpoint = self._obter_endpoint(uf, "distribuicao")
                 xml_response = self._enviar_para_sefaz(
                     url=endpoint,
@@ -1032,6 +1035,7 @@ class SefazService:
                     situacao=situacao,
                     situacao_codigo=situacao_codigo,
                     protocolo=extrair_protocolo(resumo_xml),
+                    xml_resumo=resumo_xml,  # Armazena XML resumo para download
                 )
                 
                 notas_encontradas.append(nfe_metadata)
