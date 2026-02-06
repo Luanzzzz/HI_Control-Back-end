@@ -485,33 +485,18 @@ async def buscar_notas_empresa(
                 **cache_hit["dados"]
             }
         
-        # 5. Obter certificado (híbrido)
-        try:
-            cert_bytes, senha, tipo_cert = await certificado_service.obter_certificado_para_busca(
-                empresa_id, current_user["id"]
-            )
-        except CertificadoAusenteError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "certificado_ausente", "mensagem": str(e)}
-            )
-        except CertificadoExpiradoError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "certificado_vencido", "mensagem": str(e)}
-            )
-        
-        # 6. Buscar na SEFAZ
+        # 5. Buscar na SEFAZ (NÃO REQUER CERTIFICADO - Consulta pública via DistribuicaoDFe)
         cnpj = request.cnpj.replace(".", "").replace("/", "").replace("-", "")
-        
+
         response = sefaz_service.buscar_notas_por_cnpj(
             cnpj=cnpj,
             empresa_id=empresa_id,
-            nsu_inicial=request.nsu_inicial,
-            cert_bytes=cert_bytes,
-            senha_cert=senha
+            nsu_inicial=request.nsu_inicial
         )
-        
+
+        # Tipo de certificado usado (consulta pública não usa certificado)
+        tipo_cert = "publico_distribuicao_dfe"
+
         # 7. Formatar resultado
         resultado = {
             "notas": [
