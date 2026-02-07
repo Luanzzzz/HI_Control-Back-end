@@ -90,16 +90,42 @@ class NotaFiscalBase(BaseModel):
 
 
 class NotaFiscalCreate(NotaFiscalBase):
-    """Schema para criação de nota fiscal"""
+    """Schema para criacao de nota fiscal (inclui campos de importacao XML)"""
     empresa_id: str = Field(..., description="UUID da empresa")
+
+    # Campos adicionais para importacao de XML
+    tipo_operacao: Optional[str] = Field(None, description="entrada ou saida")
+    ie_emitente: Optional[str] = Field(None, description="Inscricao Estadual do emitente")
+    cpf_destinatario: Optional[str] = Field(None, description="CPF do destinatario (PF)")
+    valor_icms: Optional[Decimal] = Field(None, ge=0, decimal_places=2)
+    valor_ipi: Optional[Decimal] = Field(None, ge=0, decimal_places=2)
+    valor_pis: Optional[Decimal] = Field(None, ge=0, decimal_places=2)
+    valor_cofins: Optional[Decimal] = Field(None, ge=0, decimal_places=2)
+    valor_frete: Optional[Decimal] = Field(None, ge=0, decimal_places=2)
+    valor_desconto: Optional[Decimal] = Field(None, ge=0, decimal_places=2)
+    fonte: Optional[str] = Field(None, description="Origem da nota: xml_importado, sefaz, manual")
+    xml_completo: Optional[str] = Field(None, description="XML completo da nota")
+
+    @field_validator('cnpj_emitente', 'cnpj_destinatario', mode='before')
+    @classmethod
+    def normalizar_cnpj_create(cls, v: Optional[str]) -> Optional[str]:
+        """Aceita CNPJ em qualquer formato e normaliza"""
+        if v is None:
+            return v
+        # Remove caracteres nao numericos
+        cnpj = re.sub(r'\D', '', str(v))
+        if len(cnpj) == 14:
+            # Formata: 00.000.000/0000-00
+            return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+        return v
 
 
 class NotaFiscalResponse(NotaFiscalBase):
     """Schema de resposta com campos adicionais do banco"""
-    id: str
-    empresa_id: str
-    created_at: datetime
-    updated_at: datetime
+    id: Optional[str] = None
+    empresa_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
 
     class Config:

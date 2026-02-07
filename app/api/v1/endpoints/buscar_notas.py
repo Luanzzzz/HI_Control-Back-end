@@ -816,7 +816,7 @@ async def limpar_cache_teste(
         Dict com quantidade de registros removidos
     """
     try:
-        logger.info("🗑️ Iniciando limpeza de cache de teste...")
+        logger.info("Iniciando limpeza de cache de teste...")
 
         # Buscar todos os caches
         resultado = db.table("cache_notas_fiscais")\
@@ -840,7 +840,7 @@ async def limpar_cache_teste(
                 .in_("id", ids_remover)\
                 .execute()
 
-        logger.info(f"✅ Cache de teste limpo: {len(ids_remover)} entradas removidas")
+        logger.info(f"Cache de teste limpo: {len(ids_remover)} entradas removidas")
 
         return {
             "success": True,
@@ -849,9 +849,530 @@ async def limpar_cache_teste(
         }
 
     except Exception as e:
-        logger.error(f"❌ Erro ao limpar cache: {e}")
+        logger.error(f"Erro ao limpar cache: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erro ao limpar cache: {str(e)}"
+        )
+
+
+# ============================================
+# ENDPOINT: Importar XML de Nota Fiscal
+# ============================================
+
+from fastapi import UploadFile, File
+from typing import List
+
+
+@router.post(
+    "/importar-xml",
+    summary="Importar nota fiscal via XML",
+    description="""
+    Importa uma nota fiscal a partir de arquivo XML.
+
+    **Formatos suportados:**
+    - NF-e (modelo 55)
+    - NFC-e (modelo 65)
+    - Arquivo procNFe (NF-e com protocolo)
+
+    **Como obter XMLs:**
+    1. Portal Nacional da NF-e: https://www.nfe.fazenda.gov.br/portal
+    2. Download individual de notas autorizadas
+    3. Sistema contabil que exporta XMLs
+
+    **Processo:**
+    1. Valida estrutura do XML
+    2. Extrai dados (chave, emitente, valores, etc)
+    3. Persiste no banco de dados
+    4. Retorna nota importada
+    """,
+    tags=["NFe - Importacao"]
+)
+async def importar_xml_nota(
+    empresa_id: str,
+    arquivo: UploadFile = File(..., description="Arquivo XML da nota fiscal"),
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Importa nota fiscal a partir de arquivo XML.
+    """
+    try:
+        logger.info(f"Importando XML para empresa {empresa_id} - Arquivo: {arquivo.filename}")
+
+        # 1. Validar acesso a empresa
+        from app.dependencies import verificar_acesso_empresa
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Voce nao tem permissao para acessar esta empresa"
+            )
+
+        # 2. Validar arquivo
+        if not arquivo.filename.endswith('.xml'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Arquivo deve ser XML (.xml)"
+            )
+
+        # 3. Ler conteudo
+        xml_content = await arquivo.read()
+
+        if len(xml_content) > 5 * 1024 * 1024:  # 5MB max
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Arquivo muito grande. Maximo 5MB."
+            )
+
+        # 4. Importar usando servico
+        from app.services.real_consulta_service import real_consulta_service
+
+        nota_create, metadados = real_consulta_service.importar_xml(xml_content, empresa_id)
+
+        # 5. Persistir no banco
+        nota_dict = nota_create.model_dump() if hasattr(nota_create, 'model_dump') else nota_create.dict()
+
+        # Converter Decimal para float para JSON
+        for key, value in nota_dict.items():
+            if hasattr(value, '__float__'):
+                nota_dict[key] = float(value)
+
+        # Adicionar XML completo
+        nota_dict['xml_completo'] = metadados.get('xml_completo')
+
+        # Upsert (insert ou update se ja existir)
+        resultado = db.table("notas_fiscais")\
+            .upsert(nota_dict, on_conflict="chave_acesso")\
+            .execute()
+
+        if not resultado.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Erro ao persistir nota no banco"
+            )
+
+        nota_salva = resultado.data[0]
+
+        logger.info(f"XML importado com sucesso: {nota_create.chave_acesso}")
+
+        return {
+            "success": True,
+            "message": "Nota fiscal importada com sucesso",
+            "nota": {
+                "id": nota_salva.get("id"),
+                "chave_acesso": nota_create.chave_acesso,
+                "numero_nf": nota_create.numero_nf,
+                "serie": nota_create.serie,
+                "tipo_nf": nota_create.tipo_nf,
+                "data_emissao": nota_create.data_emissao.isoformat() if nota_create.data_emissao else None,
+                "cnpj_emitente": nota_create.cnpj_emitente,
+                "nome_emitente": nota_create.nome_emitente,
+                "valor_total": float(nota_create.valor_total),
+                "situacao": nota_create.situacao,
+            }
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error(f"Erro de validacao ao importar XML: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"XML invalido: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Erro ao importar XML: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao importar XML: {str(e)}"
+        )
+
+
+@router.post(
+    "/importar-lote",
+    summary="Importar lote de XMLs (ZIP)",
+    description="""
+    Importa multiplas notas fiscais de um arquivo ZIP contendo XMLs.
+
+    **Formato esperado:**
+    - Arquivo ZIP contendo arquivos .xml
+    - Cada XML deve ser uma NF-e/NFC-e valida
+    - Maximo 100 XMLs por lote
+    - Maximo 50MB para o arquivo ZIP
+
+    **Retorno:**
+    - Lista de notas importadas com sucesso
+    - Lista de erros para XMLs invalidos
+    """,
+    tags=["NFe - Importacao"]
+)
+async def importar_lote_xml(
+    empresa_id: str,
+    arquivo: UploadFile = File(..., description="Arquivo ZIP contendo XMLs"),
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Importa lote de XMLs via arquivo ZIP.
+    """
+    import zipfile
+    import io
+
+    try:
+        logger.info(f"Importando lote ZIP para empresa {empresa_id}")
+
+        # 1. Validar acesso
+        from app.dependencies import verificar_acesso_empresa
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Voce nao tem permissao para acessar esta empresa"
+            )
+
+        # 2. Validar arquivo
+        if not arquivo.filename.endswith('.zip'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Arquivo deve ser ZIP (.zip)"
+            )
+
+        # 3. Ler conteudo
+        zip_content = await arquivo.read()
+
+        if len(zip_content) > 50 * 1024 * 1024:  # 50MB max
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Arquivo muito grande. Maximo 50MB."
+            )
+
+        # 4. Processar ZIP
+        from app.services.real_consulta_service import real_consulta_service
+
+        notas_importadas = []
+        erros = []
+
+        with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
+            xml_files = [f for f in zf.namelist() if f.endswith('.xml')]
+
+            if len(xml_files) > 100:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Maximo 100 XMLs por lote"
+                )
+
+            for xml_filename in xml_files:
+                try:
+                    xml_content = zf.read(xml_filename)
+                    nota_create, metadados = real_consulta_service.importar_xml(xml_content, empresa_id)
+
+                    # Persistir
+                    nota_dict = nota_create.model_dump() if hasattr(nota_create, 'model_dump') else nota_create.dict()
+
+                    for key, value in nota_dict.items():
+                        if hasattr(value, '__float__'):
+                            nota_dict[key] = float(value)
+
+                    nota_dict['xml_completo'] = metadados.get('xml_completo')
+
+                    resultado = db.table("notas_fiscais")\
+                        .upsert(nota_dict, on_conflict="chave_acesso")\
+                        .execute()
+
+                    if resultado.data:
+                        notas_importadas.append({
+                            "arquivo": xml_filename,
+                            "chave_acesso": nota_create.chave_acesso,
+                            "numero_nf": nota_create.numero_nf,
+                            "valor_total": float(nota_create.valor_total),
+                        })
+
+                except Exception as e:
+                    erros.append({
+                        "arquivo": xml_filename,
+                        "erro": str(e)
+                    })
+
+        logger.info(f"Lote importado: {len(notas_importadas)} sucesso, {len(erros)} erros")
+
+        return {
+            "success": True,
+            "message": f"Lote processado: {len(notas_importadas)} notas importadas",
+            "total_arquivos": len(xml_files),
+            "importadas": len(notas_importadas),
+            "erros": len(erros),
+            "notas": notas_importadas,
+            "detalhes_erros": erros[:20]  # Limitar erros retornados
+        }
+
+    except HTTPException:
+        raise
+    except zipfile.BadZipFile:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Arquivo ZIP invalido ou corrompido"
+        )
+    except Exception as e:
+        logger.error(f"Erro ao importar lote: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao importar lote: {str(e)}"
+        )
+
+
+# ============================================
+# ENDPOINT: Buscar notas do BANCO (sem SEFAZ)
+# ============================================
+
+@router.get(
+    "/empresas/{empresa_id}/notas",
+    summary="Listar notas fiscais do banco de dados",
+    description="""
+    Lista notas fiscais cadastradas no banco de dados para uma empresa.
+
+    **Fonte de dados:**
+    - Notas importadas via XML
+    - Notas consultadas anteriormente no SEFAZ
+
+    **Filtros disponiveis:**
+    - tipo_nf: NFE, NFCE, CTE, NFSE
+    - situacao: autorizada, cancelada, denegada
+    - data_inicio, data_fim: Periodo de emissao
+    - search: Busca por numero, emitente ou chave
+    """,
+    tags=["NFe - Busca por Empresa"]
+)
+async def listar_notas_empresa(
+    empresa_id: str,
+    tipo_nf: Optional[str] = None,
+    situacao: Optional[str] = None,
+    data_inicio: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Lista notas fiscais do banco de dados (sem consultar SEFAZ).
+    """
+    try:
+        logger.info(f"Listando notas da empresa {empresa_id} do banco de dados")
+
+        # 1. Validar acesso
+        from app.dependencies import verificar_acesso_empresa
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Voce nao tem permissao para acessar esta empresa"
+            )
+
+        # 2. Montar query
+        query = db.table("notas_fiscais")\
+            .select("*")\
+            .eq("empresa_id", empresa_id)\
+            .order("data_emissao", desc=True)
+
+        # 3. Aplicar filtros
+        if tipo_nf:
+            query = query.eq("tipo_nf", tipo_nf.upper())
+
+        if situacao:
+            query = query.eq("situacao", situacao.lower())
+
+        if data_inicio:
+            query = query.gte("data_emissao", data_inicio)
+
+        if data_fim:
+            query = query.lte("data_emissao", data_fim)
+
+        if search:
+            query = query.or_(
+                f"numero_nf.ilike.%{search}%,"
+                f"nome_emitente.ilike.%{search}%,"
+                f"chave_acesso.ilike.%{search}%"
+            )
+
+        # 4. Paginacao
+        query = query.range(offset, offset + limit - 1)
+
+        # 5. Executar
+        resultado = query.execute()
+
+        if not resultado.data:
+            return {
+                "success": True,
+                "fonte": "banco_de_dados",
+                "empresa_id": empresa_id,
+                "total": 0,
+                "notas": [],
+                "message": "Nenhuma nota encontrada. Importe XMLs ou consulte o SEFAZ."
+            }
+
+        # 6. Formatar notas
+        notas = []
+        for row in resultado.data:
+            nota = {
+                "id": row.get("id"),
+                "chave_acesso": row.get("chave_acesso", ""),
+                "numero_nf": row.get("numero_nf", ""),
+                "serie": row.get("serie", "1"),
+                "tipo_nf": row.get("tipo_nf", "NFE"),
+                "data_emissao": row.get("data_emissao"),
+                "cnpj_emitente": row.get("cnpj_emitente", ""),
+                "nome_emitente": row.get("nome_emitente", ""),
+                "cnpj_destinatario": row.get("cnpj_destinatario"),
+                "nome_destinatario": row.get("nome_destinatario"),
+                "valor_total": float(row.get("valor_total", 0)),
+                "situacao": row.get("situacao", "autorizada"),
+                "tem_xml": bool(row.get("xml_completo") or row.get("xml_resumo")),
+            }
+            notas.append(nota)
+
+        logger.info(f"Encontradas {len(notas)} notas no banco para empresa {empresa_id}")
+
+        return {
+            "success": True,
+            "fonte": "banco_de_dados",
+            "empresa_id": empresa_id,
+            "total": len(notas),
+            "limit": limit,
+            "offset": offset,
+            "notas": notas,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao listar notas: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao listar notas: {str(e)}"
+        )
+
+
+# ============================================
+# ENDPOINT: Consultar nota por chave no SEFAZ
+# ============================================
+
+@router.get(
+    "/consultar-chave/{chave_acesso}",
+    summary="Consultar nota por chave de acesso no SEFAZ",
+    description="""
+    Consulta uma NF-e especifica no SEFAZ usando a chave de acesso.
+
+    **Requer certificado digital** - Usa NfeConsultaProtocolo.
+
+    **Uso:**
+    - Verificar status atual de uma nota
+    - Obter protocolo de autorizacao
+    - Confirmar se nota existe no SEFAZ
+
+    **Alternativa sem certificado:**
+    Use o endpoint /importar-xml com XML baixado do Portal NF-e.
+    """,
+    tags=["NFe - Consulta SEFAZ"]
+)
+async def consultar_nota_sefaz(
+    chave_acesso: str,
+    empresa_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Consulta nota no SEFAZ por chave de acesso.
+    """
+    try:
+        logger.info(f"Consultando SEFAZ - Chave: {chave_acesso}")
+
+        # 1. Validar chave
+        if not chave_acesso or len(chave_acesso) != 44 or not chave_acesso.isdigit():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Chave de acesso invalida. Deve ter 44 digitos numericos."
+            )
+
+        # 2. Validar acesso
+        from app.dependencies import verificar_acesso_empresa
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Voce nao tem permissao para acessar esta empresa"
+            )
+
+        # 3. Verificar certificado
+        from app.services.certificado_service import certificado_service
+
+        status_cert = await certificado_service.validar_status_empresa(empresa_id)
+
+        if status_cert["status"] in ["ausente", "vencido"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "certificado_indisponivel",
+                    "mensagem": "Certificado digital necessario para consulta no SEFAZ. " +
+                                "Alternativa: baixe o XML no Portal NF-e e use /importar-xml",
+                    "portal_nfe": "https://www.nfe.fazenda.gov.br/portal"
+                }
+            )
+
+        # 4. Obter certificado
+        cert_data = await certificado_service.obter_certificado_empresa(empresa_id)
+
+        if not cert_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Nao foi possivel obter certificado da empresa"
+            )
+
+        # 5. Extrair UF da chave
+        codigo_uf = chave_acesso[:2]
+        uf_map = {
+            "11": "RO", "12": "AC", "13": "AM", "14": "RR", "15": "PA",
+            "16": "AP", "17": "TO", "21": "MA", "22": "PI", "23": "CE",
+            "24": "RN", "25": "PB", "26": "PE", "27": "AL", "28": "SE",
+            "29": "BA", "31": "MG", "32": "ES", "33": "RJ", "35": "SP",
+            "41": "PR", "42": "SC", "43": "RS", "50": "MS", "51": "MT",
+            "52": "GO", "53": "DF",
+        }
+        uf = uf_map.get(codigo_uf, "SP")
+
+        # 6. Consultar SEFAZ usando endpoint 'consulta' (NfeConsultaProtocolo)
+        response = sefaz_service.consultar_nfe(
+            chave_acesso=chave_acesso,
+            empresa_uf=uf,
+            cert_bytes=cert_data.get('cert_bytes'),
+            senha_cert=cert_data.get('senha')
+        )
+
+        # 7. Retornar resultado
+        return {
+            "success": True,
+            "fonte": "sefaz",
+            "chave_acesso": chave_acesso,
+            "uf": uf,
+            "status_codigo": response.status_codigo,
+            "status_descricao": response.status_descricao,
+            "protocolo": response.protocolo,
+            "data_autorizacao": response.data_autorizacao if hasattr(response, 'data_autorizacao') else None,
+        }
+
+    except HTTPException:
+        raise
+    except SefazException as e:
+        logger.error(f"Erro SEFAZ ao consultar chave: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "sefaz_error",
+                "codigo": e.codigo,
+                "mensagem": e.mensagem
+            }
+        )
+    except Exception as e:
+        logger.error(f"Erro ao consultar chave: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao consultar SEFAZ: {str(e)}"
         )
 

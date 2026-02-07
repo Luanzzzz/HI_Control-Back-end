@@ -907,7 +907,7 @@ class SefazService:
         # TODO: Inserir no banco de dados na tabela sefaz_log
 
     # ============================================
-    # BUSCA DE NOTAS (DISTRIBUIÇÃO DFE)
+    # BUSCA DE NOTAS (BANCO DE DADOS)
     # ============================================
 
     def buscar_notas_por_cnpj(
@@ -917,307 +917,122 @@ class SefazService:
         nsu_inicial: Optional[int] = None,
     ):
         """
-        Busca NFes distribuídas para um CNPJ via DistribuicaoDFe.
-        
-        NÃO REQUER CERTIFICADO DIGITAL - Consulta pública SEFAZ.
-        
+        Busca notas fiscais cadastradas no banco de dados para um CNPJ/Empresa.
+
+        IMPORTANTE: Este metodo consulta o BANCO DE DADOS LOCAL, nao o SEFAZ.
+
+        Para obter novas notas:
+        1. Importe XMLs via endpoint /importar-xml
+        2. Use /consultar-chave para verificar notas especificas no SEFAZ
+
         Args:
-            cnpj: CNPJ para consultar (14 dígitos sem formatação)
+            cnpj: CNPJ para consultar (14 digitos sem formatacao)
             empresa_id: UUID da empresa no banco
-            nsu_inicial: NSU para retomar consulta (None = buscar desde o início)
-        
+            nsu_inicial: NSU para paginacao (offset)
+
         Returns:
-            DistribuicaoResponseModel com lista de notas encontradas
-        
-        Raises:
-            SefazException: Em caso de erro na consulta
+            DistribuicaoResponseModel com lista de notas do banco
         """
         from app.models.nfe_busca import (
             DistribuicaoResponseModel,
             NFeBuscadaMetadata,
-            mapear_situacao_nfe
-        )
-        from app.utils.xml_utils import (
-            extrair_status_code,
-            extrair_motivo,
-            extrair_chave_acesso,
-            extrair_cnpj_emitente,
-            extrair_nome_emitente,
-            extrair_cnpj_destinatario,
-            extrair_cpf_destinatario,
-            extrair_nome_destinatario,
-            extrair_valor_total,
-            extrair_nsu,
-            extrair_situacao_nfe,
-            extrair_data_emissao,
-            extrair_tipo_operacao,
-            extrair_protocolo,
         )
         from decimal import Decimal
         from datetime import datetime
-        
-        logger.info(f"Iniciando busca DistribuicaoDFe para CNPJ: {cnpj}")
-        
-        # 1. Determinar UF a partir do CNPJ (primeiros 2 dígitos após os 8 primeiros)
-        # Por simplicidade, usar SP como padrão (em produção, consultar RF ou usar tabela)
-        uf = "SP"  # TODO: Implementar lógica de UF por CNPJ
-        
-        # 2. Construir XML de requisição DistribuicaoDFe
-        nsu = nsu_inicial if nsu_inicial is not None else 0
-        xml_request = self._construir_xml_distribuicao(cnpj, nsu, uf)
-        
-        # 3. Enviar para SEFAZ (ou mock)
-        try:
-            # Verificar se deve usar mock
-            import os
-            use_mock = os.getenv("USE_MOCK_SEFAZ", "false").lower() == "true"  # ALTERADO: false por padrão
+        from app.db.supabase_client import supabase_admin
 
-            if use_mock:
-                from app.adapters.mock_sefaz_client import get_distribuicao_client
-                mock_client = get_distribuicao_client()
-                xml_response = mock_client.consultar(cnpj=cnpj, nsu_inicial=nsu, uf=uf)
-                logger.warning("⚠️  USANDO MOCK SEFAZ - Dados de teste! ⚠️")
-                logger.warning("⚠️  Para usar dados REAIS, configure: USE_MOCK_SEFAZ=false ⚠️")
+        logger.info(f"Buscando notas no banco de dados para empresa: {empresa_id}")
+
+        try:
+            # 1. Consultar banco de dados
+            offset = nsu_inicial if nsu_inicial else 0
+
+            resultado = supabase_admin.table("notas_fiscais")\
+                .select("*")\
+                .eq("empresa_id", empresa_id)\
+                .order("data_emissao", desc=True)\
+                .range(offset, offset + 49)\
+                .execute()
+
+            # 2. Contar total de notas
+            count_result = supabase_admin.table("notas_fiscais")\
+                .select("id", count="exact")\
+                .eq("empresa_id", empresa_id)\
+                .execute()
+
+            total_notas = count_result.count if hasattr(count_result, 'count') else len(resultado.data or [])
+
+            # 3. Converter para NFeBuscadaMetadata
+            notas_encontradas = []
+
+            if resultado.data:
+                for row in resultado.data:
+                    try:
+                        # Determinar tipo_operacao (1=saida, 0=entrada)
+                        tipo_op = row.get("tipo_operacao", "saida")
+                        tipo_operacao_codigo = "1" if tipo_op == "saida" else "0"
+
+                        # Parse data_emissao
+                        data_str = row.get("data_emissao")
+                        if data_str:
+                            if isinstance(data_str, str):
+                                data_emissao = datetime.fromisoformat(data_str.replace("Z", "+00:00"))
+                            else:
+                                data_emissao = data_str
+                        else:
+                            data_emissao = datetime.now()
+
+                        nfe_metadata = NFeBuscadaMetadata(
+                            chave_acesso=row.get("chave_acesso", ""),
+                            nsu=row.get("nsu", 0) or 0,
+                            data_emissao=data_emissao,
+                            tipo_operacao=tipo_operacao_codigo,
+                            valor_total=Decimal(str(row.get("valor_total", 0))),
+                            cnpj_emitente=row.get("cnpj_emitente", ""),
+                            nome_emitente=row.get("nome_emitente", ""),
+                            cnpj_destinatario=row.get("cnpj_destinatario"),
+                            cpf_destinatario=row.get("cpf_destinatario"),
+                            nome_destinatario=row.get("nome_destinatario"),
+                            situacao=row.get("situacao", "autorizada"),
+                            situacao_codigo="1" if row.get("situacao") == "autorizada" else "3",
+                            protocolo=row.get("protocolo"),
+                            xml_resumo=row.get("xml_resumo") or row.get("xml_completo"),
+                        )
+
+                        notas_encontradas.append(nfe_metadata)
+
+                    except Exception as e:
+                        logger.error(f"Erro ao converter nota do banco: {e}")
+                        continue
+
+            # 4. Calcular NSUs para paginacao
+            ultimo_nsu = offset + len(notas_encontradas)
+            max_nsu = total_notas
+
+            # 5. Preparar resposta
+            if notas_encontradas:
+                status_codigo = "138"  # Sucesso
+                motivo = f"Encontradas {len(notas_encontradas)} notas no banco de dados"
             else:
-                logger.info("✅ Consultando SEFAZ REAL - Dados autênticos")
-                logger.info(f"   CNPJ: {cnpj}, NSU Inicial: {nsu}, UF: {uf}")
-                endpoint = self._obter_url_sefaz(uf, "distribuicao")
-                xml_response = self._enviar_para_sefaz(
-                    url=endpoint,
-                    xml=xml_request,
-                    operacao="distribuicao_dfe"
-                )
-                
-        except Exception as e:
-            logger.error(f"Erro ao consultar DistribuicaoDFe: {e}")
-            raise SefazException("999", f"Erro na comunicação: {str(e)}", None)
-        
-        # 4. Parsear resposta
-        status_codigo = extrair_status_code(xml_response) or "999"
-        motivo = extrair_motivo(xml_response) or "Erro desconhecido"
-        
-        # Extrair NSUs
-        ultimo_nsu = self._extrair_ultimo_nsu(xml_response)
-        max_nsu = self._extrair_max_nsu(xml_response)
-        
-        # 5. Extrair resumos de NFe (resNFe)
-        resumos_xml = self._extrair_resumos_nfe(xml_response)
-        
-        notas_encontradas = []
-        for resumo_xml in resumos_xml:
-            try:
-                # Parsear cada resNFe
-                chave = extrair_chave_acesso(resumo_xml)
-                if not chave:
-                    continue
-                
-                # Extrair metadados
-                data_emissao_str = extrair_data_emissao(resumo_xml)
-                data_emissao = datetime.fromisoformat(data_emissao_str.replace("Z", "+00:00")) if data_emissao_str else datetime.now()
-                
-                valor_str = extrair_valor_total(resumo_xml) or "0"
-                valor_total = Decimal(valor_str)
-                
-                situacao_codigo = extrair_situacao_nfe(resumo_xml) or "1"
-                situacao = mapear_situacao_nfe(situacao_codigo)
-                
-                nfe_metadata = NFeBuscadaMetadata(
-                    chave_acesso=chave,
-                    nsu=extrair_nsu(resumo_xml) or 0,
-                    data_emissao=data_emissao,
-                    tipo_operacao=extrair_tipo_operacao(resumo_xml) or "1",
-                    valor_total=valor_total,
-                    cnpj_emitente=extrair_cnpj_emitente(resumo_xml) or "",
-                    nome_emitente=extrair_nome_emitente(resumo_xml) or "",
-                    cnpj_destinatario=extrair_cnpj_destinatario(resumo_xml),
-                    cpf_destinatario=extrair_cpf_destinatario(resumo_xml),
-                    nome_destinatario=extrair_nome_destinatario(resumo_xml),
-                    situacao=situacao,
-                    situacao_codigo=situacao_codigo,
-                    protocolo=extrair_protocolo(resumo_xml),
-                    xml_resumo=resumo_xml,  # Armazena XML resumo para download
-                )
-                
-                notas_encontradas.append(nfe_metadata)
-                
-            except Exception as e:
-                logger.error(f"Erro ao parsear resNFe: {e}")
-                continue
-        
-        # 6. Preparar response
-        response = DistribuicaoResponseModel(
-            status_codigo=status_codigo,
-            motivo=motivo,
-            notas_encontradas=notas_encontradas,
-            ultimo_nsu=ultimo_nsu,
-            max_nsu=max_nsu,
-            total_notas=len(notas_encontradas)
-        )
-        
-        # 7. Persistir notas no banco (evitando duplicidades)
-        if notas_encontradas:
-            self._persistir_notas_buscadas(notas_encontradas, empresa_id)
-        
-        # 8. Registrar log
-        self._log_operacao(
-            operacao="consulta_distribuicao",
-            cnpj=cnpj,
-            numero="N/A",
-            serie="N/A",
-            xml_request=xml_request,
-            xml_response=xml_response,
-            status=status_codigo
-        )
-        
-        logger.info(f"Busca concluída: {len(notas_encontradas)} notas encontradas")
-        
-        return response
+                status_codigo = "137"  # Nenhum documento
+                motivo = "Nenhuma nota encontrada no banco de dados. Importe XMLs via /importar-xml"
 
-    def _construir_xml_distribuicao(
-        self, 
-        cnpj: str, 
-        nsu: int,
-        uf: str
-    ) -> str:
-        """
-        Constrói XML de requisição DistribuicaoDFe.
-        
-        Args:
-            cnpj: CNPJ do interessado
-            nsu: NSU inicial para consulta
-            uf: UF para consulta
-        
-        Returns:
-            XML formatado para envio SEFAZ
-        """
-        # Por simplicidade, usar template manual
-        # Em produção, poderia usar PyNFE se disponível
-        
-        codigo_uf = self._obter_codigo_uf(uf)
-        
-        xml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
-    <tpAmb>2</tpAmb>
-    <cUFAutor>{codigo_uf}</cUFAutor>
-    <CNPJ>{cnpj}</CNPJ>
-    <distNSU>
-        <ultNSU>{nsu:015d}</ultNSU>
-    </distNSU>
-</distDFeInt>'''
-        
-        return xml
-
-    def _extrair_resumos_nfe(self, xml_response: str) -> List[str]:
-        """
-        Extrai todos os resNFe do XML de distribuição.
-        
-        Args:
-            xml_response: XML de retorno DistribuicaoDFe
-        
-        Returns:
-            Lista de XMLs resNFe (strings)
-        """
-        try:
-            from lxml import etree
-            
-            root = etree.fromstring(xml_response.encode('utf-8'))
-            namespace = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-            
-            resumos = []
-            for res_nfe_elem in root.findall('.//nfe:resNFe', namespace):
-                # Converter elemento de volta para string XML
-                resumo_xml = etree.tostring(res_nfe_elem, encoding='unicode')
-                resumos.append(resumo_xml)
-            
-            return resumos
-            
-        except Exception as e:
-            logger.error(f"Erro ao extrair resumos NFe: {e}")
-            return []
-
-    def _extrair_ultimo_nsu(self, xml_response: str) -> int:
-        """Extrai ultNSU do XML de distribuição"""
-        try:
-            from lxml import etree
-            root = etree.fromstring(xml_response.encode('utf-8'))
-            elem = root.find('.//{*}ultNSU')
-            if elem is not None and elem.text:
-                return int(elem.text.strip())
-            return 0
-        except:
-            return 0
-
-    def _extrair_max_nsu(self, xml_response: str) -> int:
-        """Extrai maxNSU do XML de distribuição"""
-        try:
-            from lxml import etree
-            root = etree.fromstring(xml_response.encode('utf-8'))
-            elem = root.find('.//{*}maxNSU')
-            if elem is not None and elem.text:
-                return int(elem.text.strip())
-            return 0
-        except:
-            return 0
-
-    def _persistir_notas_buscadas(
-        self,
-        notas: List,
-        empresa_id: str
-    ):
-        """
-        Persiste notas encontradas no banco de dados.
-        
-        Evita duplicidades usando upsert atômico baseado em chave_acesso.
-        
-        Args:
-            notas: Lista de NFeBuscadaMetadata
-            empresa_id: UUID da empresa
-        """
-        if not notas:
-            logger.info("Nenhuma nota para persistir")
-            return
-        
-        logger.info(f"Persistindo {len(notas)} notas no banco...")
-        
-        try:
-            from app.services.nfe_mapper import map_nfe_buscada_to_nota_fiscal
-            from app.repositories.nota_fiscal_repository import NotaFiscalRepository
-            from app.db.supabase_client import supabase_admin
-            
-            # Inicializar repository
-            repository = NotaFiscalRepository(supabase_admin)
-            
-            # Converter NFeBuscadaMetadata para NotaFiscalCreate
-            notas_create = []
-            for nfe_metadata in notas:
-                try:
-                    nota_create = map_nfe_buscada_to_nota_fiscal(nfe_metadata, empresa_id)
-                    notas_create.append(nota_create)
-                except ValueError as e:
-                    logger.error(f"Erro ao mapear nota {nfe_metadata.chave_acesso}: {e}")
-                    continue
-                except Exception as e:
-                    logger.error(f"Erro inesperado ao mapear nota: {e}")
-                    continue
-            
-            if not notas_create:
-                logger.warning("Nenhuma nota válida para persistir após mapeamento")
-                return
-            
-            # Upsert em lote (mais eficiente)
-            notas_persistidas = repository.upsert_lote(notas_create)
-            
-            logger.info(
-                f"✅ Persistência concluída: {len(notas_persistidas)} notas processadas"
+            response = DistribuicaoResponseModel(
+                status_codigo=status_codigo,
+                motivo=motivo,
+                notas_encontradas=notas_encontradas,
+                ultimo_nsu=ultimo_nsu,
+                max_nsu=max_nsu,
+                total_notas=len(notas_encontradas)
             )
-            
-        except Exception as e:
-            logger.error(f"❌ Erro ao persistir notas no banco: {e}", exc_info=True)
-            # Não propagar erro para não quebrar o fluxo da busca
-            # As notas ainda são retornadas ao usuário mesmo se persistência falhar
 
-            # Não propagar erro para não quebrar o fluxo da busca
-            # As notas ainda são retornadas ao usuário mesmo se persistência falhar
+            logger.info(f"Busca no banco concluida: {len(notas_encontradas)} notas encontradas")
+
+            return response
+
+        except Exception as e:
+            logger.error(f"Erro ao buscar notas no banco: {e}", exc_info=True)
+            raise SefazException("999", f"Erro ao consultar banco de dados: {str(e)}", None)
 
 
     # ============================================
@@ -1232,14 +1047,15 @@ class SefazService:
         nsu_inicial: Optional[int],
     ):
         """
-        Wrapper para execução assíncrona via BackgroundTasks.
+        Wrapper para execucao assincrona via BackgroundTasks.
         Gerencia ciclo de vida do Job (processing -> completed/failed).
+
+        IMPORTANTE: Esta busca consulta o BANCO DE DADOS local.
+        Para novas notas, use /importar-xml.
         """
         from app.db.supabase_client import supabase_admin
-        import os
-        import json
 
-        logger.info(f"[JOB] Iniciando Job {job_id} para CNPJ {cnpj}")
+        logger.info(f"[JOB] Iniciando Job {job_id} para empresa {empresa_id}")
 
         try:
             # 1. Atualizar status para PROCESSING
@@ -1248,50 +1064,38 @@ class SefazService:
                 "updated_at": datetime.now().isoformat()
             }).eq("id", job_id).execute()
 
-            # 2. Verificar certificado e forçar MOCK se necessário (Auditoria de Produção)
-            # Verifica se variáveis de certificado essenciais estão presentes
-            has_cert_env = os.getenv("CERTIFICATE_PASSWORD") and (
-                os.getenv("CERTIFICATE_A1_FILE") or os.getenv("CERTIFICATE_A1_BASE64")
-            )
-            
-            # Se não tem certificado configurado, força uso do Mock
-            if not has_cert_env:
-                logger.warning(f"[JOB] {job_id}: Certificado não detectado. Ativando MOCK_PRODUCTION.")
-                os.environ["USE_MOCK_SEFAZ"] = "true"
-            else:
-                logger.info(f"[JOB] {job_id}: Certificado detectado. Tentando busca real.")
-
-            # 3. Executar Busca (Síncrona - roda na thread pool do FastAPI)
+            # 2. Executar busca no banco de dados
             response = self.buscar_notas_por_cnpj(
                 cnpj=cnpj,
                 empresa_id=empresa_id,
                 nsu_inicial=nsu_inicial
             )
 
-            # 4. Atualizar status para COMPLETED
+            # 3. Atualizar status para COMPLETED
             result_payload = {
                 "success": response.sucesso,
                 "total_notas": response.total_notas,
                 "ultimo_nsu": response.ultimo_nsu,
                 "max_nsu": response.max_nsu,
                 "mensagem": response.motivo,
+                "fonte": "banco_de_dados",
                 "notas_resumo": [
-                    {"chave": n.chave_acesso, "valor": float(n.valor_total)} 
-                    for n in response.notas_encontradas[:50] # Limitar tamanho do JSON
+                    {"chave": n.chave_acesso, "valor": float(n.valor_total)}
+                    for n in response.notas_encontradas[:50]
                 ]
             }
 
             supabase_admin.table("background_jobs").update({
                 "status": "completed",
-                "result": result_payload,  # Supabase converte dict para jsonb automaticamente via client? Geralmente sim.
+                "result": result_payload,
                 "updated_at": datetime.now().isoformat()
             }).eq("id", job_id).execute()
-            
-            logger.info(f"[JOB] Job {job_id} concluído com sucesso.")
+
+            logger.info(f"[JOB] Job {job_id} concluido com sucesso - {response.total_notas} notas")
 
         except Exception as e:
             logger.error(f"[JOB] Job {job_id} falhou: {e}", exc_info=True)
-            
+
             supabase_admin.table("background_jobs").update({
                 "status": "failed",
                 "error": str(e),
