@@ -171,7 +171,13 @@ async def autorizar_nfce(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_cert = "senha_placeholder"  # TODO: gestão segura
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 4. Auto-incremento de numeração
         numero_nf = nfce.numero_nf

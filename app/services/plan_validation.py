@@ -56,19 +56,18 @@ async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
         HTTPException 403: Se nenhuma assinatura ativa encontrada
     """
     # BYPASS PARA DESENVOLVIMENTO - Retornar plano Enterprise fictício
+    # Em produção, DEVE ter ENVIRONMENT=production para desabilitar este bypass
     import os
-    env = os.getenv("ENVIRONMENT", "development")  # Default to development se não definido
+    env = os.getenv("ENVIRONMENT", "development")
     if env != "production":
         logger.warning(
-            f"🔓 [DEV MODE] Bypass de validação de assinatura ativo para usuário {usuario_id}. "
-            f"Retornando plano ENTERPRISE fictício. "
-            f"Ambiente: {env} | "
-            f"⚠️ ATENÇÃO: Isso NÃO deve estar ativo em produção!"
+            f"[DEV MODE] Bypass de assinatura ativo (usuario={usuario_id[:8]}...). "
+            f"Ambiente: {env}. Defina ENVIRONMENT=production para desabilitar."
         )
         return {
             "nome": "enterprise",
             "limites": PlanLimits.ENTERPRISE,
-            "assinatura_id": "dev-mock-assinatura-id",
+            "assinatura_id": f"dev-bypass-{usuario_id[:8]}",
             "modulos": ["nfe_emissao", "nfe_consulta", "certificados", "relatorios", "api_acesso"]
         }
 

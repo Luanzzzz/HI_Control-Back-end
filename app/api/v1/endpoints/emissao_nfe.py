@@ -148,14 +148,18 @@ async def autorizar_nfe(
                 f"Certificado próximo da expiração: {cert_status['alerta']}"
             )
 
-        # 3. Descriptografar certificado
+        # 3. Descriptografar certificado e obter senha
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
 
-        # TODO: Obter senha do certificado de forma segura
-        # Em produção, senha deve vir de cache ou ser solicitada ao usuário
-        senha_cert = "senha_placeholder"
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 4. Enviar para SEFAZ
         logger.info(
@@ -318,7 +322,13 @@ async def consultar_nfe(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_cert = "senha_placeholder"  # TODO: Gestão segura de senha
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 3. Consultar SEFAZ
         logger.info(f"Consultando NF-e: {chave_acesso}")
@@ -449,7 +459,13 @@ async def cancelar_nfe(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_cert = "senha_placeholder"
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 5. Cancelar na SEFAZ
         logger.info(f"Cancelando NF-e {chave_acesso}: {motivo}")
@@ -771,7 +787,13 @@ async def inutilizar_numeracao(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_cert = "senha_placeholder"
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         sefaz_response = sefaz_service.inutilizar_numeracao(
             empresa_cnpj=empresa["cnpj"],

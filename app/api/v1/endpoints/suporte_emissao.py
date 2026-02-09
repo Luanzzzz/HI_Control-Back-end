@@ -625,6 +625,30 @@ async def status_contingencia(
     return contingencia_service.obter_status()
 
 
+@router.get(
+    "/contingencia",
+    summary="Verificar contingência (alias)",
+)
+async def verificar_contingencia(
+    usuario: dict = Depends(get_current_user),
+):
+    """
+    Alias para /contingencia/status.
+    Verifica se SEFAZ está em contingência.
+    """
+    from app.services.contingencia_service import contingencia_service
+    status = contingencia_service.obter_status()
+    return {
+        "success": True,
+        "data": {
+            "contingencia_ativa": status["em_contingencia"],
+            "modo": status["modo"],
+            "modo_nome": status["modo_nome"],
+            "mensagem": status["motivo"] or "SEFAZ operando normalmente",
+        }
+    }
+
+
 # ============================================
 # VALIDAÇÃO AUXILIAR
 # ============================================

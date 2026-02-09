@@ -181,7 +181,13 @@ async def autorizar_cte(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_cert = "senha_placeholder"  # TODO: gestão segura
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 3. Auto-incremento
         numero_ct = cte.numero_ct
@@ -298,12 +304,19 @@ async def consultar_cte(
     cert_bytes = certificado_service.descriptografar_certificado(
         emp["certificado_a1"]
     )
+    senha_encrypted = emp.get("certificado_senha_encrypted")
+    if not senha_encrypted:
+        raise HTTPException(
+            status_code=400,
+            detail="Senha do certificado não configurada. Faça o reupload do certificado."
+        )
+    senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
     resultado = await cte_service.consultar_cte(
         chave_acesso=chave_acesso,
         uf=emp["uf"],
         cert_bytes=cert_bytes,
-        senha_cert="senha_placeholder",
+        senha_cert=senha_cert,
     )
 
     return resultado
@@ -355,6 +368,13 @@ async def cancelar_cte(
     cert_bytes = certificado_service.descriptografar_certificado(
         emp["certificado_a1"]
     )
+    senha_encrypted = emp.get("certificado_senha_encrypted")
+    if not senha_encrypted:
+        raise HTTPException(
+            status_code=400,
+            detail="Senha do certificado não configurada. Faça o reupload do certificado."
+        )
+    senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
     resultado = await cte_service.cancelar_cte(
         chave_acesso=chave_acesso,
@@ -363,7 +383,7 @@ async def cancelar_cte(
         cnpj=emp["cnpj"],
         uf=emp["uf"],
         cert_bytes=cert_bytes,
-        senha_cert="senha_placeholder",
+        senha_cert=senha_cert,
     )
 
     if resultado.get("cancelado"):

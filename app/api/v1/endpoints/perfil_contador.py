@@ -184,13 +184,10 @@ async def obter_perfil(
     user_id = usuario["id"]
 
     try:
-        # Buscar dados do usuário
+        # Buscar dados do usuário - usar SELECT * para evitar erro de colunas inexistentes
+        # caso a migration add_accounting_certificate_fields.sql não tenha sido executada
         response = db.table("usuarios") \
-            .select(
-                "razao_social_contador, cnpj_contador, inscricao_estadual_contador, "
-                "logo_url_contador, certificado_contador_validade, "
-                "certificado_contador_titular, certificado_contador_emissor"
-            ) \
+            .select("*") \
             .eq("id", user_id) \
             .single() \
             .execute()
@@ -217,6 +214,21 @@ async def obter_perfil(
         raise
     except Exception as e:
         logger.error(f"Erro ao obter perfil do contador: {e}", exc_info=True)
+        # Se erro for de coluna inexistente, retornar perfil vazio
+        if "does not exist" in str(e):
+            logger.warning(
+                "Colunas do perfil contador não encontradas. "
+                "Execute a migration: database/migrations/add_accounting_certificate_fields.sql"
+            )
+            return PerfilContadorResponse(
+                razao_social=None,
+                cnpj=None,
+                inscricao_estadual=None,
+                logo_url=None,
+                certificado_validade=None,
+                certificado_titular=None,
+                certificado_emissor=None,
+            )
         raise HTTPException(
             status_code=500,
             detail=f"Erro interno: {str(e)}"
@@ -434,12 +446,14 @@ async def upload_certificado(
         cert_criptografado = resultado["cert_criptografado"]
         info = resultado["info"]
 
-        # Armazenar no perfil do contador
+        # Armazenar no perfil do contador (inclui senha criptografada)
+        senha_encrypted = certificado_service.criptografar_senha(request.senha)
         db.table("usuarios").update({
             "certificado_contador_a1": cert_criptografado,
             "certificado_contador_validade": info["data_fim"].isoformat(),
             "certificado_contador_titular": info["titular"],
             "certificado_contador_emissor": info["emissor"],
+            "certificado_contador_senha_encrypted": senha_encrypted,
         }).eq("id", user_id).execute()
 
         logger.info(
@@ -531,12 +545,9 @@ async def verificar_status_certificado(
     user_id = usuario["id"]
 
     try:
-        # Buscar dados do certificado
+        # Buscar dados do certificado - usar SELECT * para evitar erro de colunas inexistentes
         response = db.table("usuarios") \
-            .select(
-                "certificado_contador_validade, certificado_contador_titular, "
-                "certificado_contador_emissor"
-            ) \
+            .select("*") \
             .eq("id", user_id) \
             .single() \
             .execute()
@@ -581,6 +592,21 @@ async def verificar_status_certificado(
         raise
     except Exception as e:
         logger.error(f"Erro ao verificar status do certificado: {e}", exc_info=True)
+        # Se erro for de coluna inexistente, retornar status ausente
+        if "does not exist" in str(e):
+            logger.warning(
+                "Colunas do certificado contador não encontradas. "
+                "Execute a migration: database/migrations/add_accounting_certificate_fields.sql"
+            )
+            return CertificadoStatusResponse(
+                validade=None,
+                dias_restantes=None,
+                status="ausente",
+                requer_atencao=True,
+                alerta="Certificado digital não cadastrado. Execute as migrations pendentes.",
+                titular=None,
+                emissor=None,
+            )
         raise HTTPException(
             status_code=500,
             detail=f"Erro interno: {str(e)}"
