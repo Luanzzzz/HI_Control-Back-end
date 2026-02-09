@@ -6,12 +6,46 @@ from typing import List, Optional
 from supabase import Client
 from app.dependencies import get_db, get_admin_db, get_current_user
 from app.models.empresa import EmpresaCreate, EmpresaResponse
+from app.services.municipio_service import (
+    resolver_municipio_por_cidade_uf,
+    resolver_municipio_por_codigo,
+)
 from datetime import datetime
 import logging
 import re
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+async def _preencher_municipio(empresa_dict: dict) -> dict:
+    """
+    Preenche municipio_codigo e municipio_nome automaticamente usando cidade + UF.
+    """
+    cidade = empresa_dict.get("cidade")
+    estado = empresa_dict.get("estado")
+    municipio_codigo = empresa_dict.get("municipio_codigo")
+    municipio_nome = empresa_dict.get("municipio_nome")
+
+    # Se já veio município completo, manter
+    if municipio_codigo and municipio_nome:
+        return empresa_dict
+
+    # Se veio código, tentar resolver nome
+    if municipio_codigo and not municipio_nome:
+        resolvido = await resolver_municipio_por_codigo(municipio_codigo)
+        if resolvido:
+            empresa_dict["municipio_codigo"], empresa_dict["municipio_nome"] = resolvido
+        return empresa_dict
+
+    # Se não veio código, resolver via cidade + UF
+    if cidade and estado:
+        resolvido = await resolver_municipio_por_cidade_uf(cidade, estado)
+        if resolvido:
+            empresa_dict["municipio_codigo"], empresa_dict["municipio_nome"] = resolvido
+        return empresa_dict
+
+    return empresa_dict
 
 
 @router.get("", response_model=List[EmpresaResponse])
@@ -141,6 +175,7 @@ async def criar_empresa(
             logger.info(f"Atualizando empresa existente: {empresa_existente['id']} - CNPJ {cnpj}")
 
             update_data = {k: v for k, v in empresa_dict.items() if k not in ("usuario_id",)}
+            update_data = await _preencher_municipio(update_data)
             update_data["updated_at"] = datetime.utcnow().isoformat()
 
             update_response = db.table("empresas")\
@@ -164,6 +199,7 @@ async def criar_empresa(
         logger.info(f"Criando nova empresa: CNPJ {cnpj}")
 
         now = datetime.utcnow().isoformat()
+        empresa_dict = await _preencher_municipio(empresa_dict)
         empresa_dict["created_at"] = now
         empresa_dict["updated_at"] = now
         empresa_dict["ativa"] = True
@@ -242,6 +278,7 @@ async def atualizar_empresa(
          raise HTTPException(status_code=404, detail="Empresa não encontrada")
 
     empresa_dict = empresa.dict(exclude={"usuario_id"})
+    empresa_dict = await _preencher_municipio(empresa_dict)
     empresa_dict["updated_at"] = datetime.now().isoformat()
     
     response = db.table("empresas")\
@@ -250,6 +287,65 @@ async def atualizar_empresa(
         .execute()
         
     return response.data[0]
+
+
+@router.post("/{empresa_id}/reprocessar-municipio", response_model=EmpresaResponse)
+async def reprocessar_municipio_empresa(
+    empresa_id: str,
+    usuario: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
+):
+    """
+    Reprocessa o município de uma empresa existente (cidade + UF → IBGE).
+    """
+    try:
+        # Validar propriedade
+        existing = db.table("empresas")\
+            .select("*")\
+            .eq("id", empresa_id)\
+            .eq("usuario_id", usuario["id"])\
+            .single()\
+            .execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Empresa não encontrada")
+
+        empresa = existing.data
+        cidade = empresa.get("cidade")
+        estado = empresa.get("estado")
+
+        if not cidade or not estado:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Empresa sem cidade/UF cadastrados para reprocessar município"
+            )
+
+        # Reprocessar municipio via IBGE
+        update_data = {
+            "municipio_codigo": empresa.get("municipio_codigo"),
+            "municipio_nome": empresa.get("municipio_nome"),
+        }
+        update_data = await _preencher_municipio(update_data | {"cidade": cidade, "estado": estado})
+        update_data["updated_at"] = datetime.utcnow().isoformat()
+
+        response = db.table("empresas")\
+            .update(update_data)\
+            .eq("id", empresa_id)\
+            .execute()
+
+        if not response.data:
+            raise HTTPException(status_code=500, detail="Erro ao atualizar empresa")
+
+        return response.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao reprocessar municipio: {type(e).__name__} - {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Erro interno ao reprocessar municipio. Tente novamente."
+        )
 
 @router.delete("/{empresa_id}")
 async def deletar_empresa(

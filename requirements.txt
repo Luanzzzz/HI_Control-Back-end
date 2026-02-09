@@ -47,3 +47,21 @@ email-validator
 # ⚠️ CRÍTICO para emissão e busca de notas fiscais
 pynfe>=0.5.0
 signxml>=3.0.0  # Requerido pelo PyNFE para assinatura digital
+
+# HTTP Client Async (para NFS-e APIs municipais)
+httpx>=0.27.0
+
+# Email IMAP
+imapclient>=3.0.0
+
+# Google Drive / OAuth
+google-api-python-client>=2.100.0
+google-auth>=2.25.0
+google-auth-oauthlib>=1.2.0
+
+# Scheduler (sincronização periódica)
+apscheduler>=3.10.0
+
+# PDF Generation (DANFE, DACTE)
+reportlab>=4.0.0
+qrcode>=7.4.0

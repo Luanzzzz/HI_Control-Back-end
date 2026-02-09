@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     # CORS Regex (Permitir qualquer subdomínio vercel.app)
     CORS_ORIGIN_REGEX: str = r"https://.*\.vercel\.app"
 
+    # NFS-e (APIs Municipais)
+    NFSE_AMBIENTE: str = "producao"  # "producao" ou "homologacao"
+    NFSE_TIMEOUT: int = 60  # Timeout em segundos para APIs municipais
+
+    # Google OAuth (para Google Drive)
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_REDIRECT_URI: Optional[str] = None
+
     # PostgreSQL (futuro - sistema híbrido)
     POSTGRES_URL: Optional[str] = None
     POSTGRES_USER: Optional[str] = None
