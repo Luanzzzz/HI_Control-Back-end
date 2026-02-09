@@ -1,7 +1,11 @@
 """
-Endpoint REST para busca de notas fiscais distribuídas (DistribuicaoDFe).
+Endpoints REST para busca e importacao de notas fiscais.
 
-Permite consultar NFes pelo CNPJ sem necessidade de certificado digital.
+A busca principal consulta o banco de dados local (Supabase).
+Para popular o banco, use os endpoints de importacao de XML.
+
+Fase 2 (futuro): DistribuicaoDFe para busca automatica no SEFAZ
+(REQUER certificado digital A1).
 """
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from supabase import Client
@@ -88,21 +92,22 @@ def _enriquecer_nota(nota: NFeBuscadaMetadata) -> dict:
 @router.post(
     "/buscar",
     response_model=dict,
-    summary="Buscar notas fiscais distribuídas",
+    summary="Buscar notas fiscais no banco de dados",
     description="""
-    Consulta NFes distribuídas pela SEFAZ para um CNPJ específico.
+    Busca notas fiscais cadastradas no banco de dados local.
     
-    **Não requer certificado digital** - Consulta pública via DistribuicaoDFe.
+    **Fonte de dados:** Banco de dados local (notas importadas via XML).
+    Para popular o banco, use POST /importar-xml ou POST /importar-lote.
     
     **Limites por plano:**
-    - Básico: Últimos 30 dias, máx 3 empresas
-    - Premium: Ilimitado, máx 10 empresas
-    - Enterprise: Ilimitado, máx 999 empresas
+    - Basico: Ultimos 30 dias, max 3 empresas
+    - Premium: Ilimitado, max 10 empresas
+    - Enterprise: Ilimitado, max 999 empresas
     
     **Retorna:**
     - Lista de notas encontradas com metadados
-    - NSU para continuação de consultas
     - Total de notas
+    - Orientacao para importacao quando banco vazio
     """,
 )
 async def buscar_notas_fiscais(
@@ -111,70 +116,69 @@ async def buscar_notas_fiscais(
     db: Client = Depends(get_admin_db)
 ):
     """
-    Busca NFes distribuídas pela SEFAZ para um CNPJ.
-    
+    Busca notas fiscais no banco de dados local.
+
+    Este endpoint consulta APENAS o banco de dados local (Supabase).
+    Para popular o banco com notas reais, use /importar-xml ou /importar-lote.
+
     Args:
-        request: Dados da consulta (CNPJ, NSU inicial, etc)
-        current_user: Usuário autenticado
+        request: Dados da consulta (CNPJ, NSU/offset inicial, etc)
+        current_user: Usuario autenticado
         db: Cliente Supabase admin
-    
+
     Returns:
-        Dict com lista de notas, NSU e estatísticas
-    
-    Raises:
-        HTTPException: Em caso de erro na consulta
+        Dict com lista de notas e orientacao de importacao quando vazio
     """
     try:
         logger.info(
-            f"[BUSCA NFe] Usuário: {current_user.get('email')} | CNPJ: {request.cnpj}"
+            f"[BUSCA LOCAL] Usuario: {current_user.get('email')} | CNPJ: {request.cnpj}"
         )
-        
-        # 1. Verificar acesso ao módulo
+
+        # 1. Verificar acesso ao modulo
         await verificar_acesso_modulo("buscador_notas", current_user, db)
-        
-        # 2. Obter plano do usuário
+
+        # 2. Obter plano do usuario
         plano_info = await obter_plano_usuario(current_user["id"], db)
-        
+
         logger.info(
             f"[PLANO] {plano_info['nome'].upper()} | "
-            f"Histórico: {plano_info['limites']['historico_dias'] or 'ilimitado'} dias"
+            f"Historico: {plano_info['limites']['historico_dias'] or 'ilimitado'} dias"
         )
-        
+
         # 3. Validar limites do plano
         await validar_limite_historico(plano_info, request.nsu_inicial)
         await validar_limite_consultas_dia(current_user["id"], plano_info, db)
-        
-        # 4. Buscar empresa do usuário baseado no CNPJ
-        # Normalizar CNPJ (remover formatação)
+
+        # 4. Buscar empresa do usuario baseado no CNPJ
         cnpj_normalizado = request.cnpj.replace(".", "").replace("/", "").replace("-", "")
-        
+
         empresa_response = db.table("empresas")\
             .select("id, razao_social")\
             .eq("usuario_id", current_user["id"])\
             .or_(f"cnpj.eq.{request.cnpj},cnpj.eq.{cnpj_normalizado}")\
             .execute()
-        
+
         if not empresa_response.data or len(empresa_response.data) == 0:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=(
-                    f"Empresa com CNPJ {request.cnpj} não encontrada. "
+                    f"Empresa com CNPJ {request.cnpj} nao encontrada. "
                     f"Cadastre a empresa primeiro."
                 )
             )
-        
+
         empresa = empresa_response.data[0]
         empresa_id = empresa["id"]
-        
+
         logger.info(f"[EMPRESA] {empresa.get('razao_social')} | ID: {empresa_id}")
-        
-        # 5. Executar busca SEFAZ
+
+        # 5. Executar busca no BANCO DE DADOS LOCAL (nao SEFAZ)
         response = sefaz_service.buscar_notas_por_cnpj(
             cnpj=cnpj_normalizado,
             empresa_id=empresa_id,
             nsu_inicial=request.nsu_inicial,
         )
-        
+
         # 6. Aplicar limite de quantidade solicitado
         notas_limitadas = response.notas_encontradas[:request.max_notas]
 
@@ -184,43 +188,69 @@ async def buscar_notas_fiscais(
             f"Retornando: {len(notas_limitadas)} notas"
         )
 
-        # 7. Formatar resposta (com enriquecimento de dados da chave)
-        return {
-            "success": response.sucesso,
+        # 7. Formatar resposta
+        resultado = {
+            "success": response.status_codigo == "138",
             "status_codigo": response.status_codigo,
             "motivo": response.motivo,
+            "fonte": "banco_local",
             "plano": plano_info["nome"],
             "plano_limites": obter_resumo_plano(plano_info),
             "notas": [_enriquecer_nota(nota) for nota in notas_limitadas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
-            "total_notas": len(notas_limitadas),  # Total retornado (limitado)
-            "total_encontradas": response.total_notas,  # Total SEFAZ (sem limite)
+            "total_notas": len(notas_limitadas),
+            "total_encontradas": response.total_notas,
             "tem_mais_notas": response.tem_mais_notas,
         }
-        
+
+        # 8. Quando banco vazio, adicionar orientacao de importacao
+        if not notas_limitadas:
+            resultado["mensagem"] = (
+                "Nenhuma nota fiscal encontrada no periodo. "
+                "Importe XMLs de notas fiscais usando o botao 'Importar XML' "
+                "ou faca upload em lote atraves de 'Importar Lote (ZIP)'."
+            )
+            resultado["orientacao"] = {
+                "titulo": "Como obter notas fiscais?",
+                "passos": [
+                    "1. Acesse o Portal da NF-e (www.nfe.fazenda.gov.br)",
+                    "2. Baixe os XMLs das notas emitidas",
+                    "3. Volte ao Hi-Control e importe os XMLs",
+                    "4. As notas aparecerao automaticamente neste buscador"
+                ],
+                "endpoints_disponiveis": {
+                    "importar_xml": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-xml",
+                    "importar_lote": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-lote"
+                }
+            }
+
+        return resultado
+
+    except HTTPException:
+        # Re-propagar excecoes HTTP ja formatadas
+        raise
+
     except SefazException as e:
-        logger.error(f"Erro SEFAZ ao buscar notas: {e}")
+        # Safeguard: nao deveria mais ocorrer pois buscar_notas_por_cnpj
+        # agora retorna lista vazia em vez de lancar excecao.
+        logger.error(f"[SAFEGUARD] SefazException inesperada: {e}")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
-                "error": "Erro ao comunicar com SEFAZ",
+                "error": "Erro ao consultar banco de dados",
                 "codigo": e.codigo,
                 "mensagem": e.mensagem,
             }
         )
-        
-    except HTTPException:
-        # Re-propagar exceções HTTP já formatadas
-        raise
-        
+
     except ValueError as e:
-        logger.error(f"Erro de validação: {e}")
+        logger.error(f"Erro de validacao: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "Dados inválidos", "mensagem": str(e)}
+            detail={"error": "Dados invalidos", "mensagem": str(e)}
         )
-        
+
     except Exception as e:
         logger.error(f"Erro inesperado ao buscar notas: {e}", exc_info=True)
         raise HTTPException(
@@ -450,18 +480,22 @@ async def obter_status_certificado_empresa(
     "/empresas/{empresa_id}/notas/buscar",
     summary="Buscar notas fiscais de uma empresa",
     description="""
-    Busca notas fiscais usando o certificado da empresa (ou fallback do contador).
-    
+    Busca notas fiscais no banco de dados local para uma empresa especifica.
+
+    **Fonte de dados:** Banco de dados local (notas importadas via XML).
+    Para popular o banco, use POST /importar-xml ou POST /importar-lote.
+
     **Cache:**
-    - Resultados são cacheados por 24 horas
-    - Indica se dados vieram do cache ou SEFAZ
-    
+    - Resultados sao cacheados por 24 horas
+    - Indica se dados vieram do cache ou banco
+
     **Certificado:**
-    - Prioriza certificado da empresa
-    - Fallback: usa certificado do contador se empresa não tiver
-    
+    - Verifica status do certificado (informativo)
+    - A busca no banco local NAO requer certificado
+    - Certificado sera necessario na Fase 2 (DistribuicaoDFe)
+
     **Auditoria:**
-    - Todas as consultas são registradas no histórico
+    - Todas as consultas sao registradas no historico
     """,
     tags=["NFe - Busca por Empresa"]
 )
@@ -472,78 +506,67 @@ async def buscar_notas_empresa(
     db: Client = Depends(get_admin_db)
 ):
     """
-    Busca notas usando certificado da empresa com cache.
+    Busca notas no banco de dados local para uma empresa.
+
+    IMPORTANTE: Este endpoint consulta APENAS o banco local.
+    Ele NAO chama o SEFAZ diretamente. Para popular o banco,
+    o usuario deve importar XMLs via /importar-xml ou /importar-lote.
     """
     inicio = datetime.now()
     filtros = request.model_dump() if hasattr(request, 'model_dump') else request.dict()
-    
+
     try:
-        # 1. Validar acesso à empresa
+        # 1. Validar acesso a empresa
         if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Você não tem permissão para acessar esta empresa"
-            )
-        
-        # 2. Verificar módulo
-        await verificar_acesso_modulo("buscador_notas", current_user, db)
-        
-        # 3. Verificar certificado
-        status_cert = await certificado_service.validar_status_empresa(empresa_id)
-        
-        if status_cert["status"] == "vencido":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "certificado_vencido",
-                    "mensagem": status_cert["mensagem"],
-                    "tem_fallback": status_cert.get("tem_fallback", False)
-                }
-            )
-        
-        if status_cert["status"] == "ausente" and not status_cert.get("tem_fallback"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "certificado_ausente",
-                    "mensagem": "Empresa sem certificado e contador sem fallback disponível"
-                }
+                detail="Voce nao tem permissao para acessar esta empresa"
             )
 
-        # Validar status de erro na verificacao do certificado
-        if status_cert.get("status") == "erro":
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "error": "certificado_validation_error",
-                    "mensagem": status_cert.get("mensagem", "Erro ao validar certificado")
-                }
-            )
+        # 2. Verificar modulo
+        await verificar_acesso_modulo("buscador_notas", current_user, db)
+
+        # 3. Verificar certificado (informativo - nao bloqueia busca no banco)
+        status_cert = {"status": "nao_verificado", "mensagem": "Busca local nao requer certificado"}
+        try:
+            status_cert = await certificado_service.validar_status_empresa(empresa_id)
+        except Exception as cert_err:
+            logger.warning(f"Aviso: Nao foi possivel verificar certificado: {cert_err}")
+            status_cert = {
+                "status": "verificacao_indisponivel",
+                "mensagem": f"Nao foi possivel verificar certificado: {str(cert_err)}"
+            }
+
+        # NOTA: Para busca no banco local, certificado NAO e obrigatorio.
+        # O certificado sera necessario na Fase 2 (DistribuicaoDFe).
+        # Por isso, nao bloqueamos a busca se certificado estiver ausente/vencido.
 
         # 4. Verificar cache
         chave_cache = cache_service.gerar_chave_cache(empresa_id, filtros)
         cache_hit = await cache_service.buscar(chave_cache)
-        
+
         if cache_hit:
-            # Registrar no histórico (source: cache)
+            # Registrar no historico (source: cache)
             tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
             await _registrar_historico(
                 db, empresa_id, current_user["id"], filtros,
                 cache_hit.get("quantidade", 0), "cache", tempo_ms, True, None,
-                status_cert.get("usando_fallback") and "contador_fallback" or "empresa"
+                "banco_local"
             )
-            
+
             return {
                 "success": True,
                 "fonte": "cache",
                 "cached_at": cache_hit["cached_at"],
                 "empresa_id": empresa_id,
-                "certificado_status": status_cert["status"],
-                "usando_fallback": status_cert.get("usando_fallback", False),
+                "certificado_status": status_cert.get("status", "nao_verificado"),
                 **cache_hit["dados"]
             }
-        
-        # 5. Buscar na SEFAZ (NÃO REQUER CERTIFICADO - Consulta pública via DistribuicaoDFe)
+
+        # 5. Buscar no BANCO DE DADOS LOCAL (nao SEFAZ)
+        # NOTA: DistribuicaoDFe REQUER certificado digital A1.
+        # (Contrario ao que se pensava anteriormente.)
+        # Fase 2 implementara chamada real ao SEFAZ.
         cnpj = request.cnpj.replace(".", "").replace("/", "").replace("-", "")
 
         response = sefaz_service.buscar_notas_por_cnpj(
@@ -552,61 +575,90 @@ async def buscar_notas_empresa(
             nsu_inicial=request.nsu_inicial
         )
 
-        # Tipo de certificado usado (consulta pública não usa certificado)
-        tipo_cert = "publico_distribuicao_dfe"
-
         # 6. Aplicar limite de quantidade solicitado
         notas_limitadas = response.notas_encontradas[:request.max_notas]
 
         logger.info(
-            f"[RESULTADO EMPRESA] Total encontradas: {len(response.notas_encontradas)} | "
-            f"Limite aplicado: {request.max_notas} | "
-            f"Retornando: {len(notas_limitadas)} notas"
+            f"[RESULTADO EMPRESA] Encontradas: {len(response.notas_encontradas)} | "
+            f"Limite: {request.max_notas} | Retornando: {len(notas_limitadas)}"
         )
 
-        # 7. Formatar resultado (com enriquecimento de dados da chave)
+        # 7. Formatar resultado
         resultado = {
             "notas": [_enriquecer_nota(nota) for nota in notas_limitadas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
-            "total_notas": len(notas_limitadas),  # Total retornado (limitado)
-            "total_encontradas": response.total_notas,  # Total SEFAZ (sem limite)
+            "total_notas": len(notas_limitadas),
+            "total_encontradas": response.total_notas,
             "tem_mais_notas": response.tem_mais_notas,
         }
-        
-        # 8. Salvar no cache
+
+        # 8. Quando banco vazio, adicionar orientacao
+        if not notas_limitadas:
+            resultado["mensagem"] = (
+                "Nenhuma nota fiscal encontrada no periodo. "
+                "Importe XMLs de notas fiscais usando o botao 'Importar XML' "
+                "ou faca upload em lote atraves de 'Importar Lote (ZIP)'."
+            )
+            resultado["orientacao"] = {
+                "titulo": "Como obter notas fiscais?",
+                "passos": [
+                    "1. Acesse o Portal da NF-e (www.nfe.fazenda.gov.br)",
+                    "2. Baixe os XMLs das notas emitidas",
+                    "3. Volte ao Hi-Control e importe os XMLs",
+                    "4. As notas aparecerao automaticamente neste buscador"
+                ],
+                "endpoints_disponiveis": {
+                    "importar_xml": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-xml",
+                    "importar_lote": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-lote"
+                }
+            }
+
+        # 9. Salvar no cache (mesmo vazio, para evitar reprocessar)
         await cache_service.salvar(empresa_id, chave_cache, resultado)
-        
-        # 9. Registrar no histórico
+
+        # 10. Registrar no historico
         tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
         await _registrar_historico(
             db, empresa_id, current_user["id"], filtros,
-            response.total_notas, "sefaz", tempo_ms, True, None, tipo_cert
+            response.total_notas, "banco_local", tempo_ms, True, None, "banco_local"
         )
-        
+
         return {
             "success": True,
-            "fonte": "sefaz",
+            "fonte": "banco_local",
             "empresa_id": empresa_id,
-            "certificado_status": status_cert["status"],
-            "certificado_usado": tipo_cert,
+            "certificado_status": status_cert.get("status", "nao_verificado"),
             **resultado
         }
-        
+
     except HTTPException:
         raise
     except SefazException as e:
-        # Registrar erro no histórico
+        # Safeguard: nao deveria mais ocorrer pois buscar_notas_por_cnpj
+        # agora retorna lista vazia em vez de lancar excecao.
+        logger.error(f"[SAFEGUARD] SefazException inesperada em buscar_notas_empresa: {e}")
         tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
         await _registrar_historico(
             db, empresa_id, current_user["id"], filtros,
-            0, "sefaz", tempo_ms, False, str(e), None
+            0, "banco_local", tempo_ms, False, str(e), None
         )
-        
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"error": "sefaz_error", "codigo": e.codigo, "mensagem": e.mensagem}
-        )
+
+        # Retornar 200 com lista vazia em vez de 502
+        return {
+            "success": False,
+            "fonte": "banco_local",
+            "empresa_id": empresa_id,
+            "notas": [],
+            "total_notas": 0,
+            "total_encontradas": 0,
+            "tem_mais_notas": False,
+            "mensagem": (
+                "Erro temporario ao consultar banco de dados. "
+                "Tente novamente em alguns segundos."
+            ),
+            "erro_tecnico": str(e),
+        }
     except Exception as e:
         logger.error(f"Erro ao buscar notas empresa {empresa_id}: {e}", exc_info=True)
         raise HTTPException(
@@ -865,7 +917,7 @@ from typing import List
 
 
 @router.post(
-    "/importar-xml",
+    "/empresas/{empresa_id}/notas/importar-xml",
     summary="Importar nota fiscal via XML",
     description="""
     Importa uma nota fiscal a partir de arquivo XML.
@@ -989,7 +1041,7 @@ async def importar_xml_nota(
 
 
 @router.post(
-    "/importar-lote",
+    "/empresas/{empresa_id}/notas/importar-lote",
     summary="Importar lote de XMLs (ZIP)",
     description="""
     Importa multiplas notas fiscais de um arquivo ZIP contendo XMLs.
