@@ -53,7 +53,7 @@ async def obter_status_bot(
         response_empresas = db.table("empresas")\
             .select("id, certificado_a1, certificado_validade")\
             .eq("usuario_id", user_id)\
-            .eq("ativo", True)\
+            .eq("ativa", True)\
             .execute()
 
         empresas_data = response_empresas.data or []
@@ -199,7 +199,7 @@ async def obter_status_empresa(
             .select("id")\
             .eq("id", empresa_id)\
             .eq("usuario_id", user_id)\
-            .eq("ativo", True)\
+            .eq("ativa", True)\
             .maybe_single()\
             .execute()
         
@@ -211,7 +211,7 @@ async def obter_status_empresa(
         
         # Buscar última nota da empresa (agora validada)
         response_ultima = db.table("notas_fiscais")\
-            .select("created_at, tipo, numero")\
+            .select("created_at, tipo_nf, numero_nf")\
             .eq("empresa_id", empresa_id)\
             .order("created_at", desc=True)\
             .limit(1)\
@@ -224,7 +224,16 @@ async def obter_status_empresa(
             .execute()
         
         total_notas = response_total.count or 0
-        ultima_nota = response_ultima.data[0] if response_ultima.data else None
+        ultima_nota_raw = response_ultima.data[0] if response_ultima.data else None
+        
+        # Mapear nomes de colunas do banco para nomes esperados pelo frontend
+        ultima_nota = None
+        if ultima_nota_raw:
+            ultima_nota = {
+                "created_at": ultima_nota_raw.get("created_at"),
+                "tipo": ultima_nota_raw.get("tipo_nf"),
+                "numero": ultima_nota_raw.get("numero_nf"),
+            }
         
         return {
             "success": True,
@@ -324,7 +333,7 @@ async def obter_metricas_bot(
         response_empresas = db.table("empresas")\
             .select("id")\
             .eq("usuario_id", user_id)\
-            .eq("ativo", True)\
+            .eq("ativa", True)\
             .execute()
 
         empresas_ids = [e["id"] for e in (response_empresas.data or [])]
@@ -347,15 +356,15 @@ async def obter_metricas_bot(
 
         total_notas = response_total.count or 0
 
-        # 3. Notas por tipo - buscar apenas campo 'tipo' (leve)
+        # 3. Notas por tipo - buscar apenas campo 'tipo_nf' (leve)
         response_tipos = db.table("notas_fiscais")\
-            .select("tipo")\
+            .select("tipo_nf")\
             .in_("empresa_id", empresas_ids)\
             .execute()
 
         tipos_count: Dict[str, int] = {}
         for nota in response_tipos.data or []:
-            tipo = nota.get("tipo", "Desconhecido")
+            tipo = nota.get("tipo_nf", "Desconhecido")
             tipos_count[tipo] = tipos_count.get(tipo, 0) + 1
 
         # 4. Empresas sincronizadas - buscar apenas empresa_id distinto

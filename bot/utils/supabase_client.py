@@ -60,7 +60,7 @@ class SupabaseResource:
             
             response = client.table("empresas")\
                 .select("*")\
-                .eq("ativo", True)\
+                .eq("ativa", True)\
                 .execute()
             
             todas_empresas = response.data or []
@@ -179,21 +179,35 @@ class SupabaseResource:
         try:
             client = cls.get_client()
             
-            # Preparar dados no formato do banco
+            # Preparar dados no formato do banco (usando nomes de colunas do schema)
             nota_data = {
                 "empresa_id": empresa_id,
                 "chave_acesso": nota.get("chave_acesso", ""),
-                "numero": nota.get("numero"),
+                "numero_nf": nota.get("numero") or nota.get("numero_nf", ""),
                 "serie": nota.get("serie", "ÚNICA"),
-                "tipo": nota.get("tipo", "NFS-e"),
+                "tipo_nf": nota.get("tipo") or nota.get("tipo_nf", "NFS-e"),
                 "data_emissao": nota.get("data_emissao"),
                 "valor_total": float(nota.get("valor_total", 0)),
-                "emitente_cnpj": nota.get("cnpj_prestador") or nota.get("prestador_cnpj"),
-                "emitente_nome": nota.get("prestador_nome"),
-                "destinatario_cnpj": nota.get("cnpj_tomador") or nota.get("tomador_cnpj"),
-                "destinatario_nome": nota.get("tomador_nome"),
-                "xml_content": nota.get("xml_content", ""),
-                "status": nota.get("status", "Autorizada"),
+                "cnpj_emitente": (
+                    nota.get("cnpj_prestador")
+                    or nota.get("prestador_cnpj")
+                    or nota.get("cnpj_emitente", "")
+                ),
+                "nome_emitente": (
+                    nota.get("prestador_nome")
+                    or nota.get("nome_emitente", "")
+                ),
+                "cnpj_destinatario": (
+                    nota.get("cnpj_tomador")
+                    or nota.get("tomador_cnpj")
+                    or nota.get("cnpj_destinatario", "")
+                ),
+                "nome_destinatario": (
+                    nota.get("tomador_nome")
+                    or nota.get("nome_destinatario", "")
+                ),
+                "xml_url": nota.get("xml_url") or nota.get("xml_content", ""),
+                "situacao": nota.get("status") or nota.get("situacao", "autorizada"),
                 "municipio_codigo": nota.get("municipio_codigo", ""),
                 "codigo_verificacao": nota.get("codigo_verificacao", ""),
                 "link_visualizacao": nota.get("link_visualizacao", ""),
