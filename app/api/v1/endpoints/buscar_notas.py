@@ -7,7 +7,7 @@ Para popular o banco, use os endpoints de importacao de XML.
 Fase 2 (futuro): DistribuicaoDFe para busca automatica no SEFAZ
 (REQUER certificado digital A1).
 """
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
 from supabase import Client
 from typing import Optional
 import logging
@@ -266,28 +266,95 @@ async def buscar_notas_fiscais(
 @router.get(
     "/buscar/stats/{cnpj}",
     summary="Estatísticas de notas por CNPJ",
-    description="Retorna estatísticas de notas já buscadas para um CNPJ",
+    description="Retorna estatísticas de notas já importadas para um CNPJ",
 )
-def obter_estatisticas_cnpj(
+async def obter_estatisticas_cnpj(
     cnpj: str,
-    # current_user = Depends(get_current_user)
+    usuario: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db)
 ):
     """
-    Retorna estatísticas de notas já consultadas.
+    Retorna estatísticas de notas já importadas no banco de dados.
     
-    Útil para dashboards e visualização de dados.
+    **Requer autenticação**
+    
+    **Nota:** Este endpoint consulta apenas o banco de dados local.
+    As notas são importadas pelo bot automático ou via endpoints de importação.
+    
+    Args:
+        cnpj: CNPJ do emitente (com ou sem formatação)
+        
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "cnpj": "12345678000190",
+                "total_notas": 150,
+                "valor_total": 125000.50,
+                "notas_por_tipo": {"NF-e": 100, "NFS-e": 50},
+                "ultima_nota": "2026-02-10T14:30:00Z"
+            }
+        }
     """
-    # TODO: Implementar consulta ao banco de dados
-    # count_total = db.query(NotaFiscal).filter_by(cnpj_emitente=cnpj).count()
-    # sum_valores = db.query(func.sum(NotaFiscal.valor_total)).filter_by(...).scalar()
-    
-    return {
-        "cnpj": cnpj,
-        "total_notas": 0,
-        "valor_total": 0.0,
-        "ultimo_nsu_consultado": 0,
-        "message": "Funcionalidade em desenvolvimento"
-    }
+    try:
+        # Limpar CNPJ (remover formatação)
+        import re
+        cnpj_limpo = re.sub(r"[^0-9]", "", cnpj)
+        
+        if len(cnpj_limpo) != 14:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="CNPJ inválido. Deve conter 14 dígitos."
+            )
+        
+        # Buscar todas as notas do CNPJ
+        response = db.table("notas_fiscais")\
+            .select("*")\
+            .eq("emitente_cnpj", cnpj_limpo)\
+            .execute()
+        
+        notas = response.data or []
+        
+        # Calcular estatísticas
+        total_notas = len(notas)
+        valor_total = sum(float(n.get("valor_total", 0)) for n in notas)
+        
+        # Notas por tipo
+        notas_por_tipo: Dict[str, int] = {}
+        for nota in notas:
+            tipo = nota.get("tipo", "Desconhecido")
+            notas_por_tipo[tipo] = notas_por_tipo.get(tipo, 0) + 1
+        
+        # Última nota (mais recente)
+        ultima_nota = None
+        if notas:
+            # Ordenar por data_emissao ou created_at
+            notas_ordenadas = sorted(
+                notas,
+                key=lambda x: x.get("data_emissao") or x.get("created_at") or "",
+                reverse=True
+            )
+            ultima_nota = notas_ordenadas[0].get("data_emissao") or notas_ordenadas[0].get("created_at")
+        
+        return {
+            "success": True,
+            "data": {
+                "cnpj": cnpj_limpo,
+                "total_notas": total_notas,
+                "valor_total": round(valor_total, 2),
+                "notas_por_tipo": notas_por_tipo,
+                "ultima_nota": ultima_nota
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao obter estatísticas para CNPJ {cnpj}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao obter estatísticas: {str(e)}"
+        )
 
 
 # ============================================
@@ -1327,7 +1394,7 @@ async def listar_notas_empresa(
 )
 async def consultar_nota_sefaz(
     chave_acesso: str,
-    empresa_id: str,
+    empresa_id: str = Query(..., description="ID da empresa"),
     current_user: dict = Depends(get_current_user),
     db: Client = Depends(get_admin_db)
 ):

@@ -7,7 +7,7 @@ from app.api.v1.endpoints import (
     auth, certificados, emissao_nfe, emissao_nfce, emissao_cte,
     emissao_nfse, buscar_notas, notas, empresas, perfil,
     perfil_contador, debug, nfse_endpoints, email_import_endpoints,
-    drive_import_endpoints, suporte_emissao,
+    drive_import_endpoints, suporte_emissao, bot_status,
 )
 
 # Criar router principal da v1
@@ -57,6 +57,9 @@ api_router.include_router(emissao_cte.router, tags=["CT-e - Transporte"])
 
 # NFS-e - Emissão e Cancelamento
 api_router.include_router(emissao_nfse.router, tags=["NFS-e - Emissão"])
+
+# Bot - Status e Controle
+api_router.include_router(bot_status.router, tags=["Bot Status"])
 
 # Debug (apenas em desenvolvimento - ENVIRONMENT != "production")
 if os.getenv("ENVIRONMENT", "development") != "production":

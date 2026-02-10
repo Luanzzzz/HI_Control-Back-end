@@ -1,0 +1,22 @@
+# ============================================
+# Bot de Busca Automática - Hi-Control
+# ============================================
+
+# Cliente Supabase (Resource Pattern MCP)
+supabase>=2.5.0
+
+# HTTP Client Async (para APIs NFS-e)
+httpx>=0.27.0
+
+# Certificado e XML
+cryptography>=41.0.0
+lxml>=5.1.0
+
+# Agendamento (APScheduler)
+APScheduler>=3.10.0
+
+# Ambiente
+python-dotenv>=1.0.0
+
+# Logging (padrões MCP)
+# Usando logging padrão do Python
