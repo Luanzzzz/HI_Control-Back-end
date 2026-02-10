@@ -2,14 +2,33 @@
 Endpoints para importação de notas fiscais via Google Drive.
 """
 import logging
+import os
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.dependencies import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/drive")
+
+
+def _exigir_google_configurado() -> None:
+    """
+    Exige que Google OAuth esteja configurado.
+    Levanta HTTP 503 com detalhe estruturado se não estiver.
+    """
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+    if not client_id or not redirect_uri:
+        msg = (
+            "Google OAuth não configurado. Configure GOOGLE_CLIENT_ID e "
+            "GOOGLE_REDIRECT_URI no .env. Veja .env.example ou documentação."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "google_not_configured", "message": msg},
+        )
 
 
 # ============================================
@@ -58,6 +77,7 @@ async def gerar_url_auth(
     usuario: dict = Depends(get_current_user),
 ):
     """Gera a URL para o usuário autorizar acesso ao Google Drive."""
+    _exigir_google_configurado()
     from app.services.google_drive_service import google_drive_service
 
     try:
@@ -85,6 +105,7 @@ async def callback_oauth(
     Processa o callback do OAuth2 do Google.
     Troca o authorization code por tokens.
     """
+    _exigir_google_configurado()
     from app.services.google_drive_service import google_drive_service
 
     try:
@@ -137,6 +158,7 @@ async def listar_pastas(
     usuario: dict = Depends(get_current_user),
 ):
     """Lista pastas do Google Drive para seleção."""
+    _exigir_google_configurado()
     from app.services.google_drive_service import google_drive_service
 
     try:
@@ -189,6 +211,7 @@ async def sincronizar_drive(
     usuario: dict = Depends(get_current_user),
 ):
     """Dispara sincronização do Google Drive - busca XMLs na pasta."""
+    _exigir_google_configurado()
     from app.services.google_drive_service import google_drive_service
 
     try:
