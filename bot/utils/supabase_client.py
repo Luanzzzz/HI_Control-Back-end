@@ -44,9 +44,13 @@ class SupabaseResource:
         return cls._client
     
     @classmethod
-    def buscar_empresas_ativas(cls) -> List[Dict]:
+    def buscar_empresas_ativas(cls, apenas_com_certificado: bool = True) -> List[Dict]:
         """
-        Busca todas as empresas ativas no sistema.
+        Busca empresas ativas no sistema.
+        
+        Args:
+            apenas_com_certificado: Se True, retorna apenas empresas com certificado A1 valido.
+                                   Se False, retorna todas as ativas.
         
         Returns:
             Lista de empresas com dados completos
@@ -59,10 +63,68 @@ class SupabaseResource:
                 .eq("ativo", True)\
                 .execute()
             
-            empresas = response.data or []
-            logger.info(f"📊 {len(empresas)} empresas ativas encontradas")
+            todas_empresas = response.data or []
+            logger.info(f"📊 {len(todas_empresas)} empresas ativas encontradas")
             
-            return empresas
+            if not apenas_com_certificado:
+                return todas_empresas
+            
+            # Filtrar apenas empresas com certificado valido (nao expirado)
+            agora = datetime.now()
+            empresas_validas = []
+            empresas_sem_cert = []
+            empresas_cert_expirado = []
+            
+            for emp in todas_empresas:
+                cert_validade = emp.get("certificado_validade")
+                cert_a1 = emp.get("certificado_a1")
+                
+                if not cert_a1 and not cert_validade:
+                    empresas_sem_cert.append(emp.get("razao_social", emp.get("id")))
+                    continue
+                
+                if cert_validade:
+                    try:
+                        validade_dt = datetime.fromisoformat(
+                            str(cert_validade).replace("Z", "+00:00")
+                        )
+                        # Remover timezone para comparacao simples
+                        if validade_dt.tzinfo:
+                            validade_naive = validade_dt.replace(tzinfo=None)
+                        else:
+                            validade_naive = validade_dt
+                        
+                        if validade_naive < agora:
+                            empresas_cert_expirado.append(
+                                emp.get("razao_social", emp.get("id"))
+                            )
+                            continue
+                    except (ValueError, TypeError) as e:
+                        logger.warning(
+                            f"⚠️ Erro ao parsear validade do certificado de "
+                            f"{emp.get('razao_social')}: {e}"
+                        )
+                
+                empresas_validas.append(emp)
+            
+            if empresas_sem_cert:
+                logger.warning(
+                    f"⚠️ {len(empresas_sem_cert)} empresas sem certificado: "
+                    f"{', '.join(empresas_sem_cert[:5])}"
+                )
+            
+            if empresas_cert_expirado:
+                logger.warning(
+                    f"⚠️ {len(empresas_cert_expirado)} empresas com certificado expirado: "
+                    f"{', '.join(empresas_cert_expirado[:5])}"
+                )
+            
+            logger.info(
+                f"✅ {len(empresas_validas)} empresas com certificado valido "
+                f"(de {len(todas_empresas)} ativas)"
+            )
+            
+            return empresas_validas
             
         except Exception as e:
             logger.error(f"❌ Erro ao buscar empresas: {e}", exc_info=True)

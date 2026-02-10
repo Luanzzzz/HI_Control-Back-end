@@ -28,6 +28,12 @@ from bot.adapters.base_nacional import BaseNacionalAdapter, NFSeAuthException, N
 from bot.utils.supabase_client import SupabaseResource
 from bot.utils.certificado import CertificadoLoader
 
+# Google Drive integration
+try:
+    from app.services.google_drive_service import google_drive_service
+except ImportError:
+    google_drive_service = None
+
 # Configurar logging seguindo padrões MCP
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
@@ -203,7 +209,13 @@ class BotBuscadorNotas:
                 logger.info("💾 Salvando notas no banco...")
                 salvos = SupabaseResource.salvar_lote_notas(notas_total, empresa_id)
                 logger.info(f"✅ {salvos}/{len(notas_total)} notas salvas")
-            
+
+                # 5. Salvar XMLs no Google Drive (se configurado)
+                if google_drive_service:
+                    self._salvar_notas_no_drive(
+                        notas_total, empresa_id, empresa
+                    )
+
             return notas_total
             
         except Exception as e:
@@ -212,6 +224,67 @@ class BotBuscadorNotas:
                 exc_info=True
             )
             return []
+
+
+    def _salvar_notas_no_drive(
+        self, notas: List[Dict], empresa_id: str, empresa: Dict
+    ):
+        """
+        Salva XMLs das notas no Google Drive (se configurado).
+
+        Executa em loop async separado pois o metodo do Drive eh async.
+        """
+        import asyncio
+
+        empresa_nome = empresa.get("razao_social", "Empresa")
+
+        async def _upload_todas():
+            salvos = 0
+            for nota in notas:
+                xml_content = nota.get("xml_content", "")
+                if not xml_content:
+                    continue
+
+                try:
+                    xml_bytes = (
+                        xml_content.encode("utf-8")
+                        if isinstance(xml_content, str)
+                        else xml_content
+                    )
+
+                    file_id = await google_drive_service.salvar_xml_no_drive(
+                        empresa_id=empresa_id,
+                        empresa_nome=empresa_nome,
+                        xml_content=xml_bytes,
+                        nota_info={
+                            "tipo": nota.get("tipo", "NFS-e"),
+                            "numero": nota.get("numero", ""),
+                            "data_emissao": nota.get("data_emissao", ""),
+                            "chave_acesso": nota.get("chave_acesso", ""),
+                        },
+                    )
+
+                    if file_id:
+                        salvos += 1
+
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Erro ao salvar nota {nota.get('numero', '?')} "
+                        f"no Drive: {e}"
+                    )
+
+            if salvos > 0:
+                logger.info(
+                    f"☁️ {salvos} XMLs salvos no Google Drive "
+                    f"para empresa {empresa_nome}"
+                )
+
+        try:
+            asyncio.run(_upload_todas())
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Erro geral ao salvar no Drive: {e}"
+            )
 
 
 def main():

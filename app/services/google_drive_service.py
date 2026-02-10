@@ -11,7 +11,6 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from io import BytesIO
 
 from cryptography.fernet import Fernet
 
@@ -287,7 +286,265 @@ class GoogleDriveService:
             ]
 
     # ============================================
-    # SINCRONIZAÇÃO
+    # SALVAMENTO DE XMLS NO DRIVE (BOT -> DRIVE)
+    # ============================================
+
+    async def salvar_xml_no_drive(
+        self,
+        empresa_id: str,
+        empresa_nome: str,
+        xml_content: bytes,
+        nota_info: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Salva XML no Google Drive na estrutura:
+        [Pasta Raiz] / [Nome da Empresa] / [Ano-Mes] / [Tipo] / arquivo.xml
+
+        Verifica duplicidade antes de upload.
+
+        Args:
+            empresa_id: UUID da empresa
+            empresa_nome: Razao social da empresa
+            xml_content: Conteudo do XML em bytes
+            nota_info: dict com 'tipo', 'numero', 'data_emissao', 'chave_acesso'
+
+        Returns:
+            file_id do Google Drive ou None se nao configurado
+        """
+        from app.db.supabase_client import get_supabase_admin
+        import httpx
+
+        db = get_supabase_admin()
+
+        # 1. Buscar configuracao ativa do Drive para esta empresa
+        result = (
+            db.table("configuracoes_drive")
+            .select("*")
+            .eq("empresa_id", empresa_id)
+            .eq("ativo", True)
+            .limit(1)
+            .execute()
+        )
+
+        if not result.data:
+            logger.debug(
+                f"Drive nao configurado para empresa {empresa_id}, pulando upload"
+            )
+            return None
+
+        config = result.data[0]
+        pasta_raiz_id = config.get("pasta_id")
+        if not pasta_raiz_id:
+            logger.warning(
+                f"Config Drive sem pasta_id para empresa {empresa_id}"
+            )
+            return None
+
+        # 2. Obter access token
+        access_token = self.decrypt(
+            config.get("oauth_access_token_encrypted", "")
+        )
+        if not access_token:
+            access_token = await self._refresh_token(config)
+            if not access_token:
+                logger.error(
+                    f"Token Drive expirado para empresa {empresa_id}"
+                )
+                return None
+
+        # 3. Montar estrutura de pastas
+        # Sanitizar nome da empresa para nome de pasta
+        empresa_folder_name = re.sub(r'[<>:"/\\|?*]', '_', empresa_nome.strip())
+
+        # Ano-Mes (ex: "2026-02")
+        data_emissao = nota_info.get("data_emissao", "")
+        if data_emissao and len(data_emissao) >= 7:
+            ano_mes = data_emissao[:7]  # "YYYY-MM"
+        else:
+            ano_mes = datetime.now().strftime("%Y-%m")
+
+        # Tipo: "Prestada" ou "Tomada"
+        tipo_raw = nota_info.get("tipo", "NFS-e")
+        if "tomad" in tipo_raw.lower():
+            tipo_pasta = "Tomada"
+        else:
+            tipo_pasta = "Prestada"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                headers = {"Authorization": f"Bearer {access_token}"}
+
+                # Criar/obter pasta da empresa
+                empresa_folder_id = await self._get_or_create_folder(
+                    client, headers, empresa_folder_name, pasta_raiz_id
+                )
+
+                # Criar/obter pasta do ano-mes
+                mes_folder_id = await self._get_or_create_folder(
+                    client, headers, ano_mes, empresa_folder_id
+                )
+
+                # Criar/obter pasta do tipo
+                tipo_folder_id = await self._get_or_create_folder(
+                    client, headers, tipo_pasta, mes_folder_id
+                )
+
+                # 4. Nome do arquivo
+                chave = nota_info.get("chave_acesso", "")
+                numero = nota_info.get("numero", "sem_numero")
+                if chave:
+                    filename = f"{chave}.xml"
+                else:
+                    filename = f"nota_{numero}_{ano_mes}.xml"
+
+                # 5. Verificar duplicidade
+                exists = await self._file_exists_in_folder(
+                    client, headers, filename, tipo_folder_id
+                )
+                if exists:
+                    logger.info(
+                        f"XML ja existe no Drive: {filename} (empresa {empresa_id})"
+                    )
+                    return None
+
+                # 6. Upload do XML
+                file_id = await self._upload_file(
+                    client, headers, filename, xml_content,
+                    "text/xml", tipo_folder_id
+                )
+
+                logger.info(
+                    f"XML salvo no Drive: {filename} -> {file_id} "
+                    f"(empresa {empresa_id})"
+                )
+                return file_id
+
+        except Exception as e:
+            logger.error(
+                f"Erro ao salvar XML no Drive para empresa {empresa_id}: {e}",
+                exc_info=True
+            )
+            return None
+
+    async def _get_or_create_folder(
+        self,
+        client: Any,
+        headers: Dict[str, str],
+        folder_name: str,
+        parent_id: str,
+    ) -> str:
+        """Busca pasta pelo nome ou cria se nao existir."""
+        # Buscar pasta existente
+        query = (
+            f"name='{folder_name}' and "
+            f"'{parent_id}' in parents and "
+            f"mimeType='application/vnd.google-apps.folder' and "
+            f"trashed=false"
+        )
+        resp = await client.get(
+            "https://www.googleapis.com/drive/v3/files",
+            headers=headers,
+            params={"q": query, "fields": "files(id,name)", "pageSize": 1},
+        )
+
+        if resp.status_code == 200:
+            files = resp.json().get("files", [])
+            if files:
+                return files[0]["id"]
+
+        # Criar pasta
+        import json
+        metadata = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        resp = await client.post(
+            "https://www.googleapis.com/drive/v3/files",
+            headers={
+                **headers,
+                "Content-Type": "application/json",
+            },
+            content=json.dumps(metadata),
+            params={"fields": "id"},
+        )
+
+        if resp.status_code in (200, 201):
+            return resp.json()["id"]
+
+        raise ValueError(
+            f"Erro ao criar pasta '{folder_name}': {resp.text}"
+        )
+
+    async def _file_exists_in_folder(
+        self,
+        client: Any,
+        headers: Dict[str, str],
+        filename: str,
+        folder_id: str,
+    ) -> bool:
+        """Verifica se arquivo com mesmo nome ja existe na pasta."""
+        query = (
+            f"name='{filename}' and "
+            f"'{folder_id}' in parents and "
+            f"trashed=false"
+        )
+        resp = await client.get(
+            "https://www.googleapis.com/drive/v3/files",
+            headers=headers,
+            params={"q": query, "fields": "files(id)", "pageSize": 1},
+        )
+
+        if resp.status_code == 200:
+            files = resp.json().get("files", [])
+            return len(files) > 0
+
+        return False
+
+    async def _upload_file(
+        self,
+        client: Any,
+        headers: Dict[str, str],
+        filename: str,
+        content: bytes,
+        mime_type: str,
+        parent_id: str,
+    ) -> str:
+        """Faz upload de arquivo para o Google Drive."""
+        import json
+
+        # Usar upload multipart simples
+        boundary = "----DriveUploadBoundary"
+        metadata = json.dumps({
+            "name": filename,
+            "parents": [parent_id],
+        })
+
+        body = (
+            f"--{boundary}\r\n"
+            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{metadata}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode() + content + f"\r\n--{boundary}--".encode()
+
+        resp = await client.post(
+            "https://www.googleapis.com/upload/drive/v3/files"
+            "?uploadType=multipart&fields=id",
+            headers={
+                **headers,
+                "Content-Type": f"multipart/related; boundary={boundary}",
+            },
+            content=body,
+        )
+
+        if resp.status_code in (200, 201):
+            return resp.json()["id"]
+
+        raise ValueError(f"Erro no upload: {resp.text}")
+
+    # ============================================
+    # SINCRONIZAÇÃO (DRIVE -> SISTEMA)
     # ============================================
 
     async def sincronizar(

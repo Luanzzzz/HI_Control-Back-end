@@ -47,32 +47,78 @@ async def obter_status_bot(
         }
     """
     try:
-        # 1. Buscar última nota importada (última execução do bot)
-        response_ultima = db.table("notas_fiscais")\
-            .select("created_at")\
-            .order("created_at", desc=True)\
-            .limit(1)\
+        user_id = usuario.get("id")
+
+        # Buscar empresas do usuario (com todos os campos para checar certificados)
+        response_empresas = db.table("empresas")\
+            .select("id, certificado_a1, certificado_validade")\
+            .eq("usuario_id", user_id)\
+            .eq("ativo", True)\
             .execute()
-        
+
+        empresas_data = response_empresas.data or []
+        empresas_ids = [e["id"] for e in empresas_data]
+
+        # Contagem de certificados
+        agora = datetime.now()
+        count_sem_cert = 0
+        count_cert_expirado = 0
+
+        for emp in empresas_data:
+            cert_a1 = emp.get("certificado_a1")
+            cert_val = emp.get("certificado_validade")
+
+            if not cert_a1 and not cert_val:
+                count_sem_cert += 1
+                continue
+
+            if cert_val:
+                try:
+                    val_dt = datetime.fromisoformat(
+                        str(cert_val).replace("Z", "+00:00")
+                    )
+                    val_naive = val_dt.replace(tzinfo=None) if val_dt.tzinfo else val_dt
+                    if val_naive < agora:
+                        count_cert_expirado += 1
+                except (ValueError, TypeError):
+                    pass
+
         ultima_sincronizacao = None
-        if response_ultima.data:
-            ultima_sincronizacao = response_ultima.data[0].get("created_at")
-        
-        # 2. Contar notas nas últimas 24h
-        ontem = datetime.now() - timedelta(days=1)
-        
-        response_24h = db.table("notas_fiscais")\
-            .select("id", count="exact")\
-            .gte("created_at", ontem.isoformat())\
-            .execute()
-        
-        quantidade_24h = response_24h.count or 0
+        quantidade_24h = 0
+
+        if empresas_ids:
+            # 1. Buscar última nota importada (última execução do bot)
+            response_ultima = db.table("notas_fiscais")\
+                .select("created_at")\
+                .in_("empresa_id", empresas_ids)\
+                .order("created_at", desc=True)\
+                .limit(1)\
+                .execute()
+
+            if response_ultima.data:
+                ultima_sincronizacao = response_ultima.data[0].get("created_at")
+
+            # 2. Contar notas nas últimas 24h
+            ontem = datetime.now() - timedelta(days=1)
+
+            response_24h = db.table("notas_fiscais")\
+                .select("id", count="exact")\
+                .in_("empresa_id", empresas_ids)\
+                .gte("created_at", ontem.isoformat())\
+                .execute()
+
+            quantidade_24h = response_24h.count or 0
         
         # 3. Determinar status do bot
         status_bot = "ok"
         funcionando = True
         
-        if ultima_sincronizacao:
+        # Se todas as empresas estao sem certificado ou com certificado expirado
+        total_empresas = len(empresas_data)
+        if total_empresas > 0 and (count_sem_cert + count_cert_expirado) >= total_empresas:
+            status_bot = "erro_credenciais"
+            funcionando = False
+        elif ultima_sincronizacao:
             # Converter para datetime
             if isinstance(ultima_sincronizacao, str):
                 ultima_dt = datetime.fromisoformat(
@@ -102,7 +148,9 @@ async def obter_status_bot(
                 "status": status_bot,
                 "ultima_sincronizacao": ultima_sincronizacao,
                 "notas_24h": quantidade_24h,
-                "funcionando": funcionando
+                "funcionando": funcionando,
+                "empresas_sem_certificado": count_sem_cert,
+                "empresas_cert_expirado": count_cert_expirado
             }
         }
         
@@ -144,7 +192,24 @@ async def obter_status_empresa(
         }
     """
     try:
-        # Buscar última nota da empresa
+        user_id = usuario.get("id")
+        
+        # VALIDAÇÃO DE SEGURANÇA: Verificar se empresa pertence ao usuário
+        empresa_check = db.table("empresas")\
+            .select("id")\
+            .eq("id", empresa_id)\
+            .eq("usuario_id", user_id)\
+            .eq("ativo", True)\
+            .maybe_single()\
+            .execute()
+        
+        if not empresa_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Empresa não encontrada ou não pertence ao seu escritório"
+            )
+        
+        # Buscar última nota da empresa (agora validada)
         response_ultima = db.table("notas_fiscais")\
             .select("created_at, tipo, numero")\
             .eq("empresa_id", empresa_id)\
@@ -171,6 +236,8 @@ async def obter_status_empresa(
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(
             f"Erro ao obter status da empresa {empresa_id}: {e}",
@@ -229,7 +296,9 @@ async def obter_metricas_bot(
     db: Client = Depends(get_admin_db)
 ):
     """
-    Retorna métricas detalhadas do bot.
+    Retorna métricas detalhadas do bot filtradas por usuario.
+    
+    Otimizado: busca apenas campos necessarios e filtra por empresas do usuario.
     
     **Requer autenticação**
     
@@ -244,44 +313,74 @@ async def obter_metricas_bot(
         }
     """
     try:
-        # Total de notas
+        user_id = usuario.get("id")
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Usuario nao identificado"
+            )
+
+        # 1. Buscar IDs das empresas do usuario
+        response_empresas = db.table("empresas")\
+            .select("id")\
+            .eq("usuario_id", user_id)\
+            .eq("ativo", True)\
+            .execute()
+
+        empresas_ids = [e["id"] for e in (response_empresas.data or [])]
+
+        if not empresas_ids:
+            return {
+                "success": True,
+                "data": {
+                    "total_notas": 0,
+                    "notas_por_tipo": {},
+                    "empresas_sincronizadas": 0
+                }
+            }
+
+        # 2. Total de notas (count apenas, sem buscar registros)
         response_total = db.table("notas_fiscais")\
             .select("id", count="exact")\
+            .in_("empresa_id", empresas_ids)\
             .execute()
-        
+
         total_notas = response_total.count or 0
-        
-        # Notas por tipo
+
+        # 3. Notas por tipo - buscar apenas campo 'tipo' (leve)
         response_tipos = db.table("notas_fiscais")\
             .select("tipo")\
+            .in_("empresa_id", empresas_ids)\
             .execute()
-        
+
         tipos_count: Dict[str, int] = {}
         for nota in response_tipos.data or []:
             tipo = nota.get("tipo", "Desconhecido")
             tipos_count[tipo] = tipos_count.get(tipo, 0) + 1
-        
-        # Empresas sincronizadas (com ao menos 1 nota)
-        response_empresas = db.table("notas_fiscais")\
+
+        # 4. Empresas sincronizadas - buscar apenas empresa_id distinto
+        response_empresas_sync = db.table("notas_fiscais")\
             .select("empresa_id")\
+            .in_("empresa_id", empresas_ids)\
             .execute()
-        
-        empresas_ids = [
+
+        empresas_com_notas = set(
             n.get("empresa_id")
-            for n in (response_empresas.data or [])
+            for n in (response_empresas_sync.data or [])
             if n.get("empresa_id")
-        ]
-        empresas_unicas = len(set(empresas_ids))
-        
+        )
+
         return {
             "success": True,
             "data": {
                 "total_notas": total_notas,
                 "notas_por_tipo": tipos_count,
-                "empresas_sincronizadas": empresas_unicas
+                "empresas_sincronizadas": len(empresas_com_notas)
             }
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Erro ao obter métricas do bot: {e}", exc_info=True)
         raise HTTPException(
