@@ -254,27 +254,61 @@ class SupabaseResource:
         return salvos
     
     @classmethod
+    def buscar_credenciais_nfse_por_empresa(cls, empresa_id: str) -> Optional[Dict]:
+        """
+        Busca qualquer credencial ativa da empresa (fallback sem município).
+
+        Usado quando a empresa não tem municipio_codigo configurado.
+
+        Args:
+            empresa_id: UUID da empresa
+
+        Returns:
+            Dicionário com credenciais ou None
+        """
+        try:
+            client = cls.get_client()
+
+            response = client.table("credenciais_nfse")\
+                .select("*")\
+                .eq("empresa_id", empresa_id)\
+                .eq("ativo", True)\
+                .limit(1)\
+                .execute()
+
+            if response.data:
+                logger.info(f"✅ Credencial encontrada (fallback): empresa={empresa_id}")
+                return response.data[0]
+
+            logger.warning(f"⚠️ Nenhuma credencial ativa: empresa={empresa_id}")
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar credenciais: {e}")
+            return None
+
+    @classmethod
     def verificar_nota_existe(cls, chave_acesso: str) -> bool:
         """
         Verifica se nota já existe no banco.
-        
+
         Args:
             chave_acesso: Chave única da nota
-            
+
         Returns:
             True se nota existe, False caso contrário
         """
         try:
             client = cls.get_client()
-            
+
             response = client.table("notas_fiscais")\
                 .select("id")\
                 .eq("chave_acesso", chave_acesso)\
                 .limit(1)\
                 .execute()
-            
+
             return len(response.data or []) > 0
-            
+
         except Exception as e:
             logger.warning(f"⚠️ Erro ao verificar nota {chave_acesso}: {e}")
             return False

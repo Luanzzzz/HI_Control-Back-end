@@ -149,18 +149,29 @@ class BotBuscadorNotas:
         )
         
         try:
-            # 1. Buscar credenciais NFS-e (Resource Pattern)
-            credenciais = SupabaseResource.buscar_credenciais_nfse(
-                empresa_id,
-                municipio_codigo
-            )
-            
-            if not credenciais:
-                logger.warning(
-                    f"⚠️ Empresa sem credenciais NFS-e configuradas "
-                    f"para município {municipio_codigo}"
+            # 1. Buscar credenciais NFS-e (Resource Pattern) com fallback
+            logger.info(f"[FLOW] Empresa: {empresa.get('razao_social')}")
+            logger.info(f"[FLOW] CNPJ: {cnpj}")
+            logger.info(f"[FLOW] Município: {municipio_codigo or 'NÃO INFORMADO'}")
+
+            if municipio_codigo:
+                logger.info(f"[FLOW] Buscando credencial por município...")
+                credenciais = SupabaseResource.buscar_credenciais_nfse(
+                    empresa_id,
+                    municipio_codigo
                 )
+            else:
+                logger.warning(f"[FLOW] Município vazio - usando fallback")
+                credenciais = SupabaseResource.buscar_credenciais_nfse_por_empresa(
+                    empresa_id
+                )
+
+            if not credenciais:
+                logger.error(f"[FLOW] ❌ FALHA: Nenhuma credencial encontrada")
+                logger.info(f"[FLOW] 💡 SOLUÇÃO: Cadastrar credenciais em Configurações > Credenciais NFS-e")
                 return []
+
+            logger.info(f"[FLOW] ✅ Credencial OK")
             
             # 2. Preparar credenciais para adapter
             adapter_credentials = {

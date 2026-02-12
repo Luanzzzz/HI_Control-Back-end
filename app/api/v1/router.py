@@ -7,7 +7,7 @@ from app.api.v1.endpoints import (
     auth, certificados, emissao_nfe, emissao_nfce, emissao_cte,
     emissao_nfse, buscar_notas, notas, empresas, perfil,
     perfil_contador, debug, nfse_endpoints, email_import_endpoints,
-    drive_import_endpoints, suporte_emissao, bot_status,
+    drive_import_endpoints, suporte_emissao, bot_status, notas_drive,
 )
 
 # Criar router principal da v1
@@ -45,6 +45,9 @@ api_router.include_router(email_import_endpoints.router, tags=["Email - Importa�
 
 # Google Drive - Importação de XMLs
 api_router.include_router(drive_import_endpoints.router, tags=["Google Drive - Importação"])
+
+# Notas - Leitura direta do Drive
+api_router.include_router(notas_drive.router, tags=["Notas - Drive"])
 
 # NFC-e - Emissão (Modelo 65)
 api_router.include_router(emissao_nfce.router, tags=["NFC-e - Consumidor"])
