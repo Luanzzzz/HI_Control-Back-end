@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 SOAP_DISTRIBUICAO_ACTION = (
     "http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"
 )
+MOCK_CHAVES_ACESSO = {
+    "35260112345678000190550010000001231123456789",
+    "35260112345678000190550010000001241123456790",
+    "35260112345678000190550010000001251123456791",
+}
 
 
 class SefazNetworkError(Exception):
@@ -83,6 +88,7 @@ class CapturaService:
                 logger.info("USE_MOCK_SEFAZ=true | usando mock de distribuicao DFe")
                 resposta_xml = self._consultar_distribuicao_mock(cnpj_empresa, nsu_inicio)
             else:
+                self._limpar_notas_mock_antigas(db, empresa_id)
                 uf_codigo = self._resolver_uf_codigo_empresa(empresa)
                 if not uf_codigo:
                     erro_mensagem = "UF da empresa nao configurada (estado/municipio_codigo)"
@@ -701,6 +707,49 @@ class CapturaService:
 
     def _is_mock_enabled(self) -> bool:
         return os.getenv("USE_MOCK_SEFAZ", "false").lower() == "true"
+
+    def _limpar_notas_mock_antigas(self, db, empresa_id: str) -> None:
+        try:
+            candidatos = (
+                db.table("notas_fiscais")
+                .select("id, chave_acesso, cnpj_emitente, nome_emitente, fonte, nsu, xml_completo")
+                .eq("empresa_id", empresa_id)
+                .execute()
+            ).data or []
+
+            ids_remover: List[str] = []
+            for row in candidatos:
+                chave = str(row.get("chave_acesso") or "")
+                cnpj_emit = str(row.get("cnpj_emitente") or "")
+                nome_emit = str(row.get("nome_emitente") or "").upper()
+                fonte = str(row.get("fonte") or "").lower()
+                nsu = row.get("nsu")
+                xml = row.get("xml_completo")
+
+                assinatura_mock = (
+                    chave in MOCK_CHAVES_ACESSO
+                    or (
+                        fonte == "manual"
+                        and (not nsu)
+                        and (not xml)
+                        and cnpj_emit == "12.345.678/0001-90"
+                        and "HOMOLOGACAO" in nome_emit
+                    )
+                )
+                if assinatura_mock and row.get("id"):
+                    ids_remover.append(str(row["id"]))
+
+            if not ids_remover:
+                return
+
+            db.table("notas_fiscais").delete().in_("id", ids_remover).execute()
+            logger.info(
+                "Limpeza de notas mock concluida para empresa_id=%s: %s registros removidos",
+                empresa_id,
+                len(ids_remover),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao limpar notas mock antigas para empresa_id=%s", empresa_id)
 
     def _find_text(self, element, tag: str) -> Optional[str]:
         found = element.xpath(f".//*[local-name()='{tag}']")
