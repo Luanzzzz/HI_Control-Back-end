@@ -1,9 +1,10 @@
 """
 Configurações da aplicação usando Pydantic Settings
 """
-from typing import List, Optional
+import json
+from typing import Any, List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, field_validator
+from pydantic import Field
 from functools import lru_cache
 
 
@@ -32,13 +33,13 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # CORS
-    CORS_ORIGINS: List[str] = [
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:5173",
-        "https://hi-control.vercel.app",
+    CORS_ORIGINS: str = (
+        "http://localhost:3000,"
+        "http://localhost:3001,"
+        "http://localhost:5173,"
+        "https://hi-control.vercel.app,"
         "https://site-hi-control.vercel.app"
-    ]
+    )
 
     # CORS Regex (Permitir qualquer subdomínio vercel.app)
     CORS_ORIGIN_REGEX: str = r"https://.*\.vercel\.app"
@@ -58,19 +59,31 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: Optional[str] = None
     POSTGRES_DB: Optional[str] = None
 
-    @field_validator("CORS_ORIGINS", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v):
-        """Parse CORS origins de string ou lista"""
-        if isinstance(v, str):
-            if v.startswith("[") and v.endswith("]"):
-                import json
-                try:
-                    return json.loads(v)
-                except (ValueError, TypeError):
-                    pass
-            return [origin.strip() for origin in v.split(",")]
-        return v
+    @property
+    def cors_origins_list(self) -> List[str]:
+        return self._parse_cors_origins(self.CORS_ORIGINS)
+
+    @staticmethod
+    def _parse_cors_origins(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+
+        if value is None:
+            return []
+
+        raw = str(value).strip()
+        if not raw:
+            return []
+
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(v).strip() for v in parsed if str(v).strip()]
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
     model_config = SettingsConfigDict(
         env_file=".env",
