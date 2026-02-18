@@ -1,0 +1,756 @@
+"""
+Captura de NF-e no DistribuicaoDFe (SEFAZ Nacional).
+"""
+from __future__ import annotations
+
+import base64
+import gzip
+import logging
+import os
+import tempfile
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from lxml import etree
+except ImportError:  # pragma: no cover
+    etree = None
+
+from app.core.sefaz_config import AMBIENTE_PADRAO, DISTRIBUICAO_DFE_ENDPOINTS
+
+try:
+    from app.services.certificado_service import CertificadoError
+except Exception:  # pragma: no cover
+    class CertificadoError(Exception):
+        pass
+
+logger = logging.getLogger(__name__)
+
+
+class SefazNetworkError(Exception):
+    pass
+
+
+class SefazTimeoutError(SefazNetworkError):
+    pass
+
+
+class CapturaService:
+    def sincronizar_empresa(self, empresa_id: str, db) -> Dict[str, Any]:
+        inicio = datetime.now(timezone.utc)
+        logger.info("Captura SEFAZ iniciada para empresa_id=%s", empresa_id)
+
+        notas_novas = 0
+        notas_atualizadas = 0
+        nsu_inicio = 0
+        nsu_fim = 0
+        max_nsu = 0
+        status = "erro"
+        erro_mensagem: Optional[str] = None
+
+        sync_state = self._obter_ou_criar_sync(db, empresa_id)
+        if sync_state:
+            nsu_inicio = int(sync_state.get("ultimo_nsu") or 0)
+            nsu_fim = nsu_inicio
+            max_nsu = int(sync_state.get("max_nsu") or 0)
+
+        try:
+            empresa = self._obter_empresa(db, empresa_id)
+            if not empresa:
+                erro_mensagem = "Empresa nao encontrada"
+                status = self._atualizar_sync_erro_generico(db, empresa_id, erro_mensagem, sync_state)
+                return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
+
+            cnpj_empresa = self._normalizar_cnpj(empresa.get("cnpj"))
+            if not cnpj_empresa:
+                erro_mensagem = "CNPJ da empresa invalido"
+                status = self._atualizar_sync_erro_generico(db, empresa_id, erro_mensagem, sync_state)
+                return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
+
+            use_mock = self._is_mock_enabled()
+            if use_mock:
+                logger.info("USE_MOCK_SEFAZ=true | usando mock de distribuicao DFe")
+                resposta_xml = self._consultar_distribuicao_mock(cnpj_empresa, nsu_inicio)
+            else:
+                if self._certificado_expirado_por_data(empresa.get("certificado_validade")):
+                    erro_mensagem = "Certificado expirado"
+                    self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
+                    return self._resultado("sem_certificado", 0, 0, nsu_fim, max_nsu, erro_mensagem)
+
+                if not empresa.get("certificado_a1") or not empresa.get("certificado_senha_encrypted"):
+                    erro_mensagem = "Certificado A1 nao configurado"
+                    self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
+                    return self._resultado("sem_certificado", 0, 0, nsu_fim, max_nsu, erro_mensagem)
+
+                cert_service = self._get_certificado_service()
+                cert_bytes, _ = cert_service.carregar_certificado(
+                    empresa["certificado_a1"],
+                    empresa["certificado_senha_encrypted"],
+                )
+                senha_cert = cert_service.descriptografar_senha(empresa["certificado_senha_encrypted"])
+
+                if self._certificado_expirado_por_pfx(cert_bytes, senha_cert):
+                    erro_mensagem = "Certificado expirado"
+                    self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
+                    return self._resultado("sem_certificado", 0, 0, nsu_fim, max_nsu, erro_mensagem)
+
+                resposta_xml = self._consultar_distribuicao_dfe(
+                    cnpj=cnpj_empresa,
+                    ultimo_nsu=nsu_inicio,
+                    cert_bytes=cert_bytes,
+                    senha_cert=senha_cert,
+                )
+            retorno = self._parse_retorno_distribuicao(resposta_xml)
+            cstat = retorno.get("cstat")
+            motivo = retorno.get("xmotivo", "")
+            nsu_fim = int(retorno.get("ult_nsu") or nsu_inicio)
+            max_nsu = int(retorno.get("max_nsu") or max_nsu or nsu_fim)
+
+            logger.info(
+                "retDistDFeInt empresa_id=%s cStat=%s ultNSU=%s maxNSU=%s",
+                empresa_id,
+                cstat,
+                nsu_fim,
+                max_nsu,
+            )
+
+            if cstat == "137":
+                self._atualizar_sync_ok(db, empresa_id, sync_state, nsu_fim, max_nsu, 0, 0)
+                status = "ok"
+                return self._resultado(status, 0, 0, nsu_fim, max_nsu, None)
+
+            if cstat != "138":
+                erro_mensagem = f"SEFAZ cStat={cstat}: {motivo}"
+                status = self._atualizar_sync_erro_rede(db, empresa_id, erro_mensagem, sync_state)
+                return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
+
+            documentos = retorno.get("documentos", [])
+            payload = []
+            for doc in documentos:
+                nota = self._montar_payload_nota(doc, cnpj_empresa, empresa_id)
+                if nota:
+                    payload.append(nota)
+
+            notas_novas, notas_atualizadas = self._upsert_notas(db, payload)
+            self._atualizar_sync_ok(
+                db,
+                empresa_id,
+                sync_state,
+                nsu_fim,
+                max_nsu,
+                len(payload),
+                notas_novas,
+            )
+            status = "ok"
+            return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, None)
+
+        except SefazTimeoutError as exc:
+            erro_mensagem = f"Timeout de rede: {exc}"
+            status = self._atualizar_sync_erro_rede(db, empresa_id, erro_mensagem, sync_state)
+            return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, erro_mensagem)
+        except SefazNetworkError as exc:
+            erro_mensagem = f"Erro de rede: {exc}"
+            status = self._atualizar_sync_erro_rede(db, empresa_id, erro_mensagem, sync_state)
+            return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, erro_mensagem)
+        except CertificadoError as exc:
+            erro_mensagem = f"Erro de certificado: {exc}"
+            self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
+            return self._resultado("sem_certificado", notas_novas, notas_atualizadas, nsu_fim, max_nsu, erro_mensagem)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Erro inesperado na captura SEFAZ")
+            erro_mensagem = f"Erro inesperado: {exc}"
+            status = self._atualizar_sync_erro_generico(db, empresa_id, erro_mensagem, sync_state)
+            return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, erro_mensagem)
+        finally:
+            fim = datetime.now(timezone.utc)
+            self._registrar_sync_log(
+                db=db,
+                empresa_id=empresa_id,
+                iniciado_em=inicio,
+                finalizado_em=fim,
+                status=status if status in {"ok", "erro", "parcial"} else ("erro" if status != "ok" else "ok"),
+                notas_novas=notas_novas,
+                notas_atualizadas=notas_atualizadas,
+                nsu_inicio=nsu_inicio,
+                nsu_fim=nsu_fim,
+                erro_detalhes=erro_mensagem,
+                duracao_ms=int((fim - inicio).total_seconds() * 1000),
+            )
+
+    def _consultar_distribuicao_dfe(
+        self,
+        cnpj: str,
+        ultimo_nsu: int,
+        cert_bytes: bytes,
+        senha_cert: str,
+    ) -> str:
+        endpoint = DISTRIBUICAO_DFE_ENDPOINTS.get(AMBIENTE_PADRAO, DISTRIBUICAO_DFE_ENDPOINTS["producao"])
+        logger.info("Consultando endpoint distribuicao: %s", endpoint)
+
+        try:
+            return self._consultar_via_pynfe(cnpj, ultimo_nsu, cert_bytes, senha_cert)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PyNFE indisponivel/falhou (%s). Usando SOAP direto.", exc)
+            return self._consultar_via_soap(cnpj, ultimo_nsu, cert_bytes, senha_cert, endpoint)
+
+    def _consultar_distribuicao_mock(self, cnpj: str, ultimo_nsu: int) -> str:
+        from app.adapters.mock_sefaz_client import get_distribuicao_client
+
+        client = get_distribuicao_client()
+        if client is None:
+            raise RuntimeError("USE_MOCK_SEFAZ habilitado, mas mock client indisponivel")
+        return client.consultar(cnpj=cnpj, nsu_inicial=ultimo_nsu)
+
+    def _consultar_via_pynfe(
+        self,
+        cnpj: str,
+        ultimo_nsu: int,
+        cert_bytes: bytes,
+        senha_cert: str,
+    ) -> str:
+        from pynfe.processamento.comunicacao import ComunicacaoSefaz
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pfx") as cert_tmp:
+            cert_tmp.write(cert_bytes)
+            cert_path = cert_tmp.name
+
+        try:
+            homologacao = AMBIENTE_PADRAO != "producao"
+            comunicacao = ComunicacaoSefaz(uf="AN", certificado=cert_path, senha=senha_cert, homologacao=homologacao)
+            nsu = str(max(0, int(ultimo_nsu))).zfill(15)
+
+            if hasattr(comunicacao, "consulta_distribuicao_nfe"):
+                resposta = comunicacao.consulta_distribuicao_nfe(cnpj=cnpj, ultimo_nsu=nsu)
+            elif hasattr(comunicacao, "consultar_distribuicao_nfe"):
+                resposta = comunicacao.consultar_distribuicao_nfe(cnpj=cnpj, ultimo_nsu=nsu)
+            else:
+                raise RuntimeError("Metodo de distribuicao nao encontrado no PyNFE")
+
+            return self._normalizar_resposta_xml(resposta)
+        finally:
+            try:
+                os.remove(cert_path)
+            except OSError:
+                pass
+
+    def _consultar_via_soap(
+        self,
+        cnpj: str,
+        ultimo_nsu: int,
+        cert_bytes: bytes,
+        senha_cert: str,
+        endpoint: str,
+    ) -> str:
+        import requests
+
+        cert_pem_path, key_pem_path = self._gerar_cert_key_temp(cert_bytes, senha_cert)
+        nsu = str(max(0, int(ultimo_nsu))).zfill(15)
+        payload = self._montar_envelope_distribuicao(cnpj, nsu)
+        headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
+
+        try:
+            response = requests.post(
+                endpoint,
+                data=payload.encode("utf-8"),
+                headers=headers,
+                cert=(cert_pem_path, key_pem_path),
+                timeout=60,
+            )
+            response.raise_for_status()
+            return response.text
+        except requests.Timeout as exc:
+            raise SefazTimeoutError(str(exc)) from exc
+        except requests.RequestException as exc:
+            raise SefazNetworkError(str(exc)) from exc
+        finally:
+            for path in (cert_pem_path, key_pem_path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def _gerar_cert_key_temp(self, cert_bytes: bytes, senha_cert: str) -> Tuple[str, str]:
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding,
+            NoEncryption,
+            PrivateFormat,
+            pkcs12,
+        )
+
+        senha_bytes = senha_cert.encode("utf-8") if senha_cert else None
+        private_key, certificate, additional = pkcs12.load_key_and_certificates(cert_bytes, senha_bytes)
+        if private_key is None or certificate is None:
+            raise CertificadoError("PFX invalido sem certificado/chave privada")
+
+        cert_chain = certificate.public_bytes(Encoding.PEM)
+        if additional:
+            for cert_extra in additional:
+                cert_chain += cert_extra.public_bytes(Encoding.PEM)
+
+        key_pem = private_key.private_bytes(
+            encoding=Encoding.PEM,
+            format=PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=NoEncryption(),
+        )
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as cert_tmp:
+            cert_tmp.write(cert_chain)
+            cert_path = cert_tmp.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as key_tmp:
+            key_tmp.write(key_pem)
+            key_path = key_tmp.name
+
+        return cert_path, key_path
+
+    def _montar_envelope_distribuicao(self, cnpj: str, ult_nsu: str) -> str:
+        tp_amb = "1" if AMBIENTE_PADRAO == "producao" else "2"
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                 xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+  <soap12:Header>
+    <nfeCabecMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+      <cUFAutor>91</cUFAutor>
+      <tpAmb>{tp_amb}</tpAmb>
+    </nfeCabecMsg>
+  </soap12:Header>
+  <soap12:Body>
+    <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+      <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
+        <tpAmb>{tp_amb}</tpAmb>
+        <cUFAutor>91</cUFAutor>
+        <CNPJ>{cnpj}</CNPJ>
+        <distNSU>
+          <ultNSU>{ult_nsu}</ultNSU>
+        </distNSU>
+      </distDFeInt>
+    </nfeDadosMsg>
+  </soap12:Body>
+</soap12:Envelope>"""
+
+    def _parse_retorno_distribuicao(self, xml_retorno: str) -> Dict[str, Any]:
+        if etree is None:
+            raise RuntimeError("lxml nao disponivel")
+
+        root = etree.fromstring(xml_retorno.encode("utf-8"))
+        ret_nodes = root.xpath("//*[local-name()='retDistDFeInt']")
+        ret = ret_nodes[0] if ret_nodes else root
+
+        cstat = self._find_text(ret, "cStat") or ""
+        xmotivo = self._find_text(ret, "xMotivo") or ""
+        ult_nsu = self._parse_int(self._find_text(ret, "ultNSU")) or 0
+        max_nsu = self._parse_int(self._find_text(ret, "maxNSU")) or 0
+
+        documentos: List[Dict[str, Any]] = []
+        for doc_zip in ret.xpath(".//*[local-name()='docZip']"):
+            xml_doc = self._extrair_xml_doczip(doc_zip)
+            if not xml_doc:
+                continue
+            nsu = self._parse_int(doc_zip.get("NSU"))
+            if nsu is None:
+                nsu = self._parse_int(self._extrair_texto_do_xml(xml_doc, "NSU")) or 0
+            documentos.append(
+                {
+                    "nsu": int(nsu),
+                    "schema": doc_zip.get("schema") or "",
+                    "xml": xml_doc,
+                }
+            )
+
+        return {
+            "cstat": cstat,
+            "xmotivo": xmotivo,
+            "ult_nsu": ult_nsu,
+            "max_nsu": max_nsu,
+            "documentos": documentos,
+        }
+
+    def _extrair_xml_doczip(self, doc_zip) -> Optional[str]:
+        # Fluxo oficial SEFAZ: docZip em base64 (com gzip no payload).
+        conteudo = (doc_zip.text or "").strip()
+        if conteudo:
+            xml_doc = self._descompactar_doc_zip(conteudo)
+            if xml_doc:
+                return xml_doc
+
+        # Fallback para mocks/fixtures com XML inline dentro do docZip.
+        if etree is None or len(doc_zip) == 0:
+            return None
+
+        candidatos = []
+        for child in doc_zip:
+            nome = child.tag.split("}")[-1] if isinstance(child.tag, str) else ""
+            if nome in {"resNFe", "procNFe", "NFe", "resCTe", "resNFCe"}:
+                candidatos.append(child)
+
+        target = candidatos[0] if candidatos else doc_zip[-1]
+        try:
+            return etree.tostring(target, encoding="unicode")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _descompactar_doc_zip(self, conteudo_base64: str) -> Optional[str]:
+        try:
+            bruto = base64.b64decode(conteudo_base64)
+            try:
+                xml_bytes = gzip.decompress(bruto)
+            except OSError:
+                xml_bytes = bruto
+            return xml_bytes.decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _montar_payload_nota(self, doc: Dict[str, Any], cnpj_empresa: str, empresa_id: str) -> Optional[Dict[str, Any]]:
+        xml_doc = doc.get("xml")
+        if not xml_doc:
+            return None
+
+        chave = self._extrair_chave_acesso(xml_doc)
+        if not chave:
+            return None
+
+        modelo = self._extrair_texto_do_xml(xml_doc, "mod") or chave[20:22]
+        numero_nf = self._extrair_texto_do_xml(xml_doc, "nNF") or chave[25:34].lstrip("0") or chave[25:34]
+        serie = self._extrair_texto_do_xml(xml_doc, "serie") or chave[22:25].lstrip("0") or chave[22:25]
+        data_emissao = self._normalizar_data(self._extrair_texto_do_xml(xml_doc, "dhEmi") or self._extrair_texto_do_xml(xml_doc, "dEmi"))
+        valor_total = self._normalizar_decimal(self._extrair_texto_do_xml(xml_doc, "vNF"))
+
+        cnpj_emitente = self._normalizar_cnpj(
+            self._extrair_texto_do_xml(xml_doc, "CNPJEmit") or self._extrair_texto_do_xml(xml_doc, "CNPJ")
+        ) or self._normalizar_cnpj(chave[6:20])
+        cnpj_destinatario = self._normalizar_cnpj(self._extrair_texto_do_xml(xml_doc, "CNPJDest"))
+
+        nome_emitente = self._extrair_texto_do_xml(xml_doc, "xNomeEmit") or self._extrair_texto_do_xml(xml_doc, "xNome") or ""
+        nome_destinatario = self._extrair_texto_do_xml(xml_doc, "xNomeDest")
+
+        tipo_operacao = "entrada"
+        if cnpj_emitente == cnpj_empresa:
+            tipo_operacao = "saida"
+        elif cnpj_destinatario == cnpj_empresa:
+            tipo_operacao = "entrada"
+        else:
+            tp_nf = self._extrair_texto_do_xml(xml_doc, "tpNF")
+            if tp_nf == "1":
+                tipo_operacao = "saida"
+
+        situacao = self._mapear_situacao(
+            self._extrair_texto_do_xml(xml_doc, "cSitNFe") or self._extrair_texto_do_xml(xml_doc, "cStat")
+        )
+        protocolo = self._extrair_texto_do_xml(xml_doc, "nProt")
+        xml_resumo = xml_doc if ("resNFe" in (doc.get("schema") or "") or "<resNFe" in xml_doc) else None
+
+        return {
+            "empresa_id": empresa_id,
+            "chave_acesso": chave,
+            "numero_nf": numero_nf,
+            "serie": serie,
+            "tipo_nf": self._mapear_tipo_nf(modelo),
+            "modelo": modelo,
+            "data_emissao": data_emissao,
+            "valor_total": valor_total,
+            "cnpj_emitente": self._formatar_cnpj(cnpj_emitente) if cnpj_emitente else "00.000.000/0000-00",
+            "nome_emitente": nome_emitente[:255],
+            "cnpj_destinatario": self._formatar_cnpj(cnpj_destinatario) if cnpj_destinatario else None,
+            "nome_destinatario": nome_destinatario[:255] if nome_destinatario else None,
+            "situacao": situacao,
+            "protocolo": protocolo,
+            "nsu": int(doc.get("nsu") or 0),
+            "tipo_operacao": tipo_operacao,
+            "fonte": "sefaz_nacional",
+            "xml_completo": xml_doc,
+            "xml_resumo": xml_resumo,
+            "ambiente": AMBIENTE_PADRAO,
+        }
+
+    def _upsert_notas(self, db, payload: List[Dict[str, Any]]) -> Tuple[int, int]:
+        if not payload:
+            return 0, 0
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for item in payload:
+            chave = item["chave_acesso"]
+            atual = dedup.get(chave)
+            if atual is None or int(item.get("nsu") or 0) >= int(atual.get("nsu") or 0):
+                dedup[chave] = item
+
+        lista = list(dedup.values())
+        chaves = list(dedup.keys())
+
+        existentes_resp = db.table("notas_fiscais").select("chave_acesso").in_("chave_acesso", chaves).execute()
+        existentes = {x["chave_acesso"] for x in (existentes_resp.data or []) if x.get("chave_acesso")}
+
+        db.table("notas_fiscais").upsert(lista, on_conflict="chave_acesso").execute()
+
+        novas = len([k for k in chaves if k not in existentes])
+        atualizadas = len(chaves) - novas
+        return novas, atualizadas
+
+    def _obter_empresa(self, db, empresa_id: str) -> Optional[Dict[str, Any]]:
+        resp = (
+            db.table("empresas")
+            .select(
+                "id, usuario_id, cnpj, ativa, deleted_at, certificado_a1, "
+                "certificado_senha_encrypted, certificado_validade"
+            )
+            .eq("id", empresa_id)
+            .limit(1)
+            .execute()
+        )
+        return resp.data[0] if resp.data else None
+
+    def _obter_ou_criar_sync(self, db, empresa_id: str) -> Dict[str, Any]:
+        resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
+        if resp.data:
+            return resp.data[0]
+        db.table("sync_empresas").insert({"empresa_id": empresa_id}).execute()
+        resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
+        return (resp.data or [{}])[0]
+
+    def _atualizar_sync_ok(
+        self,
+        db,
+        empresa_id: str,
+        sync_state: Dict[str, Any],
+        ultimo_nsu: int,
+        max_nsu: int,
+        notas_processadas: int,
+        notas_novas: int,
+    ) -> None:
+        total_atual = int((sync_state or {}).get("total_notas_capturadas") or 0)
+        db.table("sync_empresas").update(
+            {
+                "ultimo_nsu": int(ultimo_nsu),
+                "max_nsu": int(max_nsu),
+                "ultima_sync": datetime.now(timezone.utc).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+                "status": "ok",
+                "notas_capturadas_ultima_sync": int(notas_processadas),
+                "total_notas_capturadas": total_atual + int(notas_novas),
+                "erro_mensagem": None,
+                "tentativas_consecutivas_erro": 0,
+            }
+        ).eq("empresa_id", empresa_id).execute()
+
+    def _marcar_sem_certificado(self, db, empresa_id: str, mensagem: str) -> None:
+        db.table("sync_empresas").update(
+            {
+                "status": "sem_certificado",
+                "erro_mensagem": mensagem,
+                "ultima_sync": datetime.now(timezone.utc).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+            }
+        ).eq("empresa_id", empresa_id).execute()
+
+    def _atualizar_sync_erro_rede(self, db, empresa_id: str, mensagem: str, sync_state: Dict[str, Any]) -> str:
+        tentativas = int((sync_state or {}).get("tentativas_consecutivas_erro") or 0) + 1
+        status = "erro" if tentativas >= 5 else "pendente"
+        db.table("sync_empresas").update(
+            {
+                "status": status,
+                "erro_mensagem": mensagem,
+                "tentativas_consecutivas_erro": tentativas,
+                "ultima_sync": datetime.now(timezone.utc).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+            }
+        ).eq("empresa_id", empresa_id).execute()
+        return status
+
+    def _atualizar_sync_erro_generico(self, db, empresa_id: str, mensagem: str, sync_state: Dict[str, Any]) -> str:
+        tentativas = int((sync_state or {}).get("tentativas_consecutivas_erro") or 0) + 1
+        status = "erro" if tentativas >= 5 else "pendente"
+        db.table("sync_empresas").update(
+            {
+                "status": status,
+                "erro_mensagem": mensagem,
+                "tentativas_consecutivas_erro": tentativas,
+                "ultima_sync": datetime.now(timezone.utc).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+            }
+        ).eq("empresa_id", empresa_id).execute()
+        return status
+
+    def _registrar_sync_log(
+        self,
+        db,
+        empresa_id: str,
+        iniciado_em: datetime,
+        finalizado_em: datetime,
+        status: str,
+        notas_novas: int,
+        notas_atualizadas: int,
+        nsu_inicio: int,
+        nsu_fim: int,
+        erro_detalhes: Optional[str],
+        duracao_ms: int,
+    ) -> None:
+        try:
+            db.table("sync_log").insert(
+                {
+                    "empresa_id": empresa_id,
+                    "iniciado_em": iniciado_em.isoformat(),
+                    "finalizado_em": finalizado_em.isoformat(),
+                    "status": status,
+                    "notas_novas": notas_novas,
+                    "notas_atualizadas": notas_atualizadas,
+                    "nsu_inicio": nsu_inicio,
+                    "nsu_fim": nsu_fim,
+                    "erro_detalhes": erro_detalhes,
+                    "duracao_ms": duracao_ms,
+                }
+            ).execute()
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao registrar sync_log para empresa_id=%s", empresa_id)
+
+    def _get_certificado_service(self):
+        from app.services.certificado_service import certificado_service
+        return certificado_service
+
+    def _is_mock_enabled(self) -> bool:
+        return os.getenv("USE_MOCK_SEFAZ", "false").lower() == "true"
+
+    def _find_text(self, element, tag: str) -> Optional[str]:
+        found = element.xpath(f".//*[local-name()='{tag}']")
+        if not found:
+            return None
+        value = found[0].text
+        return value.strip() if value else None
+
+    def _extrair_texto_do_xml(self, xml_doc: str, tag: str) -> Optional[str]:
+        if etree is None:
+            return None
+        try:
+            root = etree.fromstring(xml_doc.encode("utf-8"))
+            found = root.xpath(f".//*[local-name()='{tag}']")
+            if not found:
+                return None
+            value = found[0].text
+            return value.strip() if value else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _extrair_chave_acesso(self, xml_doc: str) -> Optional[str]:
+        chave = self._extrair_texto_do_xml(xml_doc, "chNFe")
+        if chave and len(chave) == 44 and chave.isdigit():
+            return chave
+        if etree is None:
+            return None
+        try:
+            root = etree.fromstring(xml_doc.encode("utf-8"))
+            inf_nfe = root.xpath(".//*[local-name()='infNFe']")
+            if not inf_nfe:
+                return None
+            ident = inf_nfe[0].attrib.get("Id", "")
+            if ident.startswith("NFe"):
+                chave = ident[3:]
+                if len(chave) == 44 and chave.isdigit():
+                    return chave
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _normalizar_resposta_xml(self, resposta: Any) -> str:
+        if isinstance(resposta, bytes):
+            return resposta.decode("utf-8", errors="ignore")
+        if isinstance(resposta, str):
+            return resposta
+        if hasattr(resposta, "text"):
+            return str(resposta.text)
+        if hasattr(resposta, "content"):
+            content = resposta.content
+            return content.decode("utf-8", errors="ignore") if isinstance(content, bytes) else str(content)
+        return str(resposta)
+
+    def _parse_int(self, valor: Optional[str]) -> Optional[int]:
+        try:
+            return int(str(valor).strip()) if valor is not None else None
+        except ValueError:
+            return None
+
+    def _normalizar_data(self, valor: Optional[str]) -> str:
+        if not valor:
+            return datetime.now(timezone.utc).isoformat()
+        if "T" in valor:
+            return valor
+        return f"{valor}T00:00:00"
+
+    def _normalizar_decimal(self, valor: Optional[str]) -> float:
+        if not valor:
+            return 0.0
+        try:
+            return float(Decimal(str(valor).replace(",", ".")))
+        except (InvalidOperation, ValueError):
+            return 0.0
+
+    def _normalizar_cnpj(self, valor: Optional[str]) -> Optional[str]:
+        if not valor:
+            return None
+        digits = "".join(ch for ch in str(valor) if ch.isdigit())
+        return digits if len(digits) == 14 else None
+
+    def _formatar_cnpj(self, valor: Optional[str]) -> Optional[str]:
+        cnpj = self._normalizar_cnpj(valor)
+        if not cnpj:
+            return valor
+        return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+
+    def _mapear_tipo_nf(self, modelo: Optional[str]) -> str:
+        mapa = {"55": "NFe", "65": "NFCe", "57": "CTe"}
+        return mapa.get(str(modelo or ""), "NFe")
+
+    def _mapear_situacao(self, codigo: Optional[str]) -> str:
+        mapa = {
+            "1": "autorizada",
+            "2": "denegada",
+            "3": "cancelada",
+            "100": "autorizada",
+            "101": "cancelada",
+            "135": "autorizada",
+            "302": "denegada",
+        }
+        return mapa.get((codigo or "").strip(), "processando")
+
+    def _certificado_expirado_por_data(self, validade: Optional[str]) -> bool:
+        if not validade:
+            return False
+        try:
+            return date.fromisoformat(str(validade)[:10]) < date.today()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _certificado_expirado_por_pfx(self, cert_bytes: bytes, senha: str) -> bool:
+        try:
+            from cryptography.hazmat.primitives.serialization import pkcs12
+
+            senha_bytes = senha.encode("utf-8") if senha else None
+            _, cert, _ = pkcs12.load_key_and_certificates(cert_bytes, senha_bytes)
+            if cert is None:
+                return True
+            validade = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
+            if validade.tzinfo is None:
+                validade = validade.replace(tzinfo=timezone.utc)
+            return validade < datetime.now(timezone.utc)
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _resultado(
+        self,
+        status: str,
+        notas_novas: int,
+        notas_atualizadas: int,
+        ultimo_nsu: int,
+        max_nsu: int,
+        erro_mensagem: Optional[str],
+    ) -> Dict[str, Any]:
+        return {
+            "status": status,
+            "notas_novas": int(notas_novas),
+            "notas_atualizadas": int(notas_atualizadas),
+            "ultimo_nsu": int(ultimo_nsu or 0),
+            "max_nsu": int(max_nsu or 0),
+            "erro_mensagem": erro_mensagem,
+        }
+
+
+captura_service = CapturaService()

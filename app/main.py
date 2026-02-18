@@ -3,6 +3,7 @@ Aplicação principal FastAPI - Hi-Control Backend
 """
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import logging
 
 from app.api.v1.router import api_router
@@ -16,6 +17,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown centralizado em lifespan."""
+    logger.info("🚀 Iniciando Hi-Control API")
+    logger.info(f"Ambiente: {settings.ENVIRONMENT}")
+    logger.info(f"Supabase URL: {settings.SUPABASE_URL}")
+
+    # Testar conexão com Supabase
+    try:
+        supabase_client.table("planos").select("id").limit(1).execute()
+        logger.info("✅ Conexão com Supabase estabelecida")
+    except Exception as e:
+        logger.error(f"❌ Erro ao conectar com Supabase: {e}")
+
+    # Scheduler existente (email/drive)
+    try:
+        from app.services.scheduler_service import scheduler_service
+        scheduler_service.start()
+    except Exception as e:
+        logger.warning(f"Scheduler não iniciado: {e}")
+
+    # Worker de captura SEFAZ em thread separada
+    try:
+        from app.worker.sync_worker import start_worker
+        start_worker()
+    except Exception as e:
+        logger.warning(f"Worker de captura SEFAZ não iniciado: {e}")
+
+    # Logar rotas registradas para verificação operacional
+    for route in app.router.routes:
+        path = getattr(route, "path", "")
+        name = getattr(route, "name", "")
+        methods = ",".join(sorted(getattr(route, "methods", []) or []))
+        logger.info("router include | path=%s | methods=%s | name=%s", path, methods, name)
+
+    try:
+        yield
+    finally:
+        try:
+            from app.worker.sync_worker import stop_worker
+            stop_worker()
+        except Exception:
+            pass
+
+        try:
+            from app.services.scheduler_service import scheduler_service
+            scheduler_service.stop()
+        except Exception:
+            pass
+
+        logger.info("👋 Encerrando Hi-Control API")
+
+
 # Criar instância FastAPI
 # CRITICAL: redirect_slashes=False prevents 307 redirects that break CORS preflight
 app = FastAPI(
@@ -25,7 +79,8 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
     docs_url=f"{settings.API_V1_PREFIX}/docs",
     redoc_url=f"{settings.API_V1_PREFIX}/redoc",
-    redirect_slashes=False
+    redirect_slashes=False,
+    lifespan=lifespan,
 )
 
 # Middleware para logar requisições (debug CORS)
@@ -59,40 +114,6 @@ app.add_middleware(
 
 # Incluir routers
 app.include_router(api_router, prefix=settings.API_V1_PREFIX)
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Executado ao iniciar a aplicação"""
-    logger.info("🚀 Iniciando Hi-Control API")
-    logger.info(f"Ambiente: {settings.ENVIRONMENT}")
-    logger.info(f"Supabase URL: {settings.SUPABASE_URL}")
-
-    # Testar conexão com Supabase
-    try:
-        response = supabase_client.table('planos').select("id").limit(1).execute()
-        logger.info("✅ Conexão com Supabase estabelecida")
-    except Exception as e:
-        logger.error(f"❌ Erro ao conectar com Supabase: {e}")
-
-    # Iniciar scheduler de sincronização automática
-    try:
-        from app.services.scheduler_service import scheduler_service
-        scheduler_service.start()
-    except Exception as e:
-        logger.warning(f"Scheduler não iniciado: {e}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Executado ao desligar a aplicação"""
-    # Parar scheduler
-    try:
-        from app.services.scheduler_service import scheduler_service
-        scheduler_service.stop()
-    except Exception:
-        pass
-    logger.info("👋 Encerrando Hi-Control API")
 
 
 @app.get("/")

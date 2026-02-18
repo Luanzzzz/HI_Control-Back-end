@@ -547,24 +547,17 @@ class NFSeService:
             tempo_ms: Tempo de resposta em milissegundos
             erro: Mensagem de erro (se houver)
         """
-        try:
-            db.table("historico_consultas").insert({
-                "empresa_id": empresa_id,
-                "contador_id": usuario_id,
-                "filtros": {
-                    "tipo": "nfse",
-                    "sistema": sistema,
-                    "municipio_codigo": municipio_codigo,
-                },
-                "quantidade_notas": quantidade,
-                "fonte": f"api_nfse_{sistema.lower().replace(' ', '_')}",
-                "tempo_resposta_ms": tempo_ms,
-                "sucesso": sucesso,
-                "erro_mensagem": erro,
-                "certificado_tipo": "nfse_credencial",
-            }).execute()
-        except Exception as e:
-            logger.warning(f"[NFS-e] Erro ao registrar auditoria: {e}")
+        logger.debug(
+            "[NFS-e] Auditoria sem persistencia | empresa=%s usuario=%s municipio=%s sistema=%s qtd=%s sucesso=%s tempo_ms=%s erro=%s",
+            empresa_id,
+            usuario_id,
+            municipio_codigo,
+            sistema,
+            quantidade,
+            sucesso,
+            tempo_ms,
+            erro,
+        )
 
     # ============================================
     # MÉTODOS PÚBLICOS AUXILIARES
