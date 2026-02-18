@@ -43,6 +43,67 @@ def _subtrair_mes(ano: int, mes: int) -> Tuple[int, int]:
     return ano, mes - 1
 
 
+def _normalizar_tipo_param(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    normalizado = value.strip().lower().replace("-", "").replace(" ", "")
+    if normalizado in {"todos", "todas", "all"}:
+        return None
+    if normalizado in {"nfe", "55"}:
+        return "NFe"
+    if normalizado in {"nfse"}:
+        return "NFSe"
+    if normalizado in {"nfce", "65"}:
+        return "NFCe"
+    if normalizado in {"cte", "57"}:
+        return "CTe"
+    return None
+
+
+def _normalizar_status_param(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    normalizado = value.strip().lower()
+    if normalizado in {"todos", "todas", "all"}:
+        return None
+    if normalizado in {"ativa", "autorizada"}:
+        return "autorizada"
+    if normalizado in {"cancelada"}:
+        return "cancelada"
+    if normalizado in {"denegada"}:
+        return "denegada"
+    if normalizado in {"processando"}:
+        return "processando"
+    return None
+
+
+def _normalizar_retencao_param(value: Optional[str]) -> str:
+    if not value:
+        return "todas"
+    normalizado = value.strip().lower().replace("ã", "a").replace("ç", "c")
+    if "com" in normalizado and "retenc" in normalizado:
+        return "com"
+    if "sem" in normalizado and "retenc" in normalizado:
+        return "sem"
+    return "todas"
+
+
+def _tem_retencao(row: Dict[str, Any]) -> bool:
+    valores = [row.get("valor_iss"), row.get("valor_pis"), row.get("valor_cofins")]
+    for valor in valores:
+        if _to_decimal(valor) > 0:
+            return True
+    return False
+
+
+def _filtrar_por_retencao(rows: List[Dict[str, Any]], retencao: str) -> List[Dict[str, Any]]:
+    if retencao == "com":
+        return [row for row in rows if _tem_retencao(row)]
+    if retencao == "sem":
+        return [row for row in rows if not _tem_retencao(row)]
+    return rows
+
+
 async def _validar_empresa_usuario(db: Client, empresa_id: str, usuario_id: str) -> Dict[str, Any]:
     resp = (
         db.table("empresas")
@@ -243,6 +304,88 @@ async def get_dashboard_empresa(
         "historico": historico,
         "notas": notas_resp.data or [],
         "notas_total": total_resp.count or 0,
+        "pagina": pagina,
+        "limite": limite,
+    }
+
+
+@router.get("/{empresa_id}/notas")
+async def listar_notas_empresa(
+    empresa_id: str,
+    tipo: Optional[str] = Query(default="Todos"),
+    status_filtro: Optional[str] = Query(default="Todos", alias="status"),
+    retencao: Optional[str] = Query(default="Todas"),
+    busca: Optional[str] = Query(default=""),
+    pagina: int = Query(default=1, ge=1),
+    limite: int = Query(default=20, ge=1, le=100),
+    usuario: Dict[str, Any] = Depends(get_current_user),
+    db: Client = Depends(get_admin_db),
+):
+    await _validar_empresa_usuario(db, empresa_id, usuario["id"])
+
+    tipo_nf = _normalizar_tipo_param(tipo)
+    situacao = _normalizar_status_param(status_filtro)
+    retencao_norm = _normalizar_retencao_param(retencao)
+    termo_busca = (busca or "").strip().replace(",", " ").replace("%", "").replace("*", "")
+
+    colunas = (
+        "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, "
+        "valor_total, cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, "
+        "situacao, municipio_nome, fonte, valor_iss, valor_pis, valor_cofins"
+    )
+    offset = (pagina - 1) * limite
+
+    def _base_query():
+        query = (
+            db.table("notas_fiscais")
+            .select(colunas, count="exact")
+            .eq("empresa_id", empresa_id)
+            .order("data_emissao", desc=True)
+        )
+        if tipo_nf:
+            query = query.eq("tipo_nf", tipo_nf)
+        if situacao:
+            query = query.eq("situacao", situacao)
+        if termo_busca:
+            query = query.or_(
+                "chave_acesso.ilike.%{0}%,"
+                "numero_nf.ilike.%{0}%,"
+                "cnpj_emitente.ilike.%{0}%,"
+                "nome_emitente.ilike.%{0}%,"
+                "cnpj_destinatario.ilike.%{0}%,"
+                "nome_destinatario.ilike.%{0}%".format(termo_busca)
+            )
+        return query
+
+    if retencao_norm == "todas":
+        resp = _base_query().range(offset, offset + limite - 1).execute()
+        notas = resp.data or []
+        for nota in notas:
+            nota.pop("valor_iss", None)
+            nota.pop("valor_pis", None)
+            nota.pop("valor_cofins", None)
+        return {
+            "notas": notas,
+            "total": resp.count or 0,
+            "pagina": pagina,
+            "limite": limite,
+        }
+
+    # Quando filtra por retencao, aplica filtro em memoria para evitar inconsistencias
+    # entre valores nulos/zero nas colunas de retencao.
+    resp = _base_query().execute()
+    linhas = resp.data or []
+    filtradas = _filtrar_por_retencao(linhas, retencao_norm)
+    total = len(filtradas)
+    notas = filtradas[offset: offset + limite]
+    for nota in notas:
+        nota.pop("valor_iss", None)
+        nota.pop("valor_pis", None)
+        nota.pop("valor_cofins", None)
+
+    return {
+        "notas": notas,
+        "total": total,
         "pagina": pagina,
         "limite": limite,
     }
