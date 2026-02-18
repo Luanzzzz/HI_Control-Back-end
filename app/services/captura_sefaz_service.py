@@ -44,6 +44,9 @@ class CapturaService:
         ambiente = str(AMBIENTE_PADRAO or "producao").strip().lower()
         return ambiente if ambiente in {"producao", "homologacao"} else "producao"
 
+    def _usar_pynfe_distribuicao(self) -> bool:
+        return os.getenv("USE_PYNFE_DISTRIBUICAO", "false").strip().lower() == "true"
+
     def sincronizar_empresa(self, empresa_id: str, db) -> Dict[str, Any]:
         inicio = datetime.now(timezone.utc)
         logger.info("Captura SEFAZ iniciada para empresa_id=%s", empresa_id)
@@ -134,6 +137,12 @@ class CapturaService:
                 status = "ok"
                 return self._resultado(status, 0, 0, nsu_fim, max_nsu, None)
 
+            if cstat == "656":
+                # Consumo indevido: aguardar 1h e nao tratar como erro operacional.
+                self._atualizar_sync_cooldown(db, empresa_id, nsu_fim, max_nsu, horas=1)
+                status = "ok"
+                return self._resultado(status, 0, 0, nsu_fim, max_nsu, None)
+
             if cstat != "138":
                 erro_mensagem = f"SEFAZ cStat={cstat}: {motivo}"
                 status = self._atualizar_sync_erro_sefaz(
@@ -210,6 +219,10 @@ class CapturaService:
         ambiente = self._ambiente_norm()
         endpoint = DISTRIBUICAO_DFE_ENDPOINTS.get(ambiente, DISTRIBUICAO_DFE_ENDPOINTS["producao"])
         logger.info("Consultando endpoint distribuicao: %s | ambiente=%s", endpoint, ambiente)
+
+        if not self._usar_pynfe_distribuicao():
+            logger.info("USE_PYNFE_DISTRIBUICAO=false | usando SOAP direto")
+            return self._consultar_via_soap(cnpj, ultimo_nsu, cert_bytes, senha_cert, endpoint, uf_codigo)
 
         try:
             return self._consultar_via_pynfe(cnpj, ultimo_nsu, cert_bytes, senha_cert)
@@ -570,6 +583,20 @@ class CapturaService:
                 "status": "ok",
                 "notas_capturadas_ultima_sync": int(notas_processadas),
                 "total_notas_capturadas": total_atual + int(notas_novas),
+                "erro_mensagem": None,
+                "tentativas_consecutivas_erro": 0,
+            }
+        ).eq("empresa_id", empresa_id).execute()
+
+    def _atualizar_sync_cooldown(self, db, empresa_id: str, ultimo_nsu: int, max_nsu: int, horas: int = 1) -> None:
+        db.table("sync_empresas").update(
+            {
+                "ultimo_nsu": int(ultimo_nsu),
+                "max_nsu": int(max_nsu),
+                "ultima_sync": datetime.now(timezone.utc).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=horas)).isoformat(),
+                "status": "ok",
+                "notas_capturadas_ultima_sync": 0,
                 "erro_mensagem": None,
                 "tentativas_consecutivas_erro": 0,
             }
