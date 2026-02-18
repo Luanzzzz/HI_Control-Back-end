@@ -17,7 +17,7 @@ try:
 except ImportError:  # pragma: no cover
     etree = None
 
-from app.core.sefaz_config import AMBIENTE_PADRAO, DISTRIBUICAO_DFE_ENDPOINTS
+from app.core.sefaz_config import AMBIENTE_PADRAO, DISTRIBUICAO_DFE_ENDPOINTS, UF_CODES
 
 try:
     from app.services.certificado_service import CertificadoError
@@ -26,6 +26,9 @@ except Exception:  # pragma: no cover
         pass
 
 logger = logging.getLogger(__name__)
+SOAP_DISTRIBUICAO_ACTION = (
+    "http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"
+)
 
 
 class SefazNetworkError(Exception):
@@ -73,6 +76,12 @@ class CapturaService:
                 logger.info("USE_MOCK_SEFAZ=true | usando mock de distribuicao DFe")
                 resposta_xml = self._consultar_distribuicao_mock(cnpj_empresa, nsu_inicio)
             else:
+                uf_codigo = self._resolver_uf_codigo_empresa(empresa)
+                if not uf_codigo:
+                    erro_mensagem = "UF da empresa nao configurada (estado/municipio_codigo)"
+                    status = self._atualizar_sync_erro_generico(db, empresa_id, erro_mensagem, sync_state)
+                    return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
+
                 if self._certificado_expirado_por_data(empresa.get("certificado_validade")):
                     erro_mensagem = "Certificado expirado"
                     self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
@@ -100,6 +109,7 @@ class CapturaService:
                     ultimo_nsu=nsu_inicio,
                     cert_bytes=cert_bytes,
                     senha_cert=senha_cert,
+                    uf_codigo=uf_codigo,
                 )
             retorno = self._parse_retorno_distribuicao(resposta_xml)
             cstat = retorno.get("cstat")
@@ -184,6 +194,7 @@ class CapturaService:
         ultimo_nsu: int,
         cert_bytes: bytes,
         senha_cert: str,
+        uf_codigo: str,
     ) -> str:
         endpoint = DISTRIBUICAO_DFE_ENDPOINTS.get(AMBIENTE_PADRAO, DISTRIBUICAO_DFE_ENDPOINTS["producao"])
         logger.info("Consultando endpoint distribuicao: %s", endpoint)
@@ -192,7 +203,7 @@ class CapturaService:
             return self._consultar_via_pynfe(cnpj, ultimo_nsu, cert_bytes, senha_cert)
         except Exception as exc:  # noqa: BLE001
             logger.warning("PyNFE indisponivel/falhou (%s). Usando SOAP direto.", exc)
-            return self._consultar_via_soap(cnpj, ultimo_nsu, cert_bytes, senha_cert, endpoint)
+            return self._consultar_via_soap(cnpj, ultimo_nsu, cert_bytes, senha_cert, endpoint, uf_codigo)
 
     def _consultar_distribuicao_mock(self, cnpj: str, ultimo_nsu: int) -> str:
         from app.adapters.mock_sefaz_client import get_distribuicao_client
@@ -241,13 +252,18 @@ class CapturaService:
         cert_bytes: bytes,
         senha_cert: str,
         endpoint: str,
+        uf_codigo: str,
     ) -> str:
         import requests
 
         cert_pem_path, key_pem_path = self._gerar_cert_key_temp(cert_bytes, senha_cert)
         nsu = str(max(0, int(ultimo_nsu))).zfill(15)
-        payload = self._montar_envelope_distribuicao(cnpj, nsu)
-        headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
+        payload = self._montar_envelope_distribuicao(cnpj, nsu, uf_codigo)
+        headers = {
+            "Content-Type": f'application/soap+xml; charset=utf-8; action="{SOAP_DISTRIBUICAO_ACTION}"',
+            "SOAPAction": f'"{SOAP_DISTRIBUICAO_ACTION}"',
+        }
+        logger.info("SOAP distribuicao: endpoint=%s cnpj=%s ult_nsu=%s cUFAutor(body)=%s", endpoint, cnpj, nsu, uf_codigo)
 
         try:
             response = requests.post(
@@ -304,29 +320,32 @@ class CapturaService:
 
         return cert_path, key_path
 
-    def _montar_envelope_distribuicao(self, cnpj: str, ult_nsu: str) -> str:
+    def _montar_envelope_distribuicao(self, cnpj: str, ult_nsu: str, uf_codigo: str) -> str:
         tp_amb = "1" if AMBIENTE_PADRAO == "producao" else "2"
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-                 xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+                 xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"
+                 xmlns:nfed="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
   <soap12:Header>
-    <nfeCabecMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+    <nfed:nfeCabecMsg>
       <cUFAutor>91</cUFAutor>
       <tpAmb>{tp_amb}</tpAmb>
-    </nfeCabecMsg>
+    </nfed:nfeCabecMsg>
   </soap12:Header>
   <soap12:Body>
-    <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
-      <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
-        <tpAmb>{tp_amb}</tpAmb>
-        <cUFAutor>91</cUFAutor>
-        <CNPJ>{cnpj}</CNPJ>
-        <distNSU>
-          <ultNSU>{ult_nsu}</ultNSU>
-        </distNSU>
-      </distDFeInt>
-    </nfeDadosMsg>
+    <nfed:nfeDistDFeInteresse>
+      <nfed:nfeDadosMsg>
+        <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
+          <tpAmb>{tp_amb}</tpAmb>
+          <cUFAutor>{uf_codigo}</cUFAutor>
+          <CNPJ>{cnpj}</CNPJ>
+          <distNSU>
+            <ultNSU>{ult_nsu}</ultNSU>
+          </distNSU>
+        </distDFeInt>
+      </nfed:nfeDadosMsg>
+    </nfed:nfeDistDFeInteresse>
   </soap12:Body>
 </soap12:Envelope>"""
 
@@ -491,14 +510,25 @@ class CapturaService:
         resp = (
             db.table("empresas")
             .select(
-                "id, usuario_id, cnpj, ativa, deleted_at, certificado_a1, "
-                "certificado_senha_encrypted, certificado_validade"
+                "id, usuario_id, cnpj, ativa, deleted_at, estado, municipio_codigo, "
+                "certificado_a1, certificado_senha_encrypted, certificado_validade"
             )
             .eq("id", empresa_id)
             .limit(1)
             .execute()
         )
         return resp.data[0] if resp.data else None
+
+    def _resolver_uf_codigo_empresa(self, empresa: Dict[str, Any]) -> Optional[str]:
+        municipio_codigo = str(empresa.get("municipio_codigo") or "").strip()
+        if len(municipio_codigo) >= 2 and municipio_codigo[:2].isdigit():
+            return municipio_codigo[:2]
+
+        estado = str(empresa.get("estado") or "").strip().upper()
+        if estado:
+            return UF_CODES.get(estado)
+
+        return None
 
     def _obter_ou_criar_sync(self, db, empresa_id: str) -> Dict[str, Any]:
         resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
