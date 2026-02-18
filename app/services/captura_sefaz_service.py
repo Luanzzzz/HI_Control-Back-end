@@ -40,6 +40,10 @@ class SefazTimeoutError(SefazNetworkError):
 
 
 class CapturaService:
+    def _ambiente_norm(self) -> str:
+        ambiente = str(AMBIENTE_PADRAO or "producao").strip().lower()
+        return ambiente if ambiente in {"producao", "homologacao"} else "producao"
+
     def sincronizar_empresa(self, empresa_id: str, db) -> Dict[str, Any]:
         inicio = datetime.now(timezone.utc)
         logger.info("Captura SEFAZ iniciada para empresa_id=%s", empresa_id)
@@ -132,7 +136,14 @@ class CapturaService:
 
             if cstat != "138":
                 erro_mensagem = f"SEFAZ cStat={cstat}: {motivo}"
-                status = self._atualizar_sync_erro_rede(db, empresa_id, erro_mensagem, sync_state)
+                status = self._atualizar_sync_erro_sefaz(
+                    db=db,
+                    empresa_id=empresa_id,
+                    mensagem=erro_mensagem,
+                    sync_state=sync_state,
+                    ultimo_nsu=nsu_fim,
+                    max_nsu=max_nsu,
+                )
                 return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
 
             documentos = retorno.get("documentos", [])
@@ -196,13 +207,14 @@ class CapturaService:
         senha_cert: str,
         uf_codigo: str,
     ) -> str:
-        endpoint = DISTRIBUICAO_DFE_ENDPOINTS.get(AMBIENTE_PADRAO, DISTRIBUICAO_DFE_ENDPOINTS["producao"])
-        logger.info("Consultando endpoint distribuicao: %s", endpoint)
+        ambiente = self._ambiente_norm()
+        endpoint = DISTRIBUICAO_DFE_ENDPOINTS.get(ambiente, DISTRIBUICAO_DFE_ENDPOINTS["producao"])
+        logger.info("Consultando endpoint distribuicao: %s | ambiente=%s", endpoint, ambiente)
 
         try:
             return self._consultar_via_pynfe(cnpj, ultimo_nsu, cert_bytes, senha_cert)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("PyNFE indisponivel/falhou (%s). Usando SOAP direto.", exc)
+            logger.info("PyNFE indisponivel/falhou (%s). Usando SOAP direto.", exc)
             return self._consultar_via_soap(cnpj, ultimo_nsu, cert_bytes, senha_cert, endpoint, uf_codigo)
 
     def _consultar_distribuicao_mock(self, cnpj: str, ultimo_nsu: int) -> str:
@@ -227,7 +239,7 @@ class CapturaService:
             cert_path = cert_tmp.name
 
         try:
-            homologacao = AMBIENTE_PADRAO != "producao"
+            homologacao = self._ambiente_norm() != "producao"
             comunicacao = ComunicacaoSefaz(uf="AN", certificado=cert_path, senha=senha_cert, homologacao=homologacao)
             nsu = str(max(0, int(ultimo_nsu))).zfill(15)
 
@@ -321,7 +333,7 @@ class CapturaService:
         return cert_path, key_path
 
     def _montar_envelope_distribuicao(self, cnpj: str, ult_nsu: str, uf_codigo: str) -> str:
-        tp_amb = "1" if AMBIENTE_PADRAO == "producao" else "2"
+        tp_amb = "1" if self._ambiente_norm() == "producao" else "2"
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -480,7 +492,7 @@ class CapturaService:
             "fonte": "sefaz_nacional",
             "xml_completo": xml_doc,
             "xml_resumo": xml_resumo,
-            "ambiente": AMBIENTE_PADRAO,
+            "ambiente": self._ambiente_norm(),
         }
 
     def _upsert_notas(self, db, payload: List[Dict[str, Any]]) -> Tuple[int, int]:
@@ -600,6 +612,29 @@ class CapturaService:
             }
         ).eq("empresa_id", empresa_id).execute()
         return status
+
+    def _atualizar_sync_erro_sefaz(
+        self,
+        db,
+        empresa_id: str,
+        mensagem: str,
+        sync_state: Dict[str, Any],
+        ultimo_nsu: int,
+        max_nsu: int,
+    ) -> str:
+        tentativas = int((sync_state or {}).get("tentativas_consecutivas_erro") or 0) + 1
+        db.table("sync_empresas").update(
+            {
+                "status": "erro",
+                "erro_mensagem": mensagem,
+                "tentativas_consecutivas_erro": tentativas,
+                "ultimo_nsu": int(ultimo_nsu or 0),
+                "max_nsu": int(max_nsu or 0),
+                "ultima_sync": datetime.now(timezone.utc).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+            }
+        ).eq("empresa_id", empresa_id).execute()
+        return "erro"
 
     def _registrar_sync_log(
         self,
