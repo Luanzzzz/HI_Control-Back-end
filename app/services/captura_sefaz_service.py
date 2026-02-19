@@ -7,6 +7,7 @@ import base64
 import gzip
 import logging
 import os
+import re
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -89,8 +90,6 @@ class CapturaService:
                 resposta_xml = self._consultar_distribuicao_mock(cnpj_empresa, nsu_inicio)
             else:
                 self._limpar_notas_mock_antigas(db, empresa_id)
-                uf_codigo = self._resolver_uf_codigo_empresa(empresa)
-
                 if self._certificado_expirado_por_data(empresa.get("certificado_validade")):
                     erro_mensagem = "Certificado expirado"
                     self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
@@ -107,6 +106,10 @@ class CapturaService:
                     empresa["certificado_senha_encrypted"],
                 )
                 senha_cert = cert_service.descriptografar_senha(empresa["certificado_senha_encrypted"])
+
+                uf_codigo, uf_sigla = self._resolver_uf_codigo_empresa(empresa, cert_bytes, senha_cert)
+                if uf_sigla and not str(empresa.get("estado") or "").strip():
+                    self._persistir_estado_empresa(db, empresa_id, uf_sigla)
 
                 if self._certificado_expirado_por_pfx(cert_bytes, senha_cert):
                     erro_mensagem = "Certificado expirado"
@@ -127,11 +130,12 @@ class CapturaService:
             max_nsu = int(retorno.get("max_nsu") or max_nsu or nsu_fim)
 
             logger.info(
-                "retDistDFeInt empresa_id=%s cStat=%s ultNSU=%s maxNSU=%s",
+                "retDistDFeInt empresa_id=%s cStat=%s ultNSU=%s maxNSU=%s docs=%s",
                 empresa_id,
                 cstat,
                 nsu_fim,
                 max_nsu,
+                len(retorno.get("documentos", []) or []),
             )
 
             if cstat == "137":
@@ -551,26 +555,82 @@ class CapturaService:
         )
         return resp.data[0] if resp.data else None
 
-    def _resolver_uf_codigo_empresa(self, empresa: Dict[str, Any]) -> str:
+    def _resolver_uf_codigo_empresa(
+        self,
+        empresa: Dict[str, Any],
+        cert_bytes: Optional[bytes] = None,
+        senha_cert: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
         municipio_codigo = str(empresa.get("municipio_codigo") or "").strip()
         if len(municipio_codigo) >= 2 and municipio_codigo[:2].isdigit():
-            return municipio_codigo[:2]
+            uf_codigo = municipio_codigo[:2]
+            return uf_codigo, self._uf_sigla_por_codigo(uf_codigo)
 
         estado = str(empresa.get("estado") or "").strip().upper()
         if estado:
             uf_codigo = UF_CODES.get(estado)
             if uf_codigo:
-                return uf_codigo
+                return uf_codigo, estado
+
+        uf_cert = self._extrair_uf_do_certificado(cert_bytes, senha_cert or "")
+        if uf_cert and uf_cert in UF_CODES:
+            logger.info(
+                "UF resolvida via certificado digital: %s (empresa_id=%s)",
+                uf_cert,
+                empresa.get("id"),
+            )
+            return UF_CODES[uf_cert], uf_cert
 
         # Fallback para manter o XML válido mesmo sem UF cadastrada na empresa.
-        # Usamos uma UF autorizadora válida (35/SP), pois alguns validadores
-        # rejeitam cUFAutor=91 no schema do distDFeInt (cStat 215).
+        # Usamos uma UF autorizadora válida (35/SP) quando não há qualquer pista
+        # de UF. Esse caso deve ser raro após extração via certificado.
         logger.warning(
             "Empresa sem estado/municipio_codigo. Usando cUFAutor=35 (fallback). "
             "empresa_id=%s",
             empresa.get("id"),
         )
-        return "35"
+        return "35", None
+
+    def _persistir_estado_empresa(self, db, empresa_id: str, estado: str) -> None:
+        try:
+            db.table("empresas").update({"estado": estado}).eq("id", empresa_id).execute()
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao persistir estado deduzido no cadastro da empresa_id=%s", empresa_id)
+
+    def _uf_sigla_por_codigo(self, uf_codigo: str) -> Optional[str]:
+        for sigla, codigo in UF_CODES.items():
+            if str(codigo).zfill(2) == str(uf_codigo).zfill(2):
+                return sigla
+        return None
+
+    def _extrair_uf_do_certificado(self, cert_bytes: Optional[bytes], senha_cert: str) -> Optional[str]:
+        if not cert_bytes:
+            return None
+        try:
+            from cryptography.hazmat.primitives.serialization import pkcs12
+            from cryptography.x509.oid import NameOID
+
+            senha_bytes = senha_cert.encode("utf-8") if senha_cert else None
+            _, cert, _ = pkcs12.load_key_and_certificates(cert_bytes, senha_bytes)
+            if cert is None:
+                return None
+
+            attrs = cert.subject.get_attributes_for_oid(NameOID.STATE_OR_PROVINCE_NAME)
+            if attrs:
+                uf = str(attrs[0].value or "").strip().upper()
+                if uf in UF_CODES:
+                    return uf
+
+            # Fallback em alguns certificados que gravam UF apenas no DN textual.
+            dn = cert.subject.rfc4514_string().upper()
+            match = re.search(r"(?:^|,)(?:ST|S)=([A-Z]{2})(?:,|$)", dn)
+            if match:
+                uf = match.group(1).strip().upper()
+                if uf in UF_CODES:
+                    return uf
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao extrair UF a partir do certificado digital")
+        return None
 
     def _obter_ou_criar_sync(self, db, empresa_id: str) -> Dict[str, Any]:
         resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
