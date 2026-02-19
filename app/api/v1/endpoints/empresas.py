@@ -6,6 +6,13 @@ from typing import List, Optional
 from supabase import Client
 from app.dependencies import get_db, get_admin_db, get_current_user
 from app.models.empresa import EmpresaCreate, EmpresaResponse
+from pydantic import BaseModel, Field
+from app.services.certificado_service import (
+    certificado_service,
+    CertificadoInvalidoError,
+    CertificadoExpiradoError,
+    SenhaIncorretaError,
+)
 from app.services.municipio_service import (
     resolver_municipio_por_cidade_uf,
     resolver_municipio_por_codigo,
@@ -46,6 +53,45 @@ async def _preencher_municipio(empresa_dict: dict) -> dict:
         return empresa_dict
 
     return empresa_dict
+
+
+class CertificadoPreviewRequest(BaseModel):
+    certificado_base64: str = Field(..., description="Arquivo .pfx/.p12 codificado em base64")
+    senha: str = Field(..., min_length=1, description="Senha do certificado digital")
+
+
+class CertificadoPreviewResponse(BaseModel):
+    titular: str
+    emissor: str
+    validade: str
+    dias_restantes: int
+    requer_atencao: bool
+    cnpj: Optional[str] = None
+    razao_social: Optional[str] = None
+
+
+def _extrair_dados_empresa_do_titular(titular: str) -> tuple[Optional[str], Optional[str]]:
+    if not titular:
+        return None, None
+
+    # Captura CNPJ com/sem pontuacao dentro do CN.
+    match = re.search(r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", titular)
+    cnpj_formatado = None
+    if match:
+        digits = re.sub(r"\D", "", match.group(0))
+        if len(digits) == 14:
+            cnpj_formatado = f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+
+    razao = titular
+    if ":" in titular:
+        razao = titular.split(":", 1)[0]
+    elif "-" in titular and cnpj_formatado and cnpj_formatado in titular:
+        razao = titular.replace(cnpj_formatado, "").replace("-", " ")
+    razao = re.sub(r"\s+", " ", razao).strip(" -:")
+    if not razao:
+        razao = None
+
+    return cnpj_formatado, razao
 
 
 @router.get("", response_model=List[EmpresaResponse])
@@ -122,6 +168,56 @@ async def verificar_cnpj(
         raise HTTPException(
             status_code=500,
             detail="Erro ao verificar CNPJ"
+        )
+
+
+@router.post("/preview-certificado", response_model=CertificadoPreviewResponse)
+async def preview_certificado_empresa(
+    request: CertificadoPreviewRequest,
+    usuario: dict = Depends(get_current_user),
+):
+    """
+    Pré-visualiza dados do certificado para auto-preencher cadastro de cliente.
+    Não persiste nenhum dado no banco.
+    """
+    _ = usuario  # Mantém endpoint autenticado sem uso adicional.
+    try:
+        resultado = certificado_service.processar_upload(
+            cert_base64_input=request.certificado_base64,
+            senha=request.senha,
+        )
+        info = resultado["info"]
+        cnpj, razao_social = _extrair_dados_empresa_do_titular(info.get("titular", ""))
+
+        return CertificadoPreviewResponse(
+            titular=info["titular"],
+            emissor=info["emissor"],
+            validade=info["data_fim"].isoformat(),
+            dias_restantes=info["dias_restantes"],
+            requer_atencao=info["requer_atencao"],
+            cnpj=cnpj,
+            razao_social=razao_social,
+        )
+    except SenhaIncorretaError:
+        raise HTTPException(
+            status_code=400,
+            detail="Senha do certificado incorreta. Verifique e tente novamente.",
+        )
+    except CertificadoExpiradoError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
+    except CertificadoInvalidoError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Certificado inválido: {str(e)}",
+        )
+    except Exception as e:
+        logger.error(f"Erro ao pré-visualizar certificado: {type(e).__name__} - {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Erro interno ao processar certificado.",
         )
 
 
