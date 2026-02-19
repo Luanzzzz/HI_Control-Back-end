@@ -90,10 +90,6 @@ class CapturaService:
             else:
                 self._limpar_notas_mock_antigas(db, empresa_id)
                 uf_codigo = self._resolver_uf_codigo_empresa(empresa)
-                if not uf_codigo:
-                    erro_mensagem = "UF da empresa nao configurada (estado/municipio_codigo)"
-                    status = self._atualizar_sync_erro_generico(db, empresa_id, erro_mensagem, sync_state)
-                    return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
 
                 if self._certificado_expirado_por_data(empresa.get("certificado_validade")):
                     erro_mensagem = "Certificado expirado"
@@ -550,16 +546,25 @@ class CapturaService:
         )
         return resp.data[0] if resp.data else None
 
-    def _resolver_uf_codigo_empresa(self, empresa: Dict[str, Any]) -> Optional[str]:
+    def _resolver_uf_codigo_empresa(self, empresa: Dict[str, Any]) -> str:
         municipio_codigo = str(empresa.get("municipio_codigo") or "").strip()
         if len(municipio_codigo) >= 2 and municipio_codigo[:2].isdigit():
             return municipio_codigo[:2]
 
         estado = str(empresa.get("estado") or "").strip().upper()
         if estado:
-            return UF_CODES.get(estado)
+            uf_codigo = UF_CODES.get(estado)
+            if uf_codigo:
+                return uf_codigo
 
-        return None
+        # Fallback nacional: evita bloquear captura em empresas sem UF/municipio.
+        # "91" representa Ambiente Nacional para distribuição DF-e.
+        logger.warning(
+            "Empresa sem estado/municipio_codigo. Usando cUFAutor=91 (Ambiente Nacional). "
+            "empresa_id=%s",
+            empresa.get("id"),
+        )
+        return "91"
 
     def _obter_ou_criar_sync(self, db, empresa_id: str) -> Dict[str, Any]:
         resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()

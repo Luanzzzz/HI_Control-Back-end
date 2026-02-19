@@ -10,6 +10,7 @@ Utiliza os mesmos adapters municipais, estendendo a interface base
 com métodos de emissão e cancelamento.
 """
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -422,8 +423,25 @@ class EmissaoNFSeService:
     # URLS DE EMISSÃO POR MUNICÍPIO
     # ============================================
 
+    def _forcar_sistema_nacional(self) -> bool:
+        valor = os.getenv("NFSE_FORCAR_SISTEMA_NACIONAL", "true").strip().lower()
+        return valor not in {"0", "false", "no", "off"}
+
+    def _obter_url_sistema_nacional(self) -> str:
+        ambiente = (
+            os.getenv("NFSE_AMBIENTE")
+            or os.getenv("SEFAZ_AMBIENTE")
+            or "producao"
+        ).strip().lower()
+        if ambiente == "homologacao":
+            return "https://sefin.producaorestrita.nfse.gov.br/sefinnacional"
+        return "https://sefin.nfse.gov.br/sefinnacional"
+
     def _obter_url_emissao(self, municipio_codigo: str) -> Optional[str]:
         """Retorna URL de emissão para o município."""
+        if self._forcar_sistema_nacional():
+            return self._obter_url_sistema_nacional()
+
         # Top 10 + municípios que seguem ABRASF
         urls = {
             # São Paulo
@@ -448,7 +466,7 @@ class EmissaoNFSeService:
             "1302603": "https://sistemas.manaus.am.gov.br/nfse/services/NfseWebService",
         }
 
-        return urls.get(municipio_codigo)
+        return urls.get(municipio_codigo) or self._obter_url_sistema_nacional()
 
     def _obter_url_cancelamento(self, municipio_codigo: str) -> Optional[str]:
         """Retorna URL de cancelamento para o município."""

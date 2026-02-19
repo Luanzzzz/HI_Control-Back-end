@@ -19,6 +19,7 @@ Uso:
 from datetime import date, datetime
 from typing import List, Dict, Optional, Type
 import logging
+import os
 
 from app.db.supabase_client import get_supabase_admin
 from app.services.nfse.base_adapter import (
@@ -141,6 +142,14 @@ class NFSeService:
         },
     ]
 
+    def _forcar_sistema_nacional(self) -> bool:
+        """
+        Define o padrão de integração NFS-e.
+        Default: Sistema Nacional para todas as empresas.
+        """
+        valor = os.getenv("NFSE_FORCAR_SISTEMA_NACIONAL", "true").strip().lower()
+        return valor not in {"0", "false", "no", "off"}
+
     def obter_adapter(
         self,
         municipio_codigo: str,
@@ -159,6 +168,9 @@ class NFSeService:
         Returns:
             Instância do adapter configurado
         """
+        if self._forcar_sistema_nacional():
+            return SistemaNacionalAdapter(credentials, homologacao=homologacao)
+
         adapter_class = self.MUNICIPIO_ADAPTERS.get(
             municipio_codigo,
             SistemaNacionalAdapter,
@@ -329,7 +341,7 @@ class NFSeService:
         """
         try:
             result = db.table("empresas")\
-                .select("id, cnpj, razao_social, municipio_codigo, municipio_nome, uf")\
+                .select("id, cnpj, razao_social, municipio_codigo, municipio_nome, estado")\
                 .eq("id", empresa_id)\
                 .single()\
                 .execute()
