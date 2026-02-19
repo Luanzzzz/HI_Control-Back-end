@@ -349,6 +349,11 @@ class CapturaService:
 
     def _montar_envelope_distribuicao(self, cnpj: str, ult_nsu: str, uf_codigo: str) -> str:
         tp_amb = "1" if self._ambiente_norm() == "producao" else "2"
+        uf_codigo = str(uf_codigo or "").zfill(2)
+        if not (len(uf_codigo) == 2 and uf_codigo.isdigit()):
+            uf_codigo = "35"
+        if uf_codigo == "91":
+            uf_codigo = "35"
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -356,8 +361,8 @@ class CapturaService:
                  xmlns:nfed="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
   <soap12:Header>
     <nfed:nfeCabecMsg>
-      <cUFAutor>91</cUFAutor>
-      <tpAmb>{tp_amb}</tpAmb>
+      <cUFAutor>{uf_codigo}</cUFAutor>
+      <versaoDados>1.01</versaoDados>
     </nfed:nfeCabecMsg>
   </soap12:Header>
   <soap12:Body>
@@ -557,14 +562,15 @@ class CapturaService:
             if uf_codigo:
                 return uf_codigo
 
-        # Fallback nacional: evita bloquear captura em empresas sem UF/municipio.
-        # "91" representa Ambiente Nacional para distribuição DF-e.
+        # Fallback para manter o XML válido mesmo sem UF cadastrada na empresa.
+        # Usamos uma UF autorizadora válida (35/SP), pois alguns validadores
+        # rejeitam cUFAutor=91 no schema do distDFeInt (cStat 215).
         logger.warning(
-            "Empresa sem estado/municipio_codigo. Usando cUFAutor=91 (Ambiente Nacional). "
+            "Empresa sem estado/municipio_codigo. Usando cUFAutor=35 (fallback). "
             "empresa_id=%s",
             empresa.get("id"),
         )
-        return "91"
+        return "35"
 
     def _obter_ou_criar_sync(self, db, empresa_id: str) -> Dict[str, Any]:
         resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
