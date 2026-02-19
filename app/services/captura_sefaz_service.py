@@ -86,10 +86,7 @@ class CapturaService:
                 return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
 
             use_mock = self._is_mock_enabled()
-            if use_mock:
-                logger.info("USE_MOCK_SEFAZ=true | usando mock de distribuicao DFe")
-                resposta_xml = self._consultar_distribuicao_mock(cnpj_empresa, nsu_inicio)
-            else:
+            if not use_mock:
                 self._limpar_notas_mock_antigas(db, empresa_id)
                 if self._certificado_expirado_por_data(empresa.get("certificado_validade")):
                     erro_mensagem = "Certificado expirado"
@@ -117,41 +114,29 @@ class CapturaService:
                     self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
                     return self._resultado("sem_certificado", 0, 0, nsu_fim, max_nsu, erro_mensagem)
 
-                resposta_xml = self._consultar_distribuicao_dfe(
-                    cnpj=cnpj_empresa,
-                    ultimo_nsu=nsu_inicio,
-                    cert_bytes=cert_bytes,
-                    senha_cert=senha_cert,
-                    uf_codigo=uf_codigo,
-                )
-            retorno = self._parse_retorno_distribuicao(resposta_xml)
+            retorno = self._coletar_documentos_distribuicao(
+                empresa_id=empresa_id,
+                cnpj_empresa=cnpj_empresa,
+                nsu_inicio=nsu_inicio,
+                use_mock=use_mock,
+                cert_bytes=cert_bytes if not use_mock else None,
+                senha_cert=senha_cert if not use_mock else None,
+                uf_codigo=uf_codigo if not use_mock else "35",
+            )
             cstat = retorno.get("cstat")
             motivo = retorno.get("xmotivo", "")
             nsu_fim = int(retorno.get("ult_nsu") or nsu_inicio)
             max_nsu_retorno = int(retorno.get("max_nsu") or 0)
             max_nsu = max(int(max_nsu or 0), max_nsu_retorno, nsu_fim)
 
-            logger.info(
-                "retDistDFeInt empresa_id=%s cStat=%s ultNSU=%s maxNSU=%s docs=%s",
-                empresa_id,
-                cstat,
-                nsu_fim,
-                max_nsu,
-                len(retorno.get("documentos", []) or []),
-            )
-
-            if cstat == "137":
-                self._atualizar_sync_ok(db, empresa_id, sync_state, nsu_fim, max_nsu, 0, 0)
-                status = "ok"
-                return self._resultado(status, 0, 0, nsu_fim, max_nsu, None)
-
-            if cstat == "656":
-                # Consumo indevido: aguardar 1h e nao tratar como erro operacional.
+            documentos = retorno.get("documentos", [])
+            if cstat == "656" and not documentos:
+                # Consumo indevido sem novos documentos: aguardar 1h.
                 self._atualizar_sync_cooldown(db, empresa_id, nsu_fim, max_nsu, horas=1)
                 status = "ok"
                 return self._resultado(status, 0, 0, nsu_fim, max_nsu, None)
 
-            if cstat != "138":
+            if cstat not in {"137", "138", "656"}:
                 erro_mensagem = f"SEFAZ cStat={cstat}: {motivo}"
                 status = self._atualizar_sync_erro_sefaz(
                     db=db,
@@ -163,7 +148,6 @@ class CapturaService:
                 )
                 return self._resultado(status, 0, 0, nsu_fim, max_nsu, erro_mensagem)
 
-            documentos = retorno.get("documentos", [])
             payload = []
             schemas: Dict[str, int] = {}
             for doc in documentos:
@@ -182,15 +166,27 @@ class CapturaService:
             )
 
             notas_novas, notas_atualizadas = self._upsert_notas(db, payload)
-            self._atualizar_sync_ok(
-                db,
-                empresa_id,
-                sync_state,
-                nsu_fim,
-                max_nsu,
-                len(payload),
-                notas_novas,
-            )
+            if cstat == "656":
+                self._atualizar_sync_cooldown(
+                    db,
+                    empresa_id,
+                    nsu_fim,
+                    max_nsu,
+                    horas=1,
+                    sync_state=sync_state,
+                    notas_processadas=len(payload),
+                    notas_novas=notas_novas,
+                )
+            else:
+                self._atualizar_sync_ok(
+                    db,
+                    empresa_id,
+                    sync_state,
+                    nsu_fim,
+                    max_nsu,
+                    len(payload),
+                    notas_novas,
+                )
             status = "ok"
             return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, None)
 
@@ -226,6 +222,84 @@ class CapturaService:
                 erro_detalhes=erro_mensagem,
                 duracao_ms=int((fim - inicio).total_seconds() * 1000),
             )
+
+    def _coletar_documentos_distribuicao(
+        self,
+        empresa_id: str,
+        cnpj_empresa: str,
+        nsu_inicio: int,
+        use_mock: bool,
+        cert_bytes: Optional[bytes],
+        senha_cert: Optional[str],
+        uf_codigo: str,
+    ) -> Dict[str, Any]:
+        max_paginas = 1 if use_mock else max(1, int(os.getenv("SEFAZ_DFE_MAX_PAGINAS", "6")))
+        documentos: List[Dict[str, Any]] = []
+        ult_nsu = int(nsu_inicio or 0)
+        max_nsu = int(nsu_inicio or 0)
+        cstat_final = ""
+        xmotivo_final = ""
+
+        for pagina in range(1, max_paginas + 1):
+            if use_mock:
+                logger.info("USE_MOCK_SEFAZ=true | usando mock de distribuicao DFe")
+                resposta_xml = self._consultar_distribuicao_mock(cnpj_empresa, ult_nsu)
+            else:
+                resposta_xml = self._consultar_distribuicao_dfe(
+                    cnpj=cnpj_empresa,
+                    ultimo_nsu=ult_nsu,
+                    cert_bytes=cert_bytes or b"",
+                    senha_cert=senha_cert or "",
+                    uf_codigo=uf_codigo,
+                )
+
+            retorno = self._parse_retorno_distribuicao(resposta_xml)
+            cstat = str(retorno.get("cstat") or "")
+            xmotivo = str(retorno.get("xmotivo") or "")
+            novo_ult_nsu = int(retorno.get("ult_nsu") or ult_nsu)
+            novo_max_nsu = int(retorno.get("max_nsu") or 0)
+            docs_lote = retorno.get("documentos", []) or []
+
+            max_nsu = max(max_nsu, novo_max_nsu, novo_ult_nsu)
+            cstat_final = cstat
+            xmotivo_final = xmotivo
+
+            logger.info(
+                "retDistDFeInt empresa_id=%s pagina=%s cStat=%s ultNSU=%s maxNSU=%s docs=%s",
+                empresa_id,
+                pagina,
+                cstat,
+                novo_ult_nsu,
+                max_nsu,
+                len(docs_lote),
+            )
+
+            if cstat == "138":
+                documentos.extend(docs_lote)
+                if novo_ult_nsu <= ult_nsu:
+                    logger.warning(
+                        "Distribuicao sem avancar NSU (empresa_id=%s, ult_nsu=%s, novo_ult_nsu=%s)",
+                        empresa_id,
+                        ult_nsu,
+                        novo_ult_nsu,
+                    )
+                    ult_nsu = novo_ult_nsu
+                    break
+                ult_nsu = novo_ult_nsu
+                if max_nsu > 0 and ult_nsu >= max_nsu:
+                    break
+                continue
+
+            ult_nsu = novo_ult_nsu
+            break
+
+        return {
+            "cstat": cstat_final,
+            "xmotivo": xmotivo_final,
+            "ult_nsu": ult_nsu,
+            "max_nsu": max_nsu,
+            "documentos": documentos,
+        }
 
     def _consultar_distribuicao_dfe(
         self,
@@ -488,7 +562,7 @@ class CapturaService:
         return None
 
     def _bytes_para_texto(self, payload: bytes) -> Optional[str]:
-        for encoding in ("utf-8", "latin-1", "cp1252"):
+        for encoding in ("utf-8", "utf-16", "utf-16le", "utf-16be", "latin-1", "cp1252"):
             try:
                 texto = payload.decode(encoding, errors="ignore").strip()
                 if texto:
@@ -721,7 +795,18 @@ class CapturaService:
             }
         ).eq("empresa_id", empresa_id).execute()
 
-    def _atualizar_sync_cooldown(self, db, empresa_id: str, ultimo_nsu: int, max_nsu: int, horas: int = 1) -> None:
+    def _atualizar_sync_cooldown(
+        self,
+        db,
+        empresa_id: str,
+        ultimo_nsu: int,
+        max_nsu: int,
+        horas: int = 1,
+        sync_state: Optional[Dict[str, Any]] = None,
+        notas_processadas: int = 0,
+        notas_novas: int = 0,
+    ) -> None:
+        total_atual = int((sync_state or {}).get("total_notas_capturadas") or 0)
         db.table("sync_empresas").update(
             {
                 "ultimo_nsu": int(ultimo_nsu),
@@ -729,7 +814,8 @@ class CapturaService:
                 "ultima_sync": datetime.now(timezone.utc).isoformat(),
                 "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=horas)).isoformat(),
                 "status": "ok",
-                "notas_capturadas_ultima_sync": 0,
+                "notas_capturadas_ultima_sync": int(notas_processadas),
+                "total_notas_capturadas": total_atual + int(notas_novas),
                 "erro_mensagem": None,
                 "tentativas_consecutivas_erro": 0,
             }
@@ -903,8 +989,7 @@ class CapturaService:
         if chave and len(chave) == 44 and chave.isdigit():
             return chave
         if etree is None:
-            match = re.search(r"\b(\d{44})\b", xml_doc or "")
-            return match.group(1) if match else None
+            return self._extrair_chave_por_regex(xml_doc or "")
         try:
             root = etree.fromstring(xml_doc.encode("utf-8"))
             inf_nfe = root.xpath(".//*[local-name()='infNFe']")
@@ -916,6 +1001,9 @@ class CapturaService:
                         chave = ident[3:47]
                         if len(chave) == 44 and chave.isdigit():
                             return chave
+                    match_evento = re.search(r"ID\d{6}(\d{44})\d{2}", ident)
+                    if match_evento:
+                        return match_evento.group(1)
             else:
                 ident = inf_nfe[0].attrib.get("Id", "")
                 if ident.startswith("NFe"):
@@ -925,8 +1013,18 @@ class CapturaService:
         except Exception:  # noqa: BLE001
             pass
 
-        match = re.search(r"\b(\d{44})\b", xml_doc or "")
-        return match.group(1) if match else None
+        return self._extrair_chave_por_regex(xml_doc or "")
+
+    def _extrair_chave_por_regex(self, conteudo: str) -> Optional[str]:
+        if not conteudo:
+            return None
+        candidatos = re.findall(r"(\d{44})", conteudo)
+        for candidato in candidatos:
+            if len(candidato) == 44 and candidato.isdigit():
+                modelo = candidato[20:22]
+                if modelo in {"55", "57", "65", "67"}:
+                    return candidato
+        return candidatos[0] if candidatos else None
 
     def _normalizar_resposta_xml(self, resposta: Any) -> str:
         if isinstance(resposta, bytes):
