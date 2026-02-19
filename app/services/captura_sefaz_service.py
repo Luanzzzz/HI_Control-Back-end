@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
@@ -127,7 +128,8 @@ class CapturaService:
             cstat = retorno.get("cstat")
             motivo = retorno.get("xmotivo", "")
             nsu_fim = int(retorno.get("ult_nsu") or nsu_inicio)
-            max_nsu = int(retorno.get("max_nsu") or max_nsu or nsu_fim)
+            max_nsu_retorno = int(retorno.get("max_nsu") or 0)
+            max_nsu = max(int(max_nsu or 0), max_nsu_retorno, nsu_fim)
 
             logger.info(
                 "retDistDFeInt empresa_id=%s cStat=%s ultNSU=%s maxNSU=%s docs=%s",
@@ -163,10 +165,21 @@ class CapturaService:
 
             documentos = retorno.get("documentos", [])
             payload = []
+            schemas: Dict[str, int] = {}
             for doc in documentos:
+                schema = str(doc.get("schema") or "desconhecido")
+                schemas[schema] = schemas.get(schema, 0) + 1
                 nota = self._montar_payload_nota(doc, cnpj_empresa, empresa_id)
                 if nota:
                     payload.append(nota)
+
+            logger.info(
+                "Documentos distribuidos empresa_id=%s total_docs=%s notas_validas=%s schemas=%s",
+                empresa_id,
+                len(documentos),
+                len(payload),
+                schemas,
+            )
 
             notas_novas, notas_atualizadas = self._upsert_notas(db, payload)
             self._atualizar_sync_ok(
@@ -449,13 +462,52 @@ class CapturaService:
     def _descompactar_doc_zip(self, conteudo_base64: str) -> Optional[str]:
         try:
             bruto = base64.b64decode(conteudo_base64)
-            try:
-                xml_bytes = gzip.decompress(bruto)
-            except OSError:
-                xml_bytes = bruto
-            return xml_bytes.decode("utf-8", errors="ignore")
         except Exception:  # noqa: BLE001
             return None
+
+        candidatos: List[bytes] = [bruto]
+        for fn in (
+            lambda b: gzip.decompress(b),
+            lambda b: zlib.decompress(b),
+            lambda b: zlib.decompress(b, -zlib.MAX_WBITS),
+        ):
+            try:
+                valor = fn(bruto)
+                if valor:
+                    candidatos.append(valor)
+            except Exception:  # noqa: BLE001
+                continue
+
+        for payload in candidatos:
+            texto = self._bytes_para_texto(payload)
+            if not texto:
+                continue
+            if self._parece_xml_valido(texto):
+                return texto
+
+        return None
+
+    def _bytes_para_texto(self, payload: bytes) -> Optional[str]:
+        for encoding in ("utf-8", "latin-1", "cp1252"):
+            try:
+                texto = payload.decode(encoding, errors="ignore").strip()
+                if texto:
+                    return texto
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _parece_xml_valido(self, conteudo: str) -> bool:
+        texto = (conteudo or "").lstrip("\ufeff \t\r\n")
+        if not texto.startswith("<"):
+            return False
+        if etree is None:
+            return True
+        try:
+            etree.fromstring(texto.encode("utf-8", errors="ignore"))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def _montar_payload_nota(self, doc: Dict[str, Any], cnpj_empresa: str, empresa_id: str) -> Optional[Dict[str, Any]]:
         xml_doc = doc.get("xml")
@@ -469,12 +521,16 @@ class CapturaService:
         modelo = self._extrair_texto_do_xml(xml_doc, "mod") or chave[20:22]
         numero_nf = self._extrair_texto_do_xml(xml_doc, "nNF") or chave[25:34].lstrip("0") or chave[25:34]
         serie = self._extrair_texto_do_xml(xml_doc, "serie") or chave[22:25].lstrip("0") or chave[22:25]
-        data_emissao = self._normalizar_data(self._extrair_texto_do_xml(xml_doc, "dhEmi") or self._extrair_texto_do_xml(xml_doc, "dEmi"))
+        data_emissao = self._normalizar_data(
+            self._extrair_texto_do_xml(xml_doc, "dhEmi")
+            or self._extrair_texto_do_xml(xml_doc, "dEmi")
+            or self._extrair_texto_do_xml(xml_doc, "dhEvento")
+        )
         valor_total = self._normalizar_decimal(self._extrair_texto_do_xml(xml_doc, "vNF"))
 
         cnpj_emitente = self._normalizar_cnpj(
-            self._extrair_texto_do_xml(xml_doc, "CNPJEmit") or self._extrair_texto_do_xml(xml_doc, "CNPJ")
-        ) or self._normalizar_cnpj(chave[6:20])
+            self._extrair_texto_do_xml(xml_doc, "CNPJEmit")
+        ) or self._normalizar_cnpj(chave[6:20]) or self._normalizar_cnpj(self._extrair_texto_do_xml(xml_doc, "CNPJ"))
         cnpj_destinatario = self._normalizar_cnpj(self._extrair_texto_do_xml(xml_doc, "CNPJDest"))
 
         nome_emitente = self._extrair_texto_do_xml(xml_doc, "xNomeEmit") or self._extrair_texto_do_xml(xml_doc, "xNome") or ""
@@ -847,20 +903,30 @@ class CapturaService:
         if chave and len(chave) == 44 and chave.isdigit():
             return chave
         if etree is None:
-            return None
+            match = re.search(r"\b(\d{44})\b", xml_doc or "")
+            return match.group(1) if match else None
         try:
             root = etree.fromstring(xml_doc.encode("utf-8"))
             inf_nfe = root.xpath(".//*[local-name()='infNFe']")
             if not inf_nfe:
-                return None
-            ident = inf_nfe[0].attrib.get("Id", "")
-            if ident.startswith("NFe"):
-                chave = ident[3:]
-                if len(chave) == 44 and chave.isdigit():
-                    return chave
+                id_attr = root.xpath(".//@Id")
+                for ident in id_attr:
+                    ident = str(ident or "")
+                    if ident.startswith("NFe") and len(ident) >= 47:
+                        chave = ident[3:47]
+                        if len(chave) == 44 and chave.isdigit():
+                            return chave
+            else:
+                ident = inf_nfe[0].attrib.get("Id", "")
+                if ident.startswith("NFe"):
+                    chave = ident[3:]
+                    if len(chave) == 44 and chave.isdigit():
+                        return chave
         except Exception:  # noqa: BLE001
-            return None
-        return None
+            pass
+
+        match = re.search(r"\b(\d{44})\b", xml_doc or "")
+        return match.group(1) if match else None
 
     def _normalizar_resposta_xml(self, resposta: Any) -> str:
         if isinstance(resposta, bytes):
