@@ -376,12 +376,19 @@ class CapturaService:
                 "erro_tipo": "empresa_invalida",
             }
 
-        dias = max(1, int(os.getenv("CAPTURA_NFSE_FALLBACK_DIAS", "365")))
-        data_fim = date.today()
-        data_inicio = data_fim - timedelta(days=dias)
         usuario_id = str(empresa.get("usuario_id") or "") or None
 
         notas_antes = self._contar_notas_empresa(db, empresa_id)
+        dias_recente = max(1, int(os.getenv("CAPTURA_NFSE_FALLBACK_DIAS", "365")))
+        dias_backfill = max(dias_recente, int(os.getenv("CAPTURA_NFSE_FALLBACK_DIAS_BACKFILL", "3650")))
+        usar_janela_longa = os.getenv("CAPTURA_NFSE_FALLBACK_LONG_WINDOW", "true").strip().lower()
+        if usar_janela_longa in {"0", "false", "no", "off"}:
+            dias = dias_backfill if notas_antes == 0 else dias_recente
+        else:
+            dias = dias_backfill
+
+        data_fim = date.today()
+        data_inicio = data_fim - timedelta(days=dias)
 
         try:
             from app.services.nfse.nfse_service import nfse_service

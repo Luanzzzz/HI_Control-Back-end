@@ -1,16 +1,23 @@
-"""
-Adapter para o Sistema Nacional de NFS-e (ABRASF/ISSNet).
+﻿"""
+Adapter para o Sistema Nacional de NFS-e.
 
-Portal: https://www.gov.br/nfse
-Ambiente de producao: https://sefin.nfse.gov.br
-Ambiente de homologacao: https://sefin.producaorestrita.nfse.gov.br
+Fluxos suportados:
+1) Emissao/consulta por chave (Sefin Nacional).
+2) Distribuicao por NSU para contribuintes (ADN), com mTLS via certificado A1.
 """
 
+from __future__ import annotations
+
+import base64
+import gzip
 import logging
 import os
+import re
 import tempfile
-from datetime import date
-from typing import Any, Dict, List
+import zlib
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
+from xml.etree import ElementTree as ET
 
 import httpx
 
@@ -28,13 +35,23 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
 
     SISTEMA_NOME = "Sistema Nacional"
 
+    # API Sefin Nacional (emissao/consulta por chave)
     URL_PRODUCAO = "https://sefin.nfse.gov.br"
     URL_HOMOLOGACAO = "https://sefin.producaorestrita.nfse.gov.br"
+
+    # API ADN Contribuintes (distribuicao por NSU)
+    ADN_URL_PRODUCAO = "https://adn.nfse.gov.br/contribuintes"
+    ADN_URL_HOMOLOGACAO = "https://adn.producaorestrita.nfse.gov.br/contribuintes"
 
     def __init__(self, credentials: Dict[str, str], homologacao: bool = False):
         super().__init__(credentials)
         self.base_url = self.URL_HOMOLOGACAO if homologacao else self.URL_PRODUCAO
+        self.adn_base_url = self.ADN_URL_HOMOLOGACAO if homologacao else self.ADN_URL_PRODUCAO
         self.homologacao = homologacao
+
+        self.nsu_inicial = self._coerce_int(credentials.get("nsu_inicial"), 0)
+        self.nsu_final = self.nsu_inicial
+        self.nsu_max_visto = self.nsu_inicial
 
     def _usar_autenticacao_por_certificado(self) -> bool:
         return bool(
@@ -42,44 +59,11 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             and self.credentials.get("certificado_senha_encrypted")
         )
 
-    def _endpoints_consulta(self) -> List[str]:
+    def _endpoints_consulta_por_chave(self) -> List[str]:
         base = self.base_url.rstrip("/")
         return [
-            f"{base}/SefinNacional/nfse/consultar",
-            f"{base}/sefinnacional/nfse/consultar",
             f"{base}/SefinNacional/nfse",
             f"{base}/sefinnacional/nfse",
-        ]
-
-    def _parametros_consulta(
-        self,
-        cnpj_limpo: str,
-        data_inicio: date,
-        data_fim: date,
-        limite: int,
-    ) -> List[Dict[str, Any]]:
-        return [
-            {
-                "cnpjPrestador": cnpj_limpo,
-                "dataInicial": data_inicio.strftime("%Y-%m-%d"),
-                "dataFinal": data_fim.strftime("%Y-%m-%d"),
-                "pagina": 1,
-                "itensPorPagina": limite,
-            },
-            {
-                "cnpjPrestador": cnpj_limpo,
-                "dataInicio": data_inicio.strftime("%Y-%m-%d"),
-                "dataFim": data_fim.strftime("%Y-%m-%d"),
-                "pagina": 1,
-                "tamanhoPagina": limite,
-            },
-            {
-                "cnpj": cnpj_limpo,
-                "dataInicio": data_inicio.strftime("%Y-%m-%d"),
-                "dataFim": data_fim.strftime("%Y-%m-%d"),
-                "pagina": 1,
-                "limite": limite,
-            },
         ]
 
     async def autenticar(self) -> str:
@@ -136,17 +120,17 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
 
         except NFSeAuthException:
             raise
-        except httpx.TimeoutException as e:
-            self.log_error(f"Timeout na autenticacao: {e}")
+        except httpx.TimeoutException as exc:
+            self.log_error(f"Timeout na autenticacao: {exc}")
             raise NFSeAuthException(
                 "Timeout ao conectar com Sistema Nacional de NFS-e. Tente novamente."
             )
-        except httpx.HTTPError as e:
-            self.log_error(f"Erro HTTP na autenticacao: {e}")
-            raise NFSeAuthException(f"Erro de rede ao autenticar: {e}")
-        except Exception as e:
-            self.log_error(f"Erro inesperado na autenticacao: {e}", exc_info=True)
-            raise NFSeAuthException(f"Erro inesperado: {e}")
+        except httpx.HTTPError as exc:
+            self.log_error(f"Erro HTTP na autenticacao: {exc}")
+            raise NFSeAuthException(f"Erro de rede ao autenticar: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            self.log_error(f"Erro inesperado na autenticacao: {exc}", exc_info=True)
+            raise NFSeAuthException(f"Erro inesperado: {exc}")
 
     async def buscar_notas(
         self,
@@ -168,57 +152,13 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                 limite=limite,
             )
 
-        if not self.token:
-            await self.autenticar()
-
-        try:
-            async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
-                response = await client.get(
-                    self._endpoints_consulta()[0],
-                    headers={
-                        "Authorization": f"Bearer {self.token}",
-                        "Accept": "application/json",
-                    },
-                    params=self._parametros_consulta(cnpj_limpo, data_inicio, data_fim, limite)[0],
-                )
-
-                if response.status_code == 401:
-                    self.log_warning("Token expirado, reautenticando...")
-                    self.token = None
-                    await self.autenticar()
-                    return await self.buscar_notas(cnpj, data_inicio, data_fim, limite)
-
-                if response.status_code in {204, 404}:
-                    self.log_info(f"Nenhuma NFS-e encontrada para CNPJ {cnpj_limpo}")
-                    return []
-
-                if response.status_code != 200:
-                    raise NFSeSearchException(
-                        f"Erro na busca: HTTP {response.status_code}",
-                        detalhes=response.text,
-                    )
-
-                data = response.json()
-                notas_processadas = self.processar_resposta(data)
-                self.log_info(
-                    f"{len(notas_processadas)} NFS-e encontradas para CNPJ {cnpj_limpo} "
-                    f"({data_inicio} a {data_fim})"
-                )
-                return notas_processadas
-
-        except NFSeSearchException:
-            raise
-        except httpx.TimeoutException as e:
-            self.log_error(f"Timeout na busca: {e}")
-            raise NFSeSearchException(
-                "Timeout ao buscar NFS-e no Sistema Nacional. Tente novamente."
-            )
-        except httpx.HTTPError as e:
-            self.log_error(f"Erro HTTP na busca: {e}")
-            raise NFSeSearchException(f"Erro de rede: {e}")
-        except Exception as e:
-            self.log_error(f"Erro inesperado na busca: {e}", exc_info=True)
-            raise NFSeSearchException(f"Erro inesperado: {e}")
+        # Fluxo legado sem certificado: consulta por chave de acesso.
+        # Nao suporta varredura por periodo, portanto retorna vazio por padrao.
+        self.log_warning(
+            "Consulta por periodo sem certificado nao suportada no Sistema Nacional. "
+            "Configure certificado A1 para distribuicao por NSU."
+        )
+        return []
 
     async def _buscar_notas_com_certificado(
         self,
@@ -229,61 +169,149 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
     ) -> List[Dict]:
         cert_pem_path = ""
         key_pem_path = ""
+
+        # O endpoint /DFe/{NSU} retorna lotes de 50 por chamada.
+        tamanho_lote = 50
+        max_paginas = max(1, int(os.getenv("NFSE_ADN_MAX_PAGINAS", "8")))
+        esperar_429_seg = max(1, int(os.getenv("NFSE_ADN_RETRY_429_SECONDS", "2")))
+        max_retries_429 = max(1, int(os.getenv("NFSE_ADN_RETRY_429_MAX", "4")))
+        pausa_paginas_ms = max(0, int(os.getenv("NFSE_ADN_PAGE_DELAY_MS", "300")))
+
+        notas: List[Dict] = []
+        chaves_vistas: Set[str] = set()
+        nsu_atual = max(0, self.nsu_inicial)
+
         try:
             cert_bytes, senha_cert = self._carregar_certificado_para_mtls()
             cert_pem_path, key_pem_path = self._gerar_cert_key_temp(cert_bytes, senha_cert)
 
-            tentativas = []
             async with httpx.AsyncClient(
                 timeout=60.0,
                 verify=True,
                 cert=(cert_pem_path, key_pem_path),
             ) as client:
-                for endpoint in self._endpoints_consulta():
-                    for params in self._parametros_consulta(cnpj_limpo, data_inicio, data_fim, limite):
+                for pagina in range(1, max_paginas + 1):
+                    endpoint = f"{self.adn_base_url}/DFe/{nsu_atual}"
+                    retries_429 = 0
+                    while True:
                         response = await client.get(
                             endpoint,
                             headers={"Accept": "application/json"},
-                            params=params,
+                            params={"cnpjConsulta": cnpj_limpo, "lote": "true"},
                         )
-                        tentativas.append(f"{endpoint} [{response.status_code}]")
+                        if response.status_code != 429:
+                            break
 
-                        if response.status_code in {204, 404}:
-                            continue
-
-                        if response.status_code in {401, 403}:
-                            self.log_warning(
-                                f"Consulta mTLS sem permissao no endpoint {endpoint} "
-                                f"(HTTP {response.status_code})"
+                        retries_429 += 1
+                        self.log_warning(
+                            "ADN retornou 429 (limite temporario). "
+                            f"pagina={pagina}, nsu={nsu_atual}, tentativa={retries_429}/{max_retries_429}"
+                        )
+                        if retries_429 >= max_retries_429:
+                            if notas:
+                                response = None
+                                break
+                            raise NFSeSearchException(
+                                "ADN bloqueou temporariamente a consulta por excesso de requisicoes (HTTP 429).",
+                                detalhes=f"pagina={pagina}, nsu={nsu_atual}",
                             )
-                            continue
 
-                        if response.status_code != 200:
-                            continue
+                        await self._sleep_async(esperar_429_seg * retries_429)
 
-                        try:
-                            data = response.json()
-                        except ValueError:
-                            continue
+                    if response is None:
+                        break
 
-                        notas_processadas = self.processar_resposta(data)
-                        self.log_info(
-                            f"{len(notas_processadas)} NFS-e encontradas via mTLS para CNPJ {cnpj_limpo} "
-                            f"({data_inicio} a {data_fim})"
+                    if response.status_code in {401, 403}:
+                        raise NFSeAuthException(
+                            f"Falha na autenticacao ADN Contribuintes: HTTP {response.status_code}",
+                            detalhes=response.text,
                         )
-                        return notas_processadas
+
+                    if response.status_code not in {200, 404}:
+                        raise NFSeSearchException(
+                            f"Erro na consulta ADN Contribuintes: HTTP {response.status_code}",
+                            detalhes=response.text,
+                        )
+
+                    try:
+                        data = response.json()
+                    except ValueError as exc:
+                        raise NFSeSearchException(
+                            "Resposta invalida da API ADN Contribuintes",
+                            detalhes=str(exc),
+                        ) from exc
+
+                    status_proc = str(data.get("StatusProcessamento") or "").upper()
+                    lote_dfe = data.get("LoteDFe") or []
+
+                    self.log_info(
+                        f"ADN DFe pagina={pagina} nsu={nsu_atual} "
+                        f"status={status_proc} lote={len(lote_dfe)}"
+                    )
+
+                    if status_proc == "NENHUM_DOCUMENTO_LOCALIZADO" and not lote_dfe:
+                        break
+
+                    if not lote_dfe:
+                        # Sem lote retornado: encerra para evitar loop sem progresso.
+                        break
+
+                    nsu_lote_max = nsu_atual
+                    for item in lote_dfe:
+                        nsu_item = self._coerce_int(item.get("NSU"), 0)
+                        nsu_lote_max = max(nsu_lote_max, nsu_item)
+                        self.nsu_max_visto = max(self.nsu_max_visto, nsu_item)
+
+                        if str(item.get("TipoDocumento") or "").upper() != "NFSE":
+                            continue
+
+                        xml_doc = self._decodificar_arquivo_xml(item.get("ArquivoXml"))
+                        if not xml_doc:
+                            continue
+
+                        nota = self._extrair_nota_do_xml(xml_doc, cnpj_limpo, item)
+                        if not nota:
+                            continue
+
+                        if not self._nota_no_periodo(nota.get("data_emissao"), data_inicio, data_fim):
+                            continue
+
+                        chave_unica = (
+                            nota.get("chave_acesso")
+                            or f"{nota.get('numero')}|{nota.get('codigo_verificacao')}|{nsu_item}"
+                        )
+                        if chave_unica in chaves_vistas:
+                            continue
+
+                        chaves_vistas.add(chave_unica)
+                        notas.append(nota)
+
+                    self.nsu_final = max(self.nsu_final, nsu_lote_max)
+                    if nsu_lote_max <= nsu_atual:
+                        break
+
+                    nsu_atual = nsu_lote_max + 1
+
+                    # Lote menor que 50 geralmente indica fim da janela atual.
+                    if len(lote_dfe) < tamanho_lote:
+                        break
+
+                    if pausa_paginas_ms > 0:
+                        await self._sleep_async(pausa_paginas_ms / 1000.0)
 
             self.log_info(
-                f"Consulta NFS-e via mTLS sem documentos para CNPJ {cnpj_limpo}. "
-                f"Tentativas: {' | '.join(tentativas)}"
+                f"Consulta ADN concluida: cnpj={cnpj_limpo} notas={len(notas)} "
+                f"nsu_inicial={self.nsu_inicial} nsu_final={self.nsu_final}"
             )
-            return []
+            return notas
 
         except NFSeAuthException:
             raise
-        except Exception as e:
-            self.log_error(f"Falha na consulta NFS-e via mTLS: {e}", exc_info=True)
-            raise NFSeSearchException(f"Falha na consulta NFS-e via mTLS: {e}")
+        except NFSeSearchException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log_error(f"Falha na consulta NFS-e via ADN/mTLS: {exc}", exc_info=True)
+            raise NFSeSearchException(f"Falha na consulta NFS-e via ADN/mTLS: {exc}")
         finally:
             for path in (cert_pem_path, key_pem_path):
                 if path and os.path.exists(path):
@@ -292,7 +320,12 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                     except OSError:
                         pass
 
-    def _carregar_certificado_para_mtls(self) -> tuple[bytes, str]:
+    async def _sleep_async(self, segundos: float) -> None:
+        import asyncio
+
+        await asyncio.sleep(max(0.1, float(segundos)))
+
+    def _carregar_certificado_para_mtls(self) -> Tuple[bytes, str]:
         cert_base64 = self.credentials.get("certificado_a1")
         senha_encrypted = self.credentials.get("certificado_senha_encrypted")
         if not cert_base64 or not senha_encrypted:
@@ -310,7 +343,7 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         except Exception as exc:  # noqa: BLE001
             raise NFSeAuthException("Falha ao carregar certificado A1", detalhes=str(exc)) from exc
 
-    def _gerar_cert_key_temp(self, cert_bytes: bytes, senha_cert: str) -> tuple[str, str]:
+    def _gerar_cert_key_temp(self, cert_bytes: bytes, senha_cert: str) -> Tuple[str, str]:
         from cryptography.hazmat.primitives.serialization import (
             Encoding,
             NoEncryption,
@@ -344,8 +377,251 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
 
         return cert_path, key_path
 
+    def _decodificar_arquivo_xml(self, arquivo_xml: Any) -> Optional[str]:
+        if arquivo_xml is None:
+            return None
+
+        valor = str(arquivo_xml).strip()
+        if not valor:
+            return None
+
+        if valor.startswith("<"):
+            return valor
+
+        binarios: List[bytes] = []
+
+        # Tentativa base64 padrao
+        try:
+            binarios.append(base64.b64decode(valor, validate=True))
+        except Exception:  # noqa: BLE001
+            try:
+                binarios.append(base64.b64decode(valor + "==="))
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Tentativa direta em bytes (casos sem base64)
+        if not binarios:
+            binarios.append(valor.encode("utf-8", errors="ignore"))
+
+        decompressors = (
+            lambda b: gzip.decompress(b),
+            lambda b: zlib.decompress(b),
+            lambda b: zlib.decompress(b, -zlib.MAX_WBITS),
+        )
+
+        for bruto in binarios:
+            if not bruto:
+                continue
+
+            # Se ja for XML em bytes
+            if bruto.lstrip().startswith(b"<"):
+                try:
+                    return bruto.decode("utf-8", errors="ignore")
+                except Exception:  # noqa: BLE001
+                    continue
+
+            for fn in decompressors:
+                try:
+                    descompactado = fn(bruto)
+                except Exception:  # noqa: BLE001
+                    continue
+
+                if descompactado and descompactado.lstrip().startswith(b"<"):
+                    return descompactado.decode("utf-8", errors="ignore")
+
+        return None
+
+    def _extrair_nota_do_xml(
+        self,
+        xml_doc: str,
+        cnpj_consulta: str,
+        item_dfe: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            root = ET.fromstring(xml_doc)
+        except ET.ParseError:
+            return None
+
+        inf_nfse = self._find_node(root, "infNFSe") or root
+
+        emit = self._find_node(inf_nfse, "emit") or self._find_node(inf_nfse, "prest")
+        toma = self._find_node(inf_nfse, "toma")
+
+        cnpj_emitente = self.limpar_cnpj(self._find_text(emit, "CNPJ") or cnpj_consulta)
+        nome_emitente = self._find_text(emit, "xNome") or self._find_text(emit, "xFant") or ""
+
+        cnpj_destinatario = self.limpar_cnpj(
+            self._find_text(toma, "CNPJ") or self._find_text(toma, "CPF") or ""
+        )
+        nome_destinatario = self._find_text(toma, "xNome") or ""
+
+        data_emissao = (
+            self._find_text(inf_nfse, "dhEmi")
+            or self._find_text(inf_nfse, "dCompet")
+            or self._find_text(inf_nfse, "dhProc")
+        )
+
+        valor_total = self._to_float(
+            self._find_text(inf_nfse, "vLiq")
+            or self._find_text(inf_nfse, "vServ")
+            or self._find_text(inf_nfse, "vNFSe")
+            or "0"
+        )
+        valor_iss = self._to_float(
+            self._find_text(inf_nfse, "vISSQN")
+            or self._find_text(inf_nfse, "vIss")
+            or "0"
+        )
+        aliquota_iss = self._to_float(
+            self._find_text(inf_nfse, "pAliqAplic")
+            or self._find_text(inf_nfse, "pAliq")
+            or "0"
+        )
+
+        chave_acesso = self._extrair_chave_acesso_nfse(inf_nfse, item_dfe)
+        numero_nf = self._find_text(inf_nfse, "nNFSe") or self._find_text(inf_nfse, "nDPS") or ""
+        serie = self._find_text(inf_nfse, "serie") or ""
+
+        codigo_municipio = self._find_text(inf_nfse, "cLocIncid") or self._find_text(inf_nfse, "cLocPrestacao") or ""
+        nome_municipio = self._find_text(inf_nfse, "xLocIncid") or self._find_text(inf_nfse, "xLocPrestacao") or ""
+
+        descricao_servico = (
+            self._find_text(inf_nfse, "xDescServ")
+            or self._find_text(inf_nfse, "xTribMun")
+            or self._find_text(inf_nfse, "xTribNac")
+            or ""
+        )
+        codigo_servico = self._find_text(inf_nfse, "cTribNac") or self._find_text(inf_nfse, "cTribMun") or ""
+
+        codigo_verificacao = (
+            self._find_text(inf_nfse, "cVerif")
+            or self._find_text(inf_nfse, "codigoVerificacao")
+            or ""
+        )
+
+        cstat = self._find_text(inf_nfse, "cStat") or ""
+        status = self._mapear_status(cstat)
+
+        return self.criar_nota_padrao(
+            chave_acesso=chave_acesso,
+            numero=str(numero_nf),
+            serie=str(serie),
+            data_emissao=data_emissao,
+            valor_total=valor_total,
+            valor_servicos=valor_total,
+            valor_iss=valor_iss,
+            aliquota_iss=aliquota_iss,
+            cnpj_prestador=cnpj_emitente,
+            prestador_nome=nome_emitente,
+            cnpj_tomador=cnpj_destinatario,
+            tomador_nome=nome_destinatario,
+            descricao_servico=descricao_servico,
+            codigo_servico=codigo_servico,
+            codigo_verificacao=codigo_verificacao,
+            link_visualizacao="",
+            xml_content=xml_doc,
+            municipio_codigo=str(codigo_municipio),
+            municipio_nome=nome_municipio,
+            status=status,
+            nsu=self._coerce_int(item_dfe.get("NSU"), 0),
+        )
+
+    def _mapear_status(self, cstat: str) -> str:
+        codigo = str(cstat or "").strip()
+        if codigo in {"100", "101", "102", "103", "104", "105", "106"}:
+            return "Autorizada"
+        if codigo in {"200", "201", "202"}:
+            return "Cancelada"
+        return "Autorizada"
+
+    def _extrair_chave_acesso_nfse(self, inf_nfse: ET.Element, item_dfe: Dict[str, Any]) -> str:
+        chave = str(item_dfe.get("ChaveAcesso") or "").strip()
+        if chave and len(re.sub(r"\D", "", chave)) >= 44:
+            return chave
+
+        ident = str((inf_nfse.attrib or {}).get("Id") or "").strip()
+        if ident:
+            match = re.search(r"(\d{50})", ident)
+            if match:
+                return match.group(1)
+            if ident.startswith("NFS"):
+                return ident[3:]
+            return ident
+
+        return ""
+
+    def _find_node(self, root: Optional[ET.Element], local_name: str) -> Optional[ET.Element]:
+        if root is None:
+            return None
+        alvo = local_name.strip()
+        for el in root.iter():
+            if self._tag_local(el.tag) == alvo:
+                return el
+        return None
+
+    def _find_text(self, root: Optional[ET.Element], local_name: str) -> Optional[str]:
+        node = self._find_node(root, local_name)
+        if node is None:
+            return None
+        texto = (node.text or "").strip()
+        return texto or None
+
+    def _tag_local(self, tag: str) -> str:
+        if "}" in tag:
+            return tag.split("}", 1)[1]
+        return tag
+
+    def _coerce_int(self, valor: Any, default: int = 0) -> int:
+        try:
+            return int(str(valor).strip())
+        except Exception:  # noqa: BLE001
+            return int(default)
+
+    def _to_float(self, valor: Any) -> float:
+        if valor is None:
+            return 0.0
+        txt = str(valor).strip()
+        if not txt:
+            return 0.0
+
+        # Formato pt-BR com milhar e decimal: 1.234,56
+        if "," in txt and "." in txt:
+            txt = txt.replace(".", "").replace(",", ".")
+        # Formato decimal com virgula: 123,45
+        elif "," in txt:
+            txt = txt.replace(",", ".")
+
+        try:
+            return float(txt)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _nota_no_periodo(self, data_emissao: Optional[str], data_inicio: date, data_fim: date) -> bool:
+        if not data_emissao:
+            return False
+
+        texto = str(data_emissao).strip()
+        data_nota: Optional[date] = None
+
+        try:
+            data_nota = datetime.fromisoformat(texto.replace("Z", "+00:00")).date()
+        except Exception:  # noqa: BLE001
+            pass
+
+        if data_nota is None:
+            try:
+                data_nota = date.fromisoformat(texto[:10])
+            except Exception:  # noqa: BLE001
+                return False
+
+        return data_inicio <= data_nota <= data_fim
+
     def processar_resposta(self, resposta: Dict) -> List[Dict]:
-        """Processa resposta do Sistema Nacional para formato padrao Hi-Control."""
+        """
+        Mantido para compatibilidade com fluxo legado.
+        No fluxo atual por certificado (ADN), o parse eh feito por XML no metodo
+        _extrair_nota_do_xml.
+        """
         notas = []
 
         lista_notas = (
@@ -471,9 +747,9 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
 
                 notas.append(nota)
 
-            except Exception as e:
+            except Exception as exc:  # noqa: BLE001
                 self.log_warning(
-                    f"Erro ao processar nota {nota_raw.get('numero', '?')}: {e}"
+                    f"Erro ao processar nota {nota_raw.get('numero', '?')}: {exc}"
                 )
                 continue
 

@@ -18,6 +18,7 @@ Uso:
 """
 from datetime import date, datetime
 from typing import Any, List, Dict, Optional, Type
+import hashlib
 import logging
 import os
 import re
@@ -267,7 +268,15 @@ class NFSeService:
             notas = await adapter.buscar_notas(cnpj, data_inicio, data_fim)
 
             # 5. Salvar notas no banco
-            notas_salvas = await self._salvar_notas(db, empresa_id, notas)
+            notas_salvas = await self._salvar_notas(
+                db=db,
+                empresa_id=empresa_id,
+                notas=notas,
+                empresa_cnpj=cnpj,
+            )
+
+            # 5.1 Persistir cursor NSU automatico (quando o adapter suporta ADN).
+            await self._persistir_cursor_nsu_automatico(db, credentials, adapter)
 
             # 6. Registrar auditoria
             tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
@@ -381,7 +390,7 @@ class NFSeService:
         empresa_id = str(empresa.get("id") or "")
         try:
             result = db.table("credenciais_nfse")\
-                .select("usuario, senha, token, cnpj, municipio_codigo")\
+                .select("id, usuario, senha, token, cnpj, municipio_codigo")\
                 .eq("empresa_id", empresa_id)\
                 .eq("ativo", True)\
                 .execute()
@@ -411,11 +420,13 @@ class NFSeService:
         empresa: Dict[str, Any],
     ) -> Dict[str, Any]:
         cred = {
+            "credencial_id": credencial.get("id"),
             "usuario": credencial.get("usuario"),
             "senha": credencial.get("senha"),
             "token": credencial.get("token"),
             "cnpj": credencial.get("cnpj") or empresa.get("cnpj"),
             "municipio_codigo": credencial.get("municipio_codigo") or empresa.get("municipio_codigo"),
+            "nsu_inicial": self._extrair_nsu_cursor_token(credencial.get("token")),
         }
 
         cert_a1 = empresa.get("certificado_a1")
@@ -447,7 +458,7 @@ class NFSeService:
             "municipio_codigo": municipio,
             "usuario": "AUTO_CERT_A1",
             "senha": None,
-            "token": "AUTO_CERT_A1",
+            "token": "AUTO_CERT_A1|NSU:0",
             "cnpj": cnpj_limpo or None,
             "ativo": True,
         }
@@ -474,11 +485,61 @@ class NFSeService:
     def _normalizar_cnpj(self, cnpj: str) -> str:
         return re.sub(r"\D", "", cnpj or "")
 
+    def _extrair_nsu_cursor_token(self, token: Optional[str]) -> int:
+        valor = str(token or "").strip()
+        if not valor:
+            return 0
+        match = re.search(r"(?:^|\|)NSU:(\d+)", valor, re.IGNORECASE)
+        if not match:
+            return 0
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return 0
+
+    async def _persistir_cursor_nsu_automatico(self, db, credentials: Dict[str, Any], adapter: Any) -> None:
+        credencial_id = credentials.get("credencial_id")
+        if not credencial_id:
+            return
+
+        if str(credentials.get("modo_autenticacao") or "").strip().lower() != "certificado_a1":
+            return
+
+        nsu_final = int(getattr(adapter, "nsu_final", 0) or 0)
+        if nsu_final <= 0:
+            return
+
+        token_atual = str(credentials.get("token") or "")
+        token_upper = token_atual.upper()
+        if token_upper and not token_upper.startswith("AUTO_CERT_A1"):
+            return
+
+        novo_token = f"AUTO_CERT_A1|NSU:{nsu_final}"
+        if token_atual == novo_token:
+            return
+
+        try:
+            db.table("credenciais_nfse").update({"token": novo_token}).eq("id", credencial_id).execute()
+            credentials["token"] = novo_token
+            credentials["nsu_inicial"] = nsu_final
+            logger.info(
+                "[NFS-e] Cursor NSU atualizado na credencial %s para %s",
+                credencial_id,
+                nsu_final,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[NFS-e] Falha ao persistir cursor NSU da credencial %s: %s",
+                credencial_id,
+                exc,
+            )
+
     async def _salvar_notas(
         self,
         db,
         empresa_id: str,
         notas: List[Dict],
+        empresa_cnpj: str = "",
     ) -> List[Dict]:
         """
         Salva notas NFS-e no banco de dados usando upsert.
@@ -495,12 +556,16 @@ class NFSeService:
             Lista de notas salvas com IDs do banco
         """
         notas_salvas = []
+        empresa_cnpj_limpo = self._normalizar_cnpj(empresa_cnpj)
 
         for nota in notas:
             try:
                 # Gerar chave de acesso única para NFS-e
                 # NFS-e não tem chave de 44 dígitos como NF-e
                 chave_acesso = self._gerar_chave_nfse(nota)
+                cnpj_prestador = self._normalizar_cnpj(str(nota.get("cnpj_prestador", "")))
+                tipo_operacao = "saida" if empresa_cnpj_limpo and cnpj_prestador == empresa_cnpj_limpo else "entrada"
+                xml_content = nota.get("xml_content", "")
 
                 nota_db = {
                     "empresa_id": empresa_id,
@@ -515,7 +580,8 @@ class NFSeService:
                     "valor_total": nota.get("valor_total", 0),
                     "data_emissao": nota.get("data_emissao"),
                     "situacao": self._normalizar_status(nota.get("status", "")),
-                    "xml_resumo": nota.get("xml_content", ""),
+                    "xml_completo": xml_content,
+                    "xml_resumo": xml_content,
                     "municipio_codigo": nota.get("municipio_codigo", ""),
                     "municipio_nome": nota.get("municipio_nome", ""),
                     "codigo_verificacao": nota.get("codigo_verificacao", ""),
@@ -524,6 +590,9 @@ class NFSeService:
                     "codigo_servico": nota.get("codigo_servico", ""),
                     "valor_iss": nota.get("valor_iss", 0),
                     "aliquota_iss": nota.get("aliquota_iss", 0),
+                    "tipo_operacao": tipo_operacao,
+                    "fonte": "sefaz_nacional",
+                    "nsu": nota.get("nsu"),
                 }
 
                 # Upsert: insert ou update se chave_acesso já existir
@@ -559,6 +628,10 @@ class NFSeService:
         Returns:
             Chave de acesso única
         """
+        chave_externa = str(nota.get("chave_acesso") or "").strip()
+        if chave_externa:
+            return self._normalizar_chave_nfse(chave_externa)
+
         municipio = nota.get("municipio_codigo", "0000000")
         numero = nota.get("numero", "0")
         codigo_verif = nota.get("codigo_verificacao", "")
@@ -575,7 +648,16 @@ class NFSeService:
         if codigo_verif:
             partes.append(codigo_verif)
 
-        return "-".join(partes)
+        return self._normalizar_chave_nfse("-".join(partes))
+
+    def _normalizar_chave_nfse(self, chave: str) -> str:
+        valor = re.sub(r"\s+", "", str(chave or ""))
+        if len(valor) <= 44:
+            return valor
+
+        digest = hashlib.sha1(valor.encode("utf-8")).hexdigest().upper()
+        # 4 + 40 = 44 caracteres (compatível com coluna chave_acesso atual).
+        return f"NFSE{digest[:40]}"
 
     def _normalizar_status(self, status: str) -> str:
         """
