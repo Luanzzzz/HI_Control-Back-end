@@ -185,7 +185,9 @@ class CapturaService:
 
                 if fallback_nfse["executado"] and not fallback_nfse["sucesso"] and not notas_processadas:
                     aviso_sync = fallback_nfse["mensagem"]
-                    fallback_bloqueante = True
+                    fallback_bloqueante = self._fallback_nfse_bloqueia_sync(
+                        str(fallback_nfse.get("erro_tipo") or "")
+                    )
 
             if fallback_bloqueante and aviso_sync:
                 self._atualizar_sync_alerta_config(
@@ -345,8 +347,21 @@ class CapturaService:
             return False
         if dfe_notas_processadas > 0:
             return False
-        # 137: sem documentos; 138: documentos não convertidos para nota; 656: consumo indevido.
+        # 137: sem documentos; 138: documentos nao convertidos para nota; 656: consumo indevido.
         return str(cstat or "") in {"137", "138", "656"}
+
+    def _fallback_nfse_bloqueia_sync(self, erro_tipo: str) -> bool:
+        strict_mode = os.getenv("CAPTURA_NFSE_FALLBACK_STRICT_MODE", "false").strip().lower()
+        if strict_mode in {"0", "false", "no", "off"}:
+            return False
+
+        erro = (erro_tipo or "").strip().lower()
+        return erro in {
+            "credenciais_ausentes",
+            "nfse_config_error",
+            "nfse_auth_error",
+            "nfse_search_error",
+        }
 
     def _executar_fallback_nfse(self, db, empresa: Dict[str, Any]) -> Dict[str, Any]:
         empresa_id = str(empresa.get("id") or "")
@@ -357,7 +372,8 @@ class CapturaService:
                 "notas_processadas": 0,
                 "notas_novas": 0,
                 "notas_atualizadas": 0,
-                "mensagem": "empresa_id inválido para fallback NFS-e",
+                "mensagem": "empresa_id invalido para fallback NFS-e",
+                "erro_tipo": "empresa_invalida",
             }
 
         dias = max(1, int(os.getenv("CAPTURA_NFSE_FALLBACK_DIAS", "365")))
@@ -382,11 +398,13 @@ class CapturaService:
             sucesso = bool(resultado.get("success", False))
             notas_processadas = int(resultado.get("quantidade") or 0)
             mensagem = str(resultado.get("mensagem") or "").strip() or None
+            erro_tipo = str(resultado.get("erro_tipo") or "").strip() or None
         except Exception as exc:  # noqa: BLE001
             logger.exception("Falha no fallback NFS-e para empresa_id=%s", empresa_id)
             sucesso = False
             notas_processadas = 0
             mensagem = f"Falha no fallback NFS-e: {exc}"
+            erro_tipo = str(getattr(exc, "codigo", "") or exc.__class__.__name__).strip()
 
         notas_depois = self._contar_notas_empresa(db, empresa_id)
         notas_novas = max(0, notas_depois - notas_antes)
@@ -399,6 +417,7 @@ class CapturaService:
             "notas_novas": int(notas_novas),
             "notas_atualizadas": int(notas_atualizadas),
             "mensagem": mensagem,
+            "erro_tipo": erro_tipo,
         }
 
     def _run_async_coro(self, coro):
@@ -838,9 +857,9 @@ class CapturaService:
             )
             return UF_CODES[uf_cert], uf_cert
 
-        # Fallback para manter o XML válido mesmo sem UF cadastrada na empresa.
-        # Usamos uma UF autorizadora válida (35/SP) quando não há qualquer pista
-        # de UF. Esse caso deve ser raro após extração via certificado.
+        # Fallback para manter o XML valido mesmo sem UF cadastrada na empresa.
+        # Usamos uma UF autorizadora valida (35/SP) quando nao ha qualquer pista
+        # de UF. Esse caso deve ser raro apos extracao via certificado.
         logger.warning(
             "Empresa sem estado/municipio_codigo. Usando cUFAutor=35 (fallback). "
             "empresa_id=%s",

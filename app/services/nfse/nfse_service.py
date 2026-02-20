@@ -17,9 +17,10 @@ Uso:
     )
 """
 from datetime import date, datetime
-from typing import List, Dict, Optional, Type
+from typing import Any, List, Dict, Optional, Type
 import logging
 import os
+import re
 
 from app.db.supabase_client import get_supabase_admin
 from app.services.nfse.base_adapter import (
@@ -230,7 +231,8 @@ class NFSeService:
             )
 
             # 2. Buscar credenciais NFS-e da empresa
-            credentials = await self._obter_credenciais_nfse(db, empresa_id, municipio_codigo)
+            # Se não houver credenciais manuais, tenta auto-configurar via certificado A1.
+            credentials = await self._obter_credenciais_nfse(db, empresa, municipio_codigo)
 
             if not credentials:
                 logger.warning(
@@ -246,7 +248,8 @@ class NFSeService:
                         "fim": data_fim.isoformat(),
                     },
                     "mensagem": (
-                        "Credenciais NFS-e não configuradas para esta empresa. "
+                        "Credenciais NFS-e não configuradas para esta empresa "
+                        "e não foi possível auto-configurar via certificado A1. "
                         "Configure as credenciais no menu Configurações > NFS-e."
                     ),
                     "erro_tipo": "credenciais_ausentes",
@@ -341,7 +344,10 @@ class NFSeService:
         """
         try:
             result = db.table("empresas")\
-                .select("id, cnpj, razao_social, municipio_codigo, municipio_nome, estado")\
+                .select(
+                    "id, cnpj, razao_social, municipio_codigo, municipio_nome, estado, "
+                    "certificado_a1, certificado_senha_encrypted"
+                )\
                 .eq("id", empresa_id)\
                 .single()\
                 .execute()
@@ -355,7 +361,7 @@ class NFSeService:
     async def _obter_credenciais_nfse(
         self,
         db,
-        empresa_id: str,
+        empresa: Dict[str, Any],
         municipio_codigo: str,
     ) -> Optional[Dict]:
         """
@@ -372,6 +378,7 @@ class NFSeService:
         Returns:
             Dict com credenciais ou None se não configuradas
         """
+        empresa_id = str(empresa.get("id") or "")
         try:
             result = db.table("credenciais_nfse")\
                 .select("usuario, senha, token, cnpj, municipio_codigo")\
@@ -380,30 +387,92 @@ class NFSeService:
                 .execute()
 
             if not result.data:
-                return None
+                return await self._gerar_credencial_auto_certificado(
+                    db=db,
+                    empresa=empresa,
+                    municipio_codigo=municipio_codigo,
+                )
 
             # Priorizar credencial específica do município
             for cred in result.data:
                 if cred.get("municipio_codigo") == municipio_codigo:
-                    return {
-                        "usuario": cred.get("usuario"),
-                        "senha": cred.get("senha"),
-                        "token": cred.get("token"),
-                        "cnpj": cred.get("cnpj"),
-                    }
+                    return self._anexar_certificado_nas_credenciais(cred, empresa)
 
             # Fallback: usar primeira credencial ativa disponível
-            cred = result.data[0]
-            return {
-                "usuario": cred.get("usuario"),
-                "senha": cred.get("senha"),
-                "token": cred.get("token"),
-                "cnpj": cred.get("cnpj"),
-            }
+            return self._anexar_certificado_nas_credenciais(result.data[0], empresa)
 
         except Exception as e:
             logger.warning(f"[NFS-e] Erro ao buscar credenciais: {e}")
             return None
+
+    def _anexar_certificado_nas_credenciais(
+        self,
+        credencial: Dict[str, Any],
+        empresa: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cred = {
+            "usuario": credencial.get("usuario"),
+            "senha": credencial.get("senha"),
+            "token": credencial.get("token"),
+            "cnpj": credencial.get("cnpj") or empresa.get("cnpj"),
+            "municipio_codigo": credencial.get("municipio_codigo") or empresa.get("municipio_codigo"),
+        }
+
+        cert_a1 = empresa.get("certificado_a1")
+        cert_senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if cert_a1 and cert_senha_encrypted:
+            cred["certificado_a1"] = cert_a1
+            cred["certificado_senha_encrypted"] = cert_senha_encrypted
+            cred["modo_autenticacao"] = "certificado_a1"
+
+        return cred
+
+    async def _gerar_credencial_auto_certificado(
+        self,
+        db,
+        empresa: Dict[str, Any],
+        municipio_codigo: str,
+    ) -> Optional[Dict[str, Any]]:
+        cert_a1 = empresa.get("certificado_a1")
+        cert_senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not cert_a1 or not cert_senha_encrypted:
+            return None
+
+        empresa_id = str(empresa.get("id") or "")
+        municipio = str(municipio_codigo or empresa.get("municipio_codigo") or "").strip() or "0000000"
+        cnpj_limpo = self._normalizar_cnpj(str(empresa.get("cnpj") or ""))
+
+        credencial_auto = {
+            "empresa_id": empresa_id,
+            "municipio_codigo": municipio,
+            "usuario": "AUTO_CERT_A1",
+            "senha": None,
+            "token": "AUTO_CERT_A1",
+            "cnpj": cnpj_limpo or None,
+            "ativo": True,
+        }
+
+        try:
+            db.table("credenciais_nfse").upsert(
+                credencial_auto,
+                on_conflict="empresa_id,municipio_codigo",
+            ).execute()
+            logger.info(
+                "[NFS-e] Credencial tecnica auto-configurada via certificado para empresa %s (municipio=%s)",
+                empresa_id,
+                municipio,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[NFS-e] Falha ao persistir credencial tecnica via certificado (empresa=%s): %s",
+                empresa_id,
+                exc,
+            )
+
+        return self._anexar_certificado_nas_credenciais(credencial_auto, empresa)
+
+    def _normalizar_cnpj(self, cnpj: str) -> str:
+        return re.sub(r"\D", "", cnpj or "")
 
     async def _salvar_notas(
         self,
