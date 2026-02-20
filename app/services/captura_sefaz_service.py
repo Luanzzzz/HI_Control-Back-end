@@ -3,12 +3,14 @@ Captura de NF-e no DistribuicaoDFe (SEFAZ Nacional).
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import gzip
 import logging
 import os
 import re
 import tempfile
+import threading
 import zlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -130,12 +132,6 @@ class CapturaService:
             max_nsu = max(int(max_nsu or 0), max_nsu_retorno, nsu_fim)
 
             documentos = retorno.get("documentos", [])
-            if cstat == "656" and not documentos:
-                # Consumo indevido sem novos documentos: aguardar 1h.
-                self._atualizar_sync_cooldown(db, empresa_id, nsu_fim, max_nsu, horas=1)
-                status = "ok"
-                return self._resultado(status, 0, 0, nsu_fim, max_nsu, None)
-
             if cstat not in {"137", "138", "656"}:
                 erro_mensagem = f"SEFAZ cStat={cstat}: {motivo}"
                 status = self._atualizar_sync_erro_sefaz(
@@ -166,6 +162,29 @@ class CapturaService:
             )
 
             notas_novas, notas_atualizadas = self._upsert_notas(db, payload)
+            notas_processadas = len(payload)
+
+            aviso_sync: Optional[str] = None
+            if not use_mock and self._deve_executar_fallback_nfse(cstat, len(payload)):
+                fallback_nfse = self._executar_fallback_nfse(db, empresa)
+                notas_novas += fallback_nfse["notas_novas"]
+                notas_atualizadas += fallback_nfse["notas_atualizadas"]
+                notas_processadas += fallback_nfse["notas_processadas"]
+
+                logger.info(
+                    "Fallback NFS-e empresa_id=%s executado=%s sucesso=%s processadas=%s novas=%s atualizadas=%s mensagem=%s",
+                    empresa_id,
+                    fallback_nfse["executado"],
+                    fallback_nfse["sucesso"],
+                    fallback_nfse["notas_processadas"],
+                    fallback_nfse["notas_novas"],
+                    fallback_nfse["notas_atualizadas"],
+                    fallback_nfse["mensagem"],
+                )
+
+                if fallback_nfse["executado"] and not fallback_nfse["sucesso"] and not notas_processadas:
+                    aviso_sync = fallback_nfse["mensagem"]
+
             if cstat == "656":
                 self._atualizar_sync_cooldown(
                     db,
@@ -174,8 +193,9 @@ class CapturaService:
                     max_nsu,
                     horas=1,
                     sync_state=sync_state,
-                    notas_processadas=len(payload),
+                    notas_processadas=notas_processadas,
                     notas_novas=notas_novas,
+                    mensagem=aviso_sync,
                 )
             else:
                 self._atualizar_sync_ok(
@@ -184,11 +204,14 @@ class CapturaService:
                     sync_state,
                     nsu_fim,
                     max_nsu,
-                    len(payload),
+                    notas_processadas,
                     notas_novas,
+                    mensagem=aviso_sync,
                 )
+            if aviso_sync and not erro_mensagem:
+                erro_mensagem = aviso_sync
             status = "ok"
-            return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, None)
+            return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, aviso_sync)
 
         except SefazTimeoutError as exc:
             erro_mensagem = f"Timeout de rede: {exc}"
@@ -300,6 +323,94 @@ class CapturaService:
             "max_nsu": max_nsu,
             "documentos": documentos,
         }
+
+    def _deve_executar_fallback_nfse(self, cstat: str, dfe_notas_processadas: int) -> bool:
+        if os.getenv("CAPTURA_NFSE_FALLBACK_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        if dfe_notas_processadas > 0:
+            return False
+        # 137: sem documentos; 138: documentos não convertidos para nota; 656: consumo indevido.
+        return str(cstat or "") in {"137", "138", "656"}
+
+    def _executar_fallback_nfse(self, db, empresa: Dict[str, Any]) -> Dict[str, Any]:
+        empresa_id = str(empresa.get("id") or "")
+        if not empresa_id:
+            return {
+                "executado": False,
+                "sucesso": False,
+                "notas_processadas": 0,
+                "notas_novas": 0,
+                "notas_atualizadas": 0,
+                "mensagem": "empresa_id inválido para fallback NFS-e",
+            }
+
+        dias = max(1, int(os.getenv("CAPTURA_NFSE_FALLBACK_DIAS", "365")))
+        data_fim = date.today()
+        data_inicio = data_fim - timedelta(days=dias)
+        usuario_id = str(empresa.get("usuario_id") or "") or None
+
+        notas_antes = self._contar_notas_empresa(db, empresa_id)
+
+        try:
+            from app.services.nfse.nfse_service import nfse_service
+
+            resultado = self._run_async_coro(
+                nfse_service.buscar_notas_empresa(
+                    empresa_id=empresa_id,
+                    data_inicio=data_inicio,
+                    data_fim=data_fim,
+                    usuario_id=usuario_id,
+                )
+            )
+            resultado = resultado if isinstance(resultado, dict) else {}
+            sucesso = bool(resultado.get("success", False))
+            notas_processadas = int(resultado.get("quantidade") or 0)
+            mensagem = str(resultado.get("mensagem") or "").strip() or None
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Falha no fallback NFS-e para empresa_id=%s", empresa_id)
+            sucesso = False
+            notas_processadas = 0
+            mensagem = f"Falha no fallback NFS-e: {exc}"
+
+        notas_depois = self._contar_notas_empresa(db, empresa_id)
+        notas_novas = max(0, notas_depois - notas_antes)
+        notas_atualizadas = max(0, notas_processadas - notas_novas)
+
+        return {
+            "executado": True,
+            "sucesso": sucesso,
+            "notas_processadas": int(notas_processadas),
+            "notas_novas": int(notas_novas),
+            "notas_atualizadas": int(notas_atualizadas),
+            "mensagem": mensagem,
+        }
+
+    def _run_async_coro(self, coro):
+        try:
+            asyncio.get_running_loop()
+            running_loop = True
+        except RuntimeError:
+            running_loop = False
+
+        if not running_loop:
+            return asyncio.run(coro)
+
+        result_box: Dict[str, Any] = {}
+        error_box: Dict[str, Exception] = {}
+
+        def _runner():
+            try:
+                result_box["value"] = asyncio.run(coro)
+            except Exception as exc:  # noqa: BLE001
+                error_box["error"] = exc
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        t.join()
+
+        if "error" in error_box:
+            raise error_box["error"]
+        return result_box.get("value")
 
     def _consultar_distribuicao_dfe(
         self,
@@ -770,6 +881,19 @@ class CapturaService:
         resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
         return (resp.data or [{}])[0]
 
+    def _contar_notas_empresa(self, db, empresa_id: str) -> int:
+        try:
+            resp = (
+                db.table("notas_fiscais")
+                .select("id", count="exact")
+                .eq("empresa_id", empresa_id)
+                .execute()
+            )
+            return int(resp.count or 0)
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao contar notas da empresa_id=%s", empresa_id)
+            return 0
+
     def _atualizar_sync_ok(
         self,
         db,
@@ -779,6 +903,7 @@ class CapturaService:
         max_nsu: int,
         notas_processadas: int,
         notas_novas: int,
+        mensagem: Optional[str] = None,
     ) -> None:
         total_atual = int((sync_state or {}).get("total_notas_capturadas") or 0)
         db.table("sync_empresas").update(
@@ -790,7 +915,7 @@ class CapturaService:
                 "status": "ok",
                 "notas_capturadas_ultima_sync": int(notas_processadas),
                 "total_notas_capturadas": total_atual + int(notas_novas),
-                "erro_mensagem": None,
+                "erro_mensagem": mensagem,
                 "tentativas_consecutivas_erro": 0,
             }
         ).eq("empresa_id", empresa_id).execute()
@@ -805,6 +930,7 @@ class CapturaService:
         sync_state: Optional[Dict[str, Any]] = None,
         notas_processadas: int = 0,
         notas_novas: int = 0,
+        mensagem: Optional[str] = None,
     ) -> None:
         total_atual = int((sync_state or {}).get("total_notas_capturadas") or 0)
         db.table("sync_empresas").update(
@@ -816,7 +942,7 @@ class CapturaService:
                 "status": "ok",
                 "notas_capturadas_ultima_sync": int(notas_processadas),
                 "total_notas_capturadas": total_atual + int(notas_novas),
-                "erro_mensagem": None,
+                "erro_mensagem": mensagem,
                 "tentativas_consecutivas_erro": 0,
             }
         ).eq("empresa_id", empresa_id).execute()

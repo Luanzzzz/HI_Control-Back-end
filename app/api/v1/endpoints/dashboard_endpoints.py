@@ -60,6 +60,13 @@ def _normalizar_tipo_param(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def _normalizar_tipo_nf_saida(value: Optional[str]) -> Optional[str]:
+    tipo = str(value or "")
+    if tipo == "NFSE":
+        return "NFSe"
+    return value
+
+
 def _normalizar_status_param(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -271,6 +278,9 @@ async def get_dashboard_empresa(
         .range(offset, offset + limite - 1)
         .execute()
     )
+    notas_data = notas_resp.data or []
+    for nota in notas_data:
+        nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
 
     return {
         "empresa": {
@@ -302,7 +312,7 @@ async def get_dashboard_empresa(
             "variacao_mes_anterior_percent": round(variacao_percent, 2) if variacao_percent is not None else None,
         },
         "historico": historico,
-        "notas": notas_resp.data or [],
+        "notas": notas_data,
         "notas_total": total_resp.count or 0,
         "pagina": pagina,
         "limite": limite,
@@ -343,7 +353,10 @@ async def listar_notas_empresa(
             .order("data_emissao", desc=True)
         )
         if tipo_nf:
-            query = query.eq("tipo_nf", tipo_nf)
+            if tipo_nf == "NFSe":
+                query = query.in_("tipo_nf", ["NFSe", "NFSE"])
+            else:
+                query = query.eq("tipo_nf", tipo_nf)
         if situacao:
             query = query.eq("situacao", situacao)
         if termo_busca:
@@ -361,6 +374,7 @@ async def listar_notas_empresa(
         resp = _base_query().range(offset, offset + limite - 1).execute()
         notas = resp.data or []
         for nota in notas:
+            nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
             nota.pop("valor_iss", None)
             nota.pop("valor_pis", None)
             nota.pop("valor_cofins", None)
@@ -379,6 +393,7 @@ async def listar_notas_empresa(
     total = len(filtradas)
     notas = filtradas[offset: offset + limite]
     for nota in notas:
+        nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
         nota.pop("valor_iss", None)
         nota.pop("valor_pis", None)
         nota.pop("valor_cofins", None)

@@ -435,7 +435,7 @@ class NFSeService:
 
                 nota_db = {
                     "empresa_id": empresa_id,
-                    "tipo_nf": "NFSE",
+                    "tipo_nf": "NFSe",
                     "numero_nf": nota.get("numero", ""),
                     "serie": nota.get("serie", ""),
                     "chave_acesso": chave_acesso,
