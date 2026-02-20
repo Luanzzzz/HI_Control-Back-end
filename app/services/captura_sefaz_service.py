@@ -165,6 +165,7 @@ class CapturaService:
             notas_processadas = len(payload)
 
             aviso_sync: Optional[str] = None
+            fallback_bloqueante = False
             if not use_mock and self._deve_executar_fallback_nfse(cstat, len(payload)):
                 fallback_nfse = self._executar_fallback_nfse(db, empresa)
                 notas_novas += fallback_nfse["notas_novas"]
@@ -184,6 +185,21 @@ class CapturaService:
 
                 if fallback_nfse["executado"] and not fallback_nfse["sucesso"] and not notas_processadas:
                     aviso_sync = fallback_nfse["mensagem"]
+                    fallback_bloqueante = True
+
+            if fallback_bloqueante and aviso_sync:
+                self._atualizar_sync_alerta_config(
+                    db=db,
+                    empresa_id=empresa_id,
+                    ultimo_nsu=nsu_fim,
+                    max_nsu=max_nsu,
+                    mensagem=aviso_sync,
+                    notas_processadas=notas_processadas,
+                    notas_novas=notas_novas,
+                )
+                erro_mensagem = aviso_sync
+                status = "erro"
+                return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, aviso_sync)
 
             if cstat == "656":
                 self._atualizar_sync_cooldown(
@@ -940,6 +956,39 @@ class CapturaService:
                 "ultima_sync": datetime.now(timezone.utc).isoformat(),
                 "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=horas)).isoformat(),
                 "status": "ok",
+                "notas_capturadas_ultima_sync": int(notas_processadas),
+                "total_notas_capturadas": total_atual + int(notas_novas),
+                "erro_mensagem": mensagem,
+                "tentativas_consecutivas_erro": 0,
+            }
+        ).eq("empresa_id", empresa_id).execute()
+
+    def _atualizar_sync_alerta_config(
+        self,
+        db,
+        empresa_id: str,
+        ultimo_nsu: int,
+        max_nsu: int,
+        mensagem: str,
+        notas_processadas: int = 0,
+        notas_novas: int = 0,
+        horas: int = 1,
+    ) -> None:
+        atual = (
+            db.table("sync_empresas")
+            .select("total_notas_capturadas")
+            .eq("empresa_id", empresa_id)
+            .limit(1)
+            .execute()
+        )
+        total_atual = int((atual.data or [{}])[0].get("total_notas_capturadas") or 0)
+        db.table("sync_empresas").update(
+            {
+                "ultimo_nsu": int(ultimo_nsu or 0),
+                "max_nsu": int(max_nsu or 0),
+                "ultima_sync": datetime.now(timezone.utc).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=horas)).isoformat(),
+                "status": "erro",
                 "notas_capturadas_ultima_sync": int(notas_processadas),
                 "total_notas_capturadas": total_atual + int(notas_novas),
                 "erro_mensagem": mensagem,
