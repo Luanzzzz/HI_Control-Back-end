@@ -52,6 +52,11 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         self.nsu_inicial = self._coerce_int(credentials.get("nsu_inicial"), 0)
         self.nsu_final = self.nsu_inicial
         self.nsu_max_visto = self.nsu_inicial
+        token_raw = str(credentials.get("token") or "")
+        token_upper = token_raw.upper()
+        self.bootstrap_recente_concluido = "HOTDONE:1" in token_upper
+        self.persistir_cursor_nsu = True
+        self.cursor_sugerido_token: Optional[str] = None
 
     def _usar_autenticacao_por_certificado(self) -> bool:
         return bool(
@@ -65,6 +70,10 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             f"{base}/SefinNacional/nfse",
             f"{base}/sefinnacional/nfse",
         ]
+
+    def _priorizar_recente_habilitado(self) -> bool:
+        valor = os.getenv("NFSE_ADN_PRIORIZAR_RECENTES", "true").strip().lower()
+        return valor not in {"0", "false", "no", "off"}
 
     async def autenticar(self) -> str:
         """Autenticacao no Sistema Nacional de NFS-e."""
@@ -190,33 +199,45 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                 verify=True,
                 cert=(cert_pem_path, key_pem_path),
             ) as client:
-                for pagina in range(1, max_paginas + 1):
-                    endpoint = f"{self.adn_base_url}/DFe/{nsu_atual}"
-                    retries_429 = 0
-                    while True:
-                        response = await client.get(
-                            endpoint,
-                            headers={"Accept": "application/json"},
-                            params={"cnpjConsulta": cnpj_limpo, "lote": "true"},
+                if (
+                    self._priorizar_recente_habilitado()
+                    and self.nsu_inicial <= 0
+                    and not self.bootstrap_recente_concluido
+                ):
+                    try:
+                        nsu_atual = await self._resolver_nsu_bootstrap_recente(
+                            client=client,
+                            cnpj_limpo=cnpj_limpo,
+                            max_retries_429=max_retries_429,
+                            esperar_429_seg=esperar_429_seg,
                         )
-                        if response.status_code != 429:
-                            break
-
-                        retries_429 += 1
-                        self.log_warning(
-                            "ADN retornou 429 (limite temporario). "
-                            f"pagina={pagina}, nsu={nsu_atual}, tentativa={retries_429}/{max_retries_429}"
-                        )
-                        if retries_429 >= max_retries_429:
-                            if notas:
-                                response = None
-                                break
-                            raise NFSeSearchException(
-                                "ADN bloqueou temporariamente a consulta por excesso de requisicoes (HTTP 429).",
-                                detalhes=f"pagina={pagina}, nsu={nsu_atual}",
+                        if nsu_atual > 0:
+                            self.persistir_cursor_nsu = False
+                            self.log_info(
+                                "Bootstrap prioritario de recentes habilitado: iniciando NSU em %s",
+                                nsu_atual,
                             )
+                    except Exception as exc:  # noqa: BLE001
+                        self.log_warning(
+                            "Falha ao localizar NSU recente (fallback para NSU inicial padrao): %s",
+                            exc,
+                        )
+                        nsu_atual = max(0, self.nsu_inicial)
 
-                        await self._sleep_async(esperar_429_seg * retries_429)
+                for pagina in range(1, max_paginas + 1):
+                    try:
+                        response = await self._consultar_lote_adn(
+                            client=client,
+                            cnpj_limpo=cnpj_limpo,
+                            nsu=nsu_atual,
+                            max_retries_429=max_retries_429,
+                            esperar_429_seg=esperar_429_seg,
+                            contexto=f"pagina={pagina},nsu={nsu_atual}",
+                        )
+                    except NFSeSearchException:
+                        if notas:
+                            break
+                        raise
 
                     if response is None:
                         break
@@ -299,6 +320,14 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                     if pausa_paginas_ms > 0:
                         await self._sleep_async(pausa_paginas_ms / 1000.0)
 
+                if (
+                    not self.persistir_cursor_nsu
+                    and self.nsu_final > 0
+                    and not self.bootstrap_recente_concluido
+                ):
+                    self.cursor_sugerido_token = f"AUTO_CERT_A1|NSU:0|HOTDONE:1|HOTNSU:{self.nsu_final}"
+                    self.bootstrap_recente_concluido = True
+
             self.log_info(
                 f"Consulta ADN concluida: cnpj={cnpj_limpo} notas={len(notas)} "
                 f"nsu_inicial={self.nsu_inicial} nsu_final={self.nsu_final}"
@@ -324,6 +353,106 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         import asyncio
 
         await asyncio.sleep(max(0.1, float(segundos)))
+
+    async def _consultar_lote_adn(
+        self,
+        client: httpx.AsyncClient,
+        cnpj_limpo: str,
+        nsu: int,
+        max_retries_429: int,
+        esperar_429_seg: int,
+        contexto: str,
+    ) -> Optional[httpx.Response]:
+        endpoint = f"{self.adn_base_url}/DFe/{max(0, int(nsu))}"
+        tentativas_429 = 0
+
+        while True:
+            response = await client.get(
+                endpoint,
+                headers={"Accept": "application/json"},
+                params={"cnpjConsulta": cnpj_limpo, "lote": "true"},
+            )
+            if response.status_code != 429:
+                return response
+
+            tentativas_429 += 1
+            self.log_warning(
+                "ADN retornou 429 (limite temporario). contexto=%s tentativa=%s/%s",
+                contexto,
+                tentativas_429,
+                max_retries_429,
+            )
+            if tentativas_429 >= max_retries_429:
+                raise NFSeSearchException(
+                    "ADN bloqueou temporariamente a consulta por excesso de requisicoes (HTTP 429).",
+                    detalhes=contexto,
+                )
+            await self._sleep_async(esperar_429_seg * tentativas_429)
+
+    async def _resolver_nsu_bootstrap_recente(
+        self,
+        client: httpx.AsyncClient,
+        cnpj_limpo: str,
+        max_retries_429: int,
+        esperar_429_seg: int,
+    ) -> int:
+        max_probe = max(0, self._coerce_int(os.getenv("NFSE_ADN_PRIORIDADE_NSU_MAX", "999999999999999")))
+        janela_nsu = max(200, self._coerce_int(os.getenv("NFSE_ADN_PRIORIDADE_JANELA_NSU", "5000")))
+        max_iter = max(6, self._coerce_int(os.getenv("NFSE_ADN_PRIORIDADE_MAX_ITER", "18")))
+
+        low = 0
+        high = max_probe
+        melhor_nsu_com_documento = -1
+
+        for idx in range(1, max_iter + 1):
+            if low > high:
+                break
+            mid = (low + high) // 2
+            response = await self._consultar_lote_adn(
+                client=client,
+                cnpj_limpo=cnpj_limpo,
+                nsu=mid,
+                max_retries_429=max_retries_429,
+                esperar_429_seg=esperar_429_seg,
+                contexto=f"bootstrap-iter={idx},nsu={mid}",
+            )
+            if response is None:
+                break
+
+            if response.status_code in {401, 403}:
+                raise NFSeAuthException(
+                    f"Falha na autenticacao ADN Contribuintes: HTTP {response.status_code}",
+                    detalhes=response.text,
+                )
+            if response.status_code not in {200, 404}:
+                raise NFSeSearchException(
+                    f"Erro na consulta ADN Contribuintes: HTTP {response.status_code}",
+                    detalhes=response.text,
+                )
+
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise NFSeSearchException(
+                    "Resposta invalida da API ADN Contribuintes durante bootstrap de NSU",
+                    detalhes=str(exc),
+                ) from exc
+
+            lote = payload.get("LoteDFe") or []
+            if lote:
+                melhor_nsu_com_documento = max(melhor_nsu_com_documento, mid)
+                nsu_lote_max = mid
+                for item in lote:
+                    nsu_item = self._coerce_int(item.get("NSU"), mid)
+                    nsu_lote_max = max(nsu_lote_max, nsu_item)
+                low = max(low, nsu_lote_max + 1)
+            else:
+                high = mid - 1
+
+        if melhor_nsu_com_documento < 0:
+            return max(0, self.nsu_inicial)
+
+        return max(0, melhor_nsu_com_documento - janela_nsu)
 
     def _carregar_certificado_para_mtls(self) -> Tuple[bytes, str]:
         cert_base64 = self.credentials.get("certificado_a1")

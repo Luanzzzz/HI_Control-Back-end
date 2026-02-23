@@ -505,13 +505,35 @@ class NFSeService:
         if str(credentials.get("modo_autenticacao") or "").strip().lower() != "certificado_a1":
             return
 
-        nsu_final = int(getattr(adapter, "nsu_final", 0) or 0)
-        if nsu_final <= 0:
-            return
-
         token_atual = str(credentials.get("token") or "")
         token_upper = token_atual.upper()
         if token_upper and not token_upper.startswith("AUTO_CERT_A1"):
+            return
+
+        token_sugerido = str(getattr(adapter, "cursor_sugerido_token", "") or "").strip()
+        if token_sugerido and token_sugerido != token_atual:
+            try:
+                db.table("credenciais_nfse").update({"token": token_sugerido}).eq("id", credencial_id).execute()
+                credentials["token"] = token_sugerido
+                credentials["nsu_inicial"] = self._extrair_nsu_cursor_token(token_sugerido)
+                logger.info(
+                    "[NFS-e] Cursor/token atualizado pela estrategia de prioridade na credencial %s: %s",
+                    credencial_id,
+                    token_sugerido,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[NFS-e] Falha ao persistir token sugerido da credencial %s: %s",
+                    credencial_id,
+                    exc,
+                )
+            return
+
+        if not bool(getattr(adapter, "persistir_cursor_nsu", True)):
+            return
+
+        nsu_final = int(getattr(adapter, "nsu_final", 0) or 0)
+        if nsu_final <= 0:
             return
 
         novo_token = f"AUTO_CERT_A1|NSU:{nsu_final}"
@@ -557,8 +579,13 @@ class NFSeService:
         """
         notas_salvas = []
         empresa_cnpj_limpo = self._normalizar_cnpj(empresa_cnpj)
+        notas_ordenadas = sorted(
+            notas,
+            key=lambda n: str(n.get("data_emissao") or ""),
+            reverse=True,
+        )
 
-        for nota in notas:
+        for nota in notas_ordenadas:
             try:
                 # Gerar chave de acesso única para NFS-e
                 # NFS-e não tem chave de 44 dígitos como NF-e
