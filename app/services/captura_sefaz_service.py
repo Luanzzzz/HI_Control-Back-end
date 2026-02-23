@@ -14,7 +14,7 @@ import threading
 import zlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from lxml import etree
@@ -49,6 +49,13 @@ class SefazTimeoutError(SefazNetworkError):
 
 
 class CapturaService:
+    def _coerce_int_env(self, key: str, default: int, min_value: int, max_value: int) -> int:
+        try:
+            value = int(str(os.getenv(key, str(default))).strip())
+        except (TypeError, ValueError):
+            value = default
+        return max(min_value, min(max_value, value))
+
     def _ambiente_norm(self) -> str:
         ambiente = str(AMBIENTE_PADRAO or "producao").strip().lower()
         return ambiente if ambiente in {"producao", "homologacao"} else "producao"
@@ -56,7 +63,13 @@ class CapturaService:
     def _usar_pynfe_distribuicao(self) -> bool:
         return os.getenv("USE_PYNFE_DISTRIBUICAO", "false").strip().lower() == "true"
 
-    def sincronizar_empresa(self, empresa_id: str, db) -> Dict[str, Any]:
+    def sincronizar_empresa(
+        self,
+        empresa_id: str,
+        db,
+        reparar_incompletas: bool = False,
+        reset_cursor_recente: bool = False,
+    ) -> Dict[str, Any]:
         inicio = datetime.now(timezone.utc)
         logger.info("Captura SEFAZ iniciada para empresa_id=%s", empresa_id)
 
@@ -74,6 +87,25 @@ class CapturaService:
             nsu_fim = nsu_inicio
             max_nsu = int(sync_state.get("max_nsu") or 0)
 
+        if reset_cursor_recente:
+            self._resetar_cursor_nfse_token_bootstrap(db, empresa_id)
+
+        progresso_inicio = datetime.now(timezone.utc)
+        try:
+            db.table("sync_empresas").update({"inicio_sync_at": progresso_inicio.isoformat()}).eq("empresa_id", empresa_id).execute()
+        except Exception:  # noqa: BLE001
+            logger.debug("Coluna inicio_sync_at indisponivel para empresa_id=%s", empresa_id)
+        self._atualizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            percentual=2.0,
+            etapa="iniciando",
+            mensagem="Iniciando captura de notas...",
+            processadas=0,
+            estimadas=None,
+            eta_segundos=None,
+        )
+
         try:
             empresa = self._obter_empresa(db, empresa_id)
             if not empresa:
@@ -89,6 +121,16 @@ class CapturaService:
 
             use_mock = self._is_mock_enabled()
             if not use_mock:
+                self._atualizar_sync_progresso(
+                    db=db,
+                    empresa_id=empresa_id,
+                    percentual=8.0,
+                    etapa="validando_certificado",
+                    mensagem="Validando certificado digital...",
+                    processadas=0,
+                    estimadas=None,
+                    eta_segundos=self._calcular_eta_segundos(progresso_inicio, 8.0),
+                )
                 self._limpar_notas_mock_antigas(db, empresa_id)
                 if self._certificado_expirado_por_data(empresa.get("certificado_validade")):
                     erro_mensagem = "Certificado expirado"
@@ -116,6 +158,48 @@ class CapturaService:
                     self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
                     return self._resultado("sem_certificado", 0, 0, nsu_fim, max_nsu, erro_mensagem)
 
+            self._atualizar_sync_progresso(
+                db=db,
+                empresa_id=empresa_id,
+                percentual=12.0,
+                etapa="consultando_sefaz",
+                mensagem="Consultando documentos no SEFAZ...",
+                processadas=0,
+                estimadas=None,
+                eta_segundos=self._calcular_eta_segundos(progresso_inicio, 12.0),
+            )
+
+            def _on_lote_distribuicao(
+                pagina: int,
+                cstat_cb: str,
+                ult_nsu_cb: int,
+                max_nsu_cb: int,
+                docs_total_cb: int,
+            ) -> None:
+                percentual = self._estimar_percentual_consulta(
+                    pagina=pagina,
+                    nsu_inicio=nsu_inicio,
+                    ult_nsu=ult_nsu_cb,
+                    max_nsu=max_nsu_cb,
+                )
+                estimadas: Optional[int] = None
+                processadas = int(max(0, docs_total_cb))
+                if int(max_nsu_cb or 0) > int(nsu_inicio or 0):
+                    estimadas = int(max(0, int(max_nsu_cb) - int(nsu_inicio or 0)))
+                    processadas = int(max(processadas, max(0, int(ult_nsu_cb or 0) - int(nsu_inicio or 0))))
+                    if estimadas and processadas > estimadas:
+                        estimadas = processadas
+                self._atualizar_sync_progresso(
+                    db=db,
+                    empresa_id=empresa_id,
+                    percentual=percentual,
+                    etapa="consultando_sefaz",
+                    mensagem=f"Capturando lotes SEFAZ (pagina {pagina}, cStat {cstat_cb})",
+                    processadas=processadas,
+                    estimadas=estimadas,
+                    eta_segundos=self._calcular_eta_segundos(progresso_inicio, percentual),
+                )
+
             retorno = self._coletar_documentos_distribuicao(
                 empresa_id=empresa_id,
                 cnpj_empresa=cnpj_empresa,
@@ -124,6 +208,7 @@ class CapturaService:
                 cert_bytes=cert_bytes if not use_mock else None,
                 senha_cert=senha_cert if not use_mock else None,
                 uf_codigo=uf_codigo if not use_mock else "35",
+                on_lote_callback=_on_lote_distribuicao,
             )
             cstat = retorno.get("cstat")
             motivo = retorno.get("xmotivo", "")
@@ -161,12 +246,33 @@ class CapturaService:
                 schemas,
             )
 
+            self._atualizar_sync_progresso(
+                db=db,
+                empresa_id=empresa_id,
+                percentual=72.0,
+                etapa="processando_documentos",
+                mensagem=f"Processando {len(payload)} documentos capturados...",
+                processadas=len(payload),
+                estimadas=len(payload) if payload else None,
+                eta_segundos=self._calcular_eta_segundos(progresso_inicio, 72.0),
+            )
+
             notas_novas, notas_atualizadas = self._upsert_notas(db, payload)
             notas_processadas = len(payload)
 
             aviso_sync: Optional[str] = None
             fallback_bloqueante = False
             if not use_mock and self._deve_executar_fallback_nfse(cstat, len(payload)):
+                self._atualizar_sync_progresso(
+                    db=db,
+                    empresa_id=empresa_id,
+                    percentual=82.0,
+                    etapa="fallback_nfse",
+                    mensagem="Consultando fallback NFS-e (Sistema Nacional)...",
+                    processadas=notas_processadas,
+                    estimadas=None,
+                    eta_segundos=self._calcular_eta_segundos(progresso_inicio, 82.0),
+                )
                 fallback_nfse = self._executar_fallback_nfse(db, empresa)
                 notas_novas += fallback_nfse["notas_novas"]
                 notas_atualizadas += fallback_nfse["notas_atualizadas"]
@@ -226,8 +332,35 @@ class CapturaService:
                     notas_novas,
                     mensagem=aviso_sync,
                 )
+
+            self._atualizar_sync_progresso(
+                db=db,
+                empresa_id=empresa_id,
+                percentual=95.0,
+                etapa="finalizando",
+                mensagem="Finalizando sincronizacao...",
+                processadas=notas_processadas,
+                estimadas=notas_processadas if notas_processadas > 0 else None,
+                eta_segundos=self._calcular_eta_segundos(progresso_inicio, 95.0),
+            )
             if aviso_sync and not erro_mensagem:
                 erro_mensagem = aviso_sync
+
+            if reparar_incompletas:
+                limite_reparo = self._coerce_int_env("CAPTURA_REPARO_INCOMPLETAS_LIMITE", 1200, 50, 10000)
+                reparadas = self.reprocessar_notas_incompletas(
+                    db=db,
+                    empresa_id=empresa_id,
+                    limite=limite_reparo,
+                )
+                if reparadas > 0:
+                    notas_atualizadas += reparadas
+                    logger.info(
+                        "Reparo de notas incompletas aplicado empresa_id=%s reparadas=%s",
+                        empresa_id,
+                        reparadas,
+                    )
+
             status = "ok"
             return self._resultado(status, notas_novas, notas_atualizadas, nsu_fim, max_nsu, aviso_sync)
 
@@ -273,8 +406,9 @@ class CapturaService:
         cert_bytes: Optional[bytes],
         senha_cert: Optional[str],
         uf_codigo: str,
+        on_lote_callback: Optional[Callable[[int, str, int, int, int], None]] = None,
     ) -> Dict[str, Any]:
-        max_paginas = 1 if use_mock else max(1, int(os.getenv("SEFAZ_DFE_MAX_PAGINAS", "6")))
+        max_paginas = 1 if use_mock else self._coerce_int_env("SEFAZ_DFE_MAX_PAGINAS", 6, 1, 20)
         documentos: List[Dict[str, Any]] = []
         ult_nsu = int(nsu_inicio or 0)
         max_nsu = int(nsu_inicio or 0)
@@ -314,6 +448,18 @@ class CapturaService:
                 max_nsu,
                 len(docs_lote),
             )
+
+            if on_lote_callback:
+                try:
+                    on_lote_callback(
+                        pagina,
+                        cstat,
+                        int(novo_ult_nsu or 0),
+                        int(max_nsu or 0),
+                        int(len(documentos) + len(docs_lote)),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Falha ao atualizar callback de progresso da distribuicao", exc_info=True)
 
             if cstat == "138":
                 documentos.extend(docs_lote)
@@ -379,8 +525,11 @@ class CapturaService:
         usuario_id = str(empresa.get("usuario_id") or "") or None
 
         notas_antes = self._contar_notas_empresa(db, empresa_id)
-        dias_recente = max(1, int(os.getenv("CAPTURA_NFSE_FALLBACK_DIAS", "365")))
-        dias_backfill = max(dias_recente, int(os.getenv("CAPTURA_NFSE_FALLBACK_DIAS_BACKFILL", "3650")))
+        dias_recente = self._coerce_int_env("CAPTURA_NFSE_FALLBACK_DIAS", 365, 1, 730)
+        dias_backfill = max(
+            dias_recente,
+            self._coerce_int_env("CAPTURA_NFSE_FALLBACK_DIAS_BACKFILL", 3650, dias_recente, 7300),
+        )
         usar_janela_longa = os.getenv("CAPTURA_NFSE_FALLBACK_LONG_WINDOW", "true").strip().lower()
         if usar_janela_longa in {"0", "false", "no", "off"}:
             dias = dias_backfill if notas_antes == 0 else dias_recente
@@ -448,7 +597,12 @@ class CapturaService:
 
         t = threading.Thread(target=_runner, daemon=True)
         t.start()
-        t.join()
+        timeout_seg = self._coerce_int_env("CAPTURA_FALLBACK_ASYNC_TIMEOUT_SECONDS", 180, 30, 1200)
+        t.join(timeout=timeout_seg)
+        if t.is_alive():
+            raise TimeoutError(
+                f"Timeout aguardando resposta do fallback NFS-e apos {timeout_seg}s"
+            )
 
         if "error" in error_box:
             raise error_box["error"]
@@ -741,27 +895,43 @@ class CapturaService:
         if not xml_doc:
             return None
 
+        schema = str(doc.get("schema") or "").strip().lower()
+        if "evento" in schema and "procnfe" not in schema and "resnfe" not in schema:
+            # Eventos (cancelamento/ciencia/etc) nao devem sobrescrever dados da nota.
+            return None
+
         chave = self._extrair_chave_acesso(xml_doc)
         if not chave:
             return None
 
-        modelo = self._extrair_texto_do_xml(xml_doc, "mod") or chave[20:22]
-        numero_nf = self._extrair_texto_do_xml(xml_doc, "nNF") or chave[25:34].lstrip("0") or chave[25:34]
-        serie = self._extrair_texto_do_xml(xml_doc, "serie") or chave[22:25].lstrip("0") or chave[22:25]
+        modelo = self._extrair_primeiro_texto_do_xml(xml_doc, ["mod", "modelo"]) or chave[20:22]
+        numero_nf = self._extrair_primeiro_texto_do_xml(xml_doc, ["nNF", "nNFe", "nDoc"]) or chave[25:34].lstrip("0") or chave[25:34]
+        serie = self._extrair_primeiro_texto_do_xml(xml_doc, ["serie", "nSerie"]) or chave[22:25].lstrip("0") or chave[22:25]
         data_emissao = self._normalizar_data(
-            self._extrair_texto_do_xml(xml_doc, "dhEmi")
-            or self._extrair_texto_do_xml(xml_doc, "dEmi")
-            or self._extrair_texto_do_xml(xml_doc, "dhEvento")
+            self._extrair_primeiro_texto_do_xml(
+                xml_doc,
+                ["dhEmi", "dEmi", "dhSaiEnt", "dhRegEvento", "dhEvento", "dhRecbto", "dhProc"],
+            )
         )
-        valor_total = self._normalizar_decimal(self._extrair_texto_do_xml(xml_doc, "vNF"))
+        valor_total = self._normalizar_decimal(
+            self._extrair_primeiro_texto_do_xml(
+                xml_doc,
+                ["vNF", "vLiq", "vProd", "vPrest", "vTPrest"],
+            )
+        )
 
         cnpj_emitente = self._normalizar_cnpj(
-            self._extrair_texto_do_xml(xml_doc, "CNPJEmit")
-        ) or self._normalizar_cnpj(chave[6:20]) or self._normalizar_cnpj(self._extrair_texto_do_xml(xml_doc, "CNPJ"))
-        cnpj_destinatario = self._normalizar_cnpj(self._extrair_texto_do_xml(xml_doc, "CNPJDest"))
+            self._extrair_primeiro_texto_do_xml(xml_doc, ["CNPJEmit", "CNPJ", "emit_CNPJ"])
+        ) or self._normalizar_cnpj(chave[6:20])
+        cnpj_destinatario = self._normalizar_cnpj(
+            self._extrair_primeiro_texto_do_xml(xml_doc, ["CNPJDest", "dest_CNPJ", "CPFDest"])
+        )
 
-        nome_emitente = self._extrair_texto_do_xml(xml_doc, "xNomeEmit") or self._extrair_texto_do_xml(xml_doc, "xNome") or ""
-        nome_destinatario = self._extrair_texto_do_xml(xml_doc, "xNomeDest")
+        nome_emitente = (
+            self._extrair_primeiro_texto_do_xml(xml_doc, ["xNomeEmit", "xFant", "xNome"])
+            or ""
+        )
+        nome_destinatario = self._extrair_primeiro_texto_do_xml(xml_doc, ["xNomeDest", "xNome"])
 
         tipo_operacao = "entrada"
         if cnpj_emitente == cnpj_empresa:
@@ -773,11 +943,24 @@ class CapturaService:
             if tp_nf == "1":
                 tipo_operacao = "saida"
 
+        tp_evento = self._extrair_texto_do_xml(xml_doc, "tpEvento")
+        if tp_evento and valor_total <= 0 and not self._extrair_texto_do_xml(xml_doc, "nNF"):
+            # XML de evento sem corpo da nota: nao deve sobrescrever dados da nota fiscal.
+            return None
         situacao = self._mapear_situacao(
-            self._extrair_texto_do_xml(xml_doc, "cSitNFe") or self._extrair_texto_do_xml(xml_doc, "cStat")
+            self._extrair_primeiro_texto_do_xml(xml_doc, ["cSitNFe", "cStat", "cSit", "cStatProc"]) or tp_evento
         )
+        if tp_evento in {"110111", "110112", "110110"}:
+            situacao = "cancelada"
+        elif situacao == "processando" and (valor_total > 0 or numero_nf):
+            situacao = "autorizada"
+
         protocolo = self._extrair_texto_do_xml(xml_doc, "nProt")
         xml_resumo = xml_doc if ("resNFe" in (doc.get("schema") or "") or "<resNFe" in xml_doc) else None
+
+        if not numero_nf and valor_total <= 0 and not nome_emitente:
+            # Payload muito incompleto tende a vir de eventos/artefatos que nao devem gerar nota.
+            return None
 
         return {
             "empresa_id": empresa_id,
@@ -810,7 +993,7 @@ class CapturaService:
         for item in payload:
             chave = item["chave_acesso"]
             atual = dedup.get(chave)
-            if atual is None or int(item.get("nsu") or 0) >= int(atual.get("nsu") or 0):
+            if atual is None or self._deve_substituir_payload_nota(atual, item):
                 dedup[chave] = item
 
         lista = list(dedup.values())
@@ -824,6 +1007,97 @@ class CapturaService:
         novas = len([k for k in chaves if k not in existentes])
         atualizadas = len(chaves) - novas
         return novas, atualizadas
+
+    def _deve_substituir_payload_nota(self, atual: Dict[str, Any], novo: Dict[str, Any]) -> bool:
+        score_atual = self._qualidade_payload_nota(atual)
+        score_novo = self._qualidade_payload_nota(novo)
+        if score_novo != score_atual:
+            return score_novo > score_atual
+
+        return int(novo.get("nsu") or 0) >= int(atual.get("nsu") or 0)
+
+    def _qualidade_payload_nota(self, payload: Dict[str, Any]) -> int:
+        score = 0
+        if float(payload.get("valor_total") or 0) > 0:
+            score += 20
+        if str(payload.get("situacao") or "").strip().lower() != "processando":
+            score += 12
+        if str(payload.get("numero_nf") or "").strip():
+            score += 6
+        if str(payload.get("nome_emitente") or "").strip():
+            score += 4
+        if str(payload.get("cnpj_emitente") or "").strip():
+            score += 3
+        if str(payload.get("xml_completo") or "").strip():
+            score += 2
+        return score
+
+    def reprocessar_notas_incompletas(self, db, empresa_id: str, limite: int = 1200) -> int:
+        """
+        Reprocessa notas com valor_total=0 ou situacao=processando usando o XML bruto salvo.
+        """
+        try:
+            empresa = self._obter_empresa(db, empresa_id)
+            cnpj_empresa = self._normalizar_cnpj((empresa or {}).get("cnpj")) or ""
+            consulta = (
+                db.table("notas_fiscais")
+                .select("id, chave_acesso, tipo_nf, nsu, valor_total, situacao, xml_completo")
+                .eq("empresa_id", empresa_id)
+                .not_.is_("xml_completo", "null")
+                .order("data_emissao", desc=True)
+                .limit(max(10, int(limite)))
+                .execute()
+            )
+            linhas = consulta.data or []
+            if not linhas:
+                return 0
+
+            candidatos = []
+            for row in linhas:
+                tipo_nf = str(row.get("tipo_nf") or "").upper()
+                if tipo_nf not in {"NFE", "NFCE", "CTE"}:
+                    continue
+                valor = float(row.get("valor_total") or 0)
+                situacao = str(row.get("situacao") or "").strip().lower()
+                if valor > 0 and situacao != "processando":
+                    continue
+                xml_doc = str(row.get("xml_completo") or "").strip()
+                if not xml_doc:
+                    continue
+                candidatos.append(row)
+
+            if not candidatos:
+                return 0
+
+            payloads: List[Dict[str, Any]] = []
+            for row in candidatos:
+                doc = {
+                    "xml": row.get("xml_completo"),
+                    "schema": "reprocess",
+                    "nsu": row.get("nsu") or 0,
+                }
+                payload = self._montar_payload_nota(doc, cnpj_empresa, empresa_id)
+                if not payload:
+                    continue
+                payload["chave_acesso"] = str(row.get("chave_acesso") or payload.get("chave_acesso") or "").strip()
+                if not payload["chave_acesso"]:
+                    continue
+                valor_antigo = float(row.get("valor_total") or 0)
+                if float(payload.get("valor_total") or 0) <= 0 and valor_antigo > 0:
+                    payload["valor_total"] = valor_antigo
+                situacao_antiga = str(row.get("situacao") or "").strip().lower()
+                if payload.get("situacao") == "processando" and situacao_antiga and situacao_antiga != "processando":
+                    payload["situacao"] = situacao_antiga
+                payloads.append(payload)
+
+            if not payloads:
+                return 0
+
+            _, atualizadas = self._upsert_notas(db, payloads)
+            return int(atualizadas)
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao reprocessar notas incompletas da empresa_id=%s", empresa_id)
+            return 0
 
     def _obter_empresa(self, db, empresa_id: str) -> Optional[Dict[str, Any]]:
         resp = (
@@ -936,6 +1210,84 @@ class CapturaService:
             logger.exception("Falha ao contar notas da empresa_id=%s", empresa_id)
             return 0
 
+    def _calcular_eta_segundos(self, inicio: datetime, percentual: float) -> Optional[int]:
+        try:
+            pct = float(percentual)
+        except Exception:  # noqa: BLE001
+            return None
+        if pct <= 0 or pct >= 100:
+            return None
+        elapsed = (datetime.now(timezone.utc) - inicio).total_seconds()
+        if elapsed <= 0:
+            return None
+        eta = int(elapsed * ((100.0 / pct) - 1.0))
+        return max(1, eta)
+
+    def _estimar_percentual_consulta(
+        self,
+        pagina: int,
+        nsu_inicio: int,
+        ult_nsu: int,
+        max_nsu: int,
+    ) -> float:
+        base_inicio = 12.0
+        base_fim = 68.0
+        total_nsu = int(max_nsu or 0) - int(nsu_inicio or 0)
+        proc_nsu = int(ult_nsu or 0) - int(nsu_inicio or 0)
+        if total_nsu > 0:
+            fator = max(0.0, min(1.0, float(proc_nsu) / float(total_nsu)))
+            return round(base_inicio + (base_fim - base_inicio) * fator, 2)
+        return min(base_fim, round(base_inicio + max(0, int(pagina)) * 8.0, 2))
+
+    def _atualizar_sync_progresso(
+        self,
+        db,
+        empresa_id: str,
+        percentual: float,
+        etapa: str,
+        mensagem: Optional[str],
+        processadas: int,
+        estimadas: Optional[int],
+        eta_segundos: Optional[int],
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "progresso_percentual": float(max(0.0, min(100.0, percentual))),
+            "etapa_atual": str(etapa or "sincronizando")[:120],
+            "mensagem_progresso": (str(mensagem)[:500] if mensagem else None),
+            "notas_processadas_parcial": int(max(0, processadas or 0)),
+            "notas_estimadas_total": int(max(0, estimadas or 0)) if estimadas is not None else None,
+            "tempo_restante_estimado_segundos": int(max(1, eta_segundos)) if eta_segundos else None,
+        }
+        try:
+            db.table("sync_empresas").update(payload).eq("empresa_id", empresa_id).execute()
+        except Exception:  # noqa: BLE001
+            # Migração pode ainda não ter sido aplicada no banco do cliente.
+            logger.debug("Colunas de progresso indisponiveis em sync_empresas (empresa_id=%s)", empresa_id)
+
+    def _finalizar_sync_progresso(
+        self,
+        db,
+        empresa_id: str,
+        status: str,
+        mensagem: Optional[str],
+        processadas: int = 0,
+    ) -> None:
+        terminal = status in {"ok", "erro", "sem_certificado"}
+        etapa = "concluido" if status == "ok" else ("aguardando_retry" if status == "pendente" else "falha")
+        payload = {
+            "status": status,
+            "progresso_percentual": 100.0 if terminal else 0.0,
+            "etapa_atual": etapa,
+            "mensagem_progresso": mensagem,
+            "notas_processadas_parcial": int(max(0, processadas or 0)),
+            "notas_estimadas_total": int(max(0, processadas or 0)),
+            "tempo_restante_estimado_segundos": 0 if terminal else None,
+        }
+        try:
+            db.table("sync_empresas").update(payload).eq("empresa_id", empresa_id).execute()
+        except Exception:  # noqa: BLE001
+            logger.debug("Finalizacao de progresso indisponivel (empresa_id=%s)", empresa_id)
+
     def _atualizar_sync_ok(
         self,
         db,
@@ -961,6 +1313,13 @@ class CapturaService:
                 "tentativas_consecutivas_erro": 0,
             }
         ).eq("empresa_id", empresa_id).execute()
+        self._finalizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            status="ok",
+            mensagem=mensagem or "Captura concluida com sucesso.",
+            processadas=notas_processadas,
+        )
 
     def _atualizar_sync_cooldown(
         self,
@@ -988,6 +1347,13 @@ class CapturaService:
                 "tentativas_consecutivas_erro": 0,
             }
         ).eq("empresa_id", empresa_id).execute()
+        self._finalizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            status="ok",
+            mensagem=mensagem or "Captura concluida. Novo ciclo em cooldown.",
+            processadas=notas_processadas,
+        )
 
     def _atualizar_sync_alerta_config(
         self,
@@ -1021,6 +1387,13 @@ class CapturaService:
                 "tentativas_consecutivas_erro": 0,
             }
         ).eq("empresa_id", empresa_id).execute()
+        self._finalizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            status="erro",
+            mensagem=mensagem,
+            processadas=notas_processadas,
+        )
 
     def _marcar_sem_certificado(self, db, empresa_id: str, mensagem: str) -> None:
         db.table("sync_empresas").update(
@@ -1031,6 +1404,13 @@ class CapturaService:
                 "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
             }
         ).eq("empresa_id", empresa_id).execute()
+        self._finalizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            status="sem_certificado",
+            mensagem=mensagem,
+            processadas=0,
+        )
 
     def _atualizar_sync_erro_rede(self, db, empresa_id: str, mensagem: str, sync_state: Dict[str, Any]) -> str:
         tentativas = int((sync_state or {}).get("tentativas_consecutivas_erro") or 0) + 1
@@ -1044,6 +1424,13 @@ class CapturaService:
                 "proximo_sync": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
             }
         ).eq("empresa_id", empresa_id).execute()
+        self._finalizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            status=status,
+            mensagem=mensagem,
+            processadas=0,
+        )
         return status
 
     def _atualizar_sync_erro_generico(self, db, empresa_id: str, mensagem: str, sync_state: Dict[str, Any]) -> str:
@@ -1058,6 +1445,13 @@ class CapturaService:
                 "proximo_sync": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
             }
         ).eq("empresa_id", empresa_id).execute()
+        self._finalizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            status=status,
+            mensagem=mensagem,
+            processadas=0,
+        )
         return status
 
     def _atualizar_sync_erro_sefaz(
@@ -1081,6 +1475,13 @@ class CapturaService:
                 "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
             }
         ).eq("empresa_id", empresa_id).execute()
+        self._finalizar_sync_progresso(
+            db=db,
+            empresa_id=empresa_id,
+            status="erro",
+            mensagem=mensagem,
+            processadas=0,
+        )
         return "erro"
 
     def _registrar_sync_log(
@@ -1165,6 +1566,42 @@ class CapturaService:
         except Exception:  # noqa: BLE001
             logger.exception("Falha ao limpar notas mock antigas para empresa_id=%s", empresa_id)
 
+    def _resetar_cursor_nfse_token_bootstrap(self, db, empresa_id: str) -> None:
+        """
+        Reseta o token tecnico AUTO_CERT_A1 para disparar bootstrap de notas recentes.
+        Isso evita ciclos longos presos em backlog antigo.
+        """
+        try:
+            credenciais = (
+                db.table("credenciais_nfse")
+                .select("id, token, usuario")
+                .eq("empresa_id", empresa_id)
+                .eq("ativo", True)
+                .execute()
+            ).data or []
+
+            if not credenciais:
+                return
+
+            for cred in credenciais:
+                token = str(cred.get("token") or "").strip()
+                usuario = str(cred.get("usuario") or "").strip().upper()
+                if not (token.upper().startswith("AUTO_CERT_A1") or usuario == "AUTO_CERT_A1"):
+                    continue
+
+                cred_id = cred.get("id")
+                if not cred_id or token == "AUTO_CERT_A1|NSU:0":
+                    continue
+
+                db.table("credenciais_nfse").update({"token": "AUTO_CERT_A1|NSU:0"}).eq("id", cred_id).execute()
+                logger.info(
+                    "Cursor tecnico NFS-e resetado para bootstrap recente (empresa_id=%s, credencial_id=%s)",
+                    empresa_id,
+                    cred_id,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao resetar cursor tecnico NFS-e da empresa_id=%s", empresa_id)
+
     def _find_text(self, element, tag: str) -> Optional[str]:
         found = element.xpath(f".//*[local-name()='{tag}']")
         if not found:
@@ -1184,6 +1621,13 @@ class CapturaService:
             return value.strip() if value else None
         except Exception:  # noqa: BLE001
             return None
+
+    def _extrair_primeiro_texto_do_xml(self, xml_doc: str, tags: List[str]) -> Optional[str]:
+        for tag in tags:
+            valor = self._extrair_texto_do_xml(xml_doc, tag)
+            if valor:
+                return valor
+        return None
 
     def _extrair_chave_acesso(self, xml_doc: str) -> Optional[str]:
         chave = self._extrair_texto_do_xml(xml_doc, "chNFe")
@@ -1256,7 +1700,12 @@ class CapturaService:
         if not valor:
             return 0.0
         try:
-            return float(Decimal(str(valor).replace(",", ".")))
+            txt = str(valor).strip()
+            if "," in txt and "." in txt:
+                txt = txt.replace(".", "").replace(",", ".")
+            else:
+                txt = txt.replace(",", ".")
+            return float(Decimal(txt))
         except (InvalidOperation, ValueError):
             return 0.0
 
@@ -1281,10 +1730,20 @@ class CapturaService:
             "1": "autorizada",
             "2": "denegada",
             "3": "cancelada",
+            "4": "autorizada",
             "100": "autorizada",
             "101": "cancelada",
+            "110": "cancelada",
+            "111": "cancelada",
+            "128": "autorizada",
             "135": "autorizada",
+            "150": "autorizada",
+            "151": "cancelada",
             "302": "denegada",
+            "303": "denegada",
+            "110110": "cancelada",
+            "110111": "cancelada",
+            "110112": "cancelada",
         }
         return mapa.get((codigo or "").strip(), "processando")
 

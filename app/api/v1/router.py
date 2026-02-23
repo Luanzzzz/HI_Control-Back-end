@@ -65,6 +65,9 @@ api_router.include_router(bot_status.router, tags=["Bot Status"])
 # Sync SEFAZ - controle de captura
 api_router.include_router(sync_endpoints.router, tags=["Sync SEFAZ"])
 
-# Debug (apenas em desenvolvimento - ENVIRONMENT != "production")
-if os.getenv("ENVIRONMENT", "development") != "production":
+# Debug: desabilitado por padrao.
+# So habilita em ambiente nao-producao quando ENABLE_DEBUG_ROUTES=true.
+env = os.getenv("ENVIRONMENT", "production").strip().lower()
+enable_debug = os.getenv("ENABLE_DEBUG_ROUTES", "false").strip().lower() in {"1", "true", "yes", "on"}
+if env != "production" and enable_debug:
     api_router.include_router(debug.router, prefix="/debug", tags=["Debug"])

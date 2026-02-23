@@ -17,6 +17,15 @@ from app.services.captura_sefaz_service import captura_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["Sync SEFAZ"])
+_SYNC_PROGRESS_FIELDS = {
+    "inicio_sync_at",
+    "etapa_atual",
+    "mensagem_progresso",
+    "progresso_percentual",
+    "notas_processadas_parcial",
+    "notas_estimadas_total",
+    "tempo_restante_estimado_segundos",
+}
 
 
 async def _validar_empresa_usuario(db: Client, empresa_id: str, usuario_id: str) -> None:
@@ -47,6 +56,15 @@ def _obter_estado_prioridade_recente(db: Client, empresa_id: str) -> Dict[str, b
             "prioridade_recente_ativa": False,
             "prioridade_recente_concluida": False,
         }
+
+
+def _upsert_sync_empresa_seguro(db: Client, payload: Dict[str, Any]) -> None:
+    try:
+        db.table("sync_empresas").upsert(payload, on_conflict="empresa_id").execute()
+        return
+    except Exception:  # noqa: BLE001
+        fallback = {k: v for k, v in payload.items() if k not in _SYNC_PROGRESS_FIELDS}
+        db.table("sync_empresas").upsert(fallback, on_conflict="empresa_id").execute()
 
     try:
         resp = (
@@ -93,19 +111,36 @@ def _obter_estado_prioridade_recente(db: Client, empresa_id: str) -> Dict[str, b
         }
 
 
-def _executar_sync_forcada(empresa_id: str) -> None:
+def _executar_sync_forcada(
+    empresa_id: str,
+    prioridade_recente: bool = True,
+    reparar_incompletas: bool = True,
+) -> None:
     db = get_supabase_admin()
     try:
-        db.table("sync_empresas").upsert(
+        now_iso = datetime.now(timezone.utc).isoformat()
+        _upsert_sync_empresa_seguro(
+            db,
             {
                 "empresa_id": empresa_id,
                 "status": "sincronizando",
                 "erro_mensagem": None,
+                "inicio_sync_at": now_iso,
+                "etapa_atual": "fila",
+                "mensagem_progresso": "Sincronizacao enfileirada...",
+                "progresso_percentual": 1.0,
+                "notas_processadas_parcial": 0,
+                "notas_estimadas_total": None,
+                "tempo_restante_estimado_segundos": None,
             },
-            on_conflict="empresa_id",
-        ).execute()
+        )
         logger.info("Executando sincronizacao forcada para empresa_id=%s", empresa_id)
-        captura_service.sincronizar_empresa(empresa_id, db)
+        captura_service.sincronizar_empresa(
+            empresa_id,
+            db,
+            reparar_incompletas=reparar_incompletas,
+            reset_cursor_recente=prioridade_recente,
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Falha em sincronizacao forcada da empresa_id=%s", empresa_id)
         try:
@@ -135,6 +170,19 @@ async def get_sync_status(
         resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
         row = (resp.data or [{}])[0]
     estado_prioridade = _obter_estado_prioridade_recente(db, empresa_id)
+    estimadas = row.get("notas_estimadas_total")
+    processadas = row.get("notas_processadas_parcial")
+    try:
+        estimadas_int = int(estimadas) if estimadas is not None else None
+    except Exception:  # noqa: BLE001
+        estimadas_int = None
+    try:
+        processadas_int = int(processadas) if processadas is not None else 0
+    except Exception:  # noqa: BLE001
+        processadas_int = 0
+    restantes_int = None
+    if estimadas_int is not None:
+        restantes_int = max(0, estimadas_int - processadas_int)
 
     return {
         "empresa_id": empresa_id,
@@ -145,6 +193,14 @@ async def get_sync_status(
         "notas_capturadas_ultima_sync": row.get("notas_capturadas_ultima_sync", 0),
         "erro_mensagem": row.get("erro_mensagem"),
         "ultimo_nsu": row.get("ultimo_nsu", 0),
+        "inicio_sync_at": row.get("inicio_sync_at"),
+        "etapa_atual": row.get("etapa_atual"),
+        "mensagem_progresso": row.get("mensagem_progresso"),
+        "progresso_percentual": float(row.get("progresso_percentual") or 0),
+        "notas_processadas_parcial": processadas_int,
+        "notas_estimadas_total": estimadas_int,
+        "notas_restantes_estimadas": restantes_int,
+        "tempo_restante_estimado_segundos": row.get("tempo_restante_estimado_segundos"),
         "prioridade_recente_ativa": estado_prioridade["prioridade_recente_ativa"],
         "prioridade_recente_concluida": estado_prioridade["prioridade_recente_concluida"],
     }
@@ -154,26 +210,42 @@ async def get_sync_status(
 async def force_sync_empresa(
     empresa_id: str,
     background_tasks: BackgroundTasks,
+    prioridade_recente: bool = True,
+    reparar_incompletas: bool = True,
     usuario: Dict[str, Any] = Depends(get_current_user),
     db: Client = Depends(get_admin_db),
 ):
     await _validar_empresa_usuario(db, empresa_id, usuario["id"])
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    db.table("sync_empresas").upsert(
+    _upsert_sync_empresa_seguro(
+        db,
         {
             "empresa_id": empresa_id,
             "proximo_sync": now_iso,
             "status": "sincronizando",
             "erro_mensagem": None,
+            "inicio_sync_at": now_iso,
+            "etapa_atual": "fila",
+            "mensagem_progresso": "Sincronizacao enfileirada...",
+            "progresso_percentual": 1.0,
+            "notas_processadas_parcial": 0,
+            "notas_estimadas_total": None,
+            "tempo_restante_estimado_segundos": None,
         },
-        on_conflict="empresa_id",
-    ).execute()
+    )
 
-    background_tasks.add_task(_executar_sync_forcada, empresa_id)
+    background_tasks.add_task(
+        _executar_sync_forcada,
+        empresa_id,
+        prioridade_recente,
+        reparar_incompletas,
+    )
     return {
         "mensagem": "Sincronizacao agendada",
         "empresa_id": empresa_id,
+        "prioridade_recente": prioridade_recente,
+        "reparo_incompletas": reparar_incompletas,
     }
 
 

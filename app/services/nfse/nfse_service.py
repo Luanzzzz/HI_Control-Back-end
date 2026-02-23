@@ -489,6 +489,17 @@ class NFSeService:
         valor = str(token or "").strip()
         if not valor:
             return 0
+        token_upper = valor.upper()
+
+        # Quando o bootstrap recente ja foi concluido, prioriza o cursor HOTNSU.
+        if "HOTDONE:1" in token_upper:
+            match_hot = re.search(r"(?:^|\|)HOTNSU:(\d+)", valor, re.IGNORECASE)
+            if match_hot:
+                try:
+                    return int(match_hot.group(1))
+                except ValueError:
+                    pass
+
         match = re.search(r"(?:^|\|)NSU:(\d+)", valor, re.IGNORECASE)
         if not match:
             return 0

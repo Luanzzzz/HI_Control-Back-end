@@ -75,6 +75,13 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         valor = os.getenv("NFSE_ADN_PRIORIZAR_RECENTES", "true").strip().lower()
         return valor not in {"0", "false", "no", "off"}
 
+    def _coerce_int_env(self, key: str, default: int, min_value: int, max_value: int) -> int:
+        try:
+            value = int(str(os.getenv(key, str(default))).strip())
+        except (TypeError, ValueError):
+            value = default
+        return max(min_value, min(max_value, value))
+
     async def autenticar(self) -> str:
         """Autenticacao no Sistema Nacional de NFS-e."""
         if self._usar_autenticacao_por_certificado():
@@ -181,10 +188,10 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
 
         # O endpoint /DFe/{NSU} retorna lotes de 50 por chamada.
         tamanho_lote = 50
-        max_paginas = max(1, int(os.getenv("NFSE_ADN_MAX_PAGINAS", "8")))
-        esperar_429_seg = max(1, int(os.getenv("NFSE_ADN_RETRY_429_SECONDS", "2")))
-        max_retries_429 = max(1, int(os.getenv("NFSE_ADN_RETRY_429_MAX", "4")))
-        pausa_paginas_ms = max(0, int(os.getenv("NFSE_ADN_PAGE_DELAY_MS", "300")))
+        max_paginas = self._coerce_int_env("NFSE_ADN_MAX_PAGINAS", 8, 1, 40)
+        esperar_429_seg = self._coerce_int_env("NFSE_ADN_RETRY_429_SECONDS", 2, 1, 30)
+        max_retries_429 = self._coerce_int_env("NFSE_ADN_RETRY_429_MAX", 4, 1, 10)
+        pausa_paginas_ms = self._coerce_int_env("NFSE_ADN_PAGE_DELAY_MS", 300, 0, 5000)
 
         notas: List[Dict] = []
         chaves_vistas: Set[str] = set()
@@ -201,7 +208,6 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             ) as client:
                 if (
                     self._priorizar_recente_habilitado()
-                    and self.nsu_inicial <= 0
                     and not self.bootstrap_recente_concluido
                 ):
                     try:
@@ -396,9 +402,14 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         max_retries_429: int,
         esperar_429_seg: int,
     ) -> int:
-        max_probe = max(0, self._coerce_int(os.getenv("NFSE_ADN_PRIORIDADE_NSU_MAX", "999999999999999")))
-        janela_nsu = max(200, self._coerce_int(os.getenv("NFSE_ADN_PRIORIDADE_JANELA_NSU", "5000")))
-        max_iter = max(6, self._coerce_int(os.getenv("NFSE_ADN_PRIORIDADE_MAX_ITER", "18")))
+        max_probe = self._coerce_int_env(
+            "NFSE_ADN_PRIORIDADE_NSU_MAX",
+            999_999_999_999_999,
+            0,
+            999_999_999_999_999,
+        )
+        janela_nsu = self._coerce_int_env("NFSE_ADN_PRIORIDADE_JANELA_NSU", 5000, 200, 200_000)
+        max_iter = self._coerce_int_env("NFSE_ADN_PRIORIDADE_MAX_ITER", 18, 6, 30)
 
         low = 0
         high = max_probe
@@ -514,17 +525,28 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         if not valor:
             return None
 
+        max_base64_len = self._coerce_int_env("NFSE_ADN_XML_BASE64_MAX_LEN", 8_000_000, 10_000, 30_000_000)
+        max_xml_len = self._coerce_int_env("NFSE_ADN_XML_MAX_LEN", 5_000_000, 10_000, 20_000_000)
+
         if valor.startswith("<"):
-            return valor
+            return valor if len(valor) <= max_xml_len else None
 
         binarios: List[bytes] = []
+        valor_limpo = re.sub(r"\s+", "", valor)
+        if len(valor_limpo) > max_base64_len:
+            self.log_warning(
+                "ArquivoXml excede tamanho maximo permitido (len=%s, max=%s)",
+                len(valor_limpo),
+                max_base64_len,
+            )
+            return None
 
         # Tentativa base64 padrao
         try:
-            binarios.append(base64.b64decode(valor, validate=True))
+            binarios.append(base64.b64decode(valor_limpo, validate=True))
         except Exception:  # noqa: BLE001
             try:
-                binarios.append(base64.b64decode(valor + "==="))
+                binarios.append(base64.b64decode(valor_limpo + "==="))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -545,7 +567,8 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             # Se ja for XML em bytes
             if bruto.lstrip().startswith(b"<"):
                 try:
-                    return bruto.decode("utf-8", errors="ignore")
+                    texto = bruto.decode("utf-8", errors="ignore")
+                    return texto if len(texto) <= max_xml_len else None
                 except Exception:  # noqa: BLE001
                     continue
 
@@ -556,7 +579,8 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                     continue
 
                 if descompactado and descompactado.lstrip().startswith(b"<"):
-                    return descompactado.decode("utf-8", errors="ignore")
+                    texto = descompactado.decode("utf-8", errors="ignore")
+                    return texto if len(texto) <= max_xml_len else None
 
         return None
 

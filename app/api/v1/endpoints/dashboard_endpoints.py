@@ -3,6 +3,7 @@ Endpoint agregado de dashboard por empresa.
 """
 from __future__ import annotations
 
+import io
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from supabase import Client
 
 from app.dependencies import get_admin_db, get_current_user
@@ -116,6 +118,14 @@ def _normalizar_tipo_param(value: Optional[str]) -> Optional[str]:
     if normalizado in {"cte", "57"}:
         return "CTe"
     return None
+
+
+def _safe_filename_fragment(value: Any, fallback: str = "nota") -> str:
+    texto = str(value or "").strip()
+    if not texto:
+        return fallback
+    permitido = "".join(ch for ch in texto if ch.isalnum() or ch in {"-", "_", "."})
+    return permitido[:120] or fallback
 
 
 def _normalizar_tipo_nf_saida(value: Optional[str]) -> Optional[str]:
@@ -350,6 +360,20 @@ async def get_dashboard_empresa(
     for nota in notas_data:
         nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
 
+    estimadas = sync_row.get("notas_estimadas_total")
+    processadas = sync_row.get("notas_processadas_parcial")
+    try:
+        estimadas_int = int(estimadas) if estimadas is not None else None
+    except Exception:  # noqa: BLE001
+        estimadas_int = None
+    try:
+        processadas_int = int(processadas) if processadas is not None else 0
+    except Exception:  # noqa: BLE001
+        processadas_int = 0
+    restantes_int = None
+    if estimadas_int is not None:
+        restantes_int = max(0, estimadas_int - processadas_int)
+
     return {
         "empresa": {
             "id": empresa["id"],
@@ -366,6 +390,14 @@ async def get_dashboard_empresa(
             "notas_capturadas_ultima_sync": sync_row.get("notas_capturadas_ultima_sync", 0),
             "erro_mensagem": sync_row.get("erro_mensagem"),
             "ultimo_nsu": sync_row.get("ultimo_nsu", 0),
+            "inicio_sync_at": sync_row.get("inicio_sync_at"),
+            "etapa_atual": sync_row.get("etapa_atual"),
+            "mensagem_progresso": sync_row.get("mensagem_progresso"),
+            "progresso_percentual": float(sync_row.get("progresso_percentual") or 0),
+            "notas_processadas_parcial": processadas_int,
+            "notas_estimadas_total": estimadas_int,
+            "notas_restantes_estimadas": restantes_int,
+            "tempo_restante_estimado_segundos": sync_row.get("tempo_restante_estimado_segundos"),
             "prioridade_recente_ativa": estado_prioridade["prioridade_recente_ativa"],
             "prioridade_recente_concluida": estado_prioridade["prioridade_recente_concluida"],
         },
@@ -499,3 +531,80 @@ async def listar_notas_empresa(
         "pagina": pagina,
         "limite": limite,
     }
+
+
+@router.get("/{empresa_id}/notas/{nota_id}")
+async def obter_nota_empresa(
+    empresa_id: str,
+    nota_id: str,
+    usuario: Dict[str, Any] = Depends(get_current_user),
+    db: Client = Depends(get_admin_db),
+):
+    await _validar_empresa_usuario(db, empresa_id, usuario["id"])
+
+    resp = (
+        db.table("notas_fiscais")
+        .select(
+            "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, "
+            "valor_total, cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, "
+            "situacao, municipio_nome, fonte, link_visualizacao, protocolo"
+        )
+        .eq("empresa_id", empresa_id)
+        .eq("id", nota_id)
+        .limit(1)
+        .execute()
+    )
+    nota = (resp.data or [None])[0]
+    if not nota:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nota nao encontrada para esta empresa",
+        )
+
+    nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
+    return {"nota": nota}
+
+
+@router.get("/{empresa_id}/notas/{nota_id}/xml")
+async def baixar_xml_nota_empresa(
+    empresa_id: str,
+    nota_id: str,
+    usuario: Dict[str, Any] = Depends(get_current_user),
+    db: Client = Depends(get_admin_db),
+):
+    await _validar_empresa_usuario(db, empresa_id, usuario["id"])
+
+    resp = (
+        db.table("notas_fiscais")
+        .select("id, chave_acesso, numero_nf, tipo_nf, xml_completo, xml_resumo")
+        .eq("empresa_id", empresa_id)
+        .eq("id", nota_id)
+        .limit(1)
+        .execute()
+    )
+    nota = (resp.data or [None])[0]
+    if not nota:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nota nao encontrada para esta empresa",
+        )
+
+    xml_content = str(nota.get("xml_completo") or nota.get("xml_resumo") or "").strip()
+    if not xml_content:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="XML nao disponivel para esta nota",
+        )
+
+    tipo_nf = str(_normalizar_tipo_nf_saida(nota.get("tipo_nf")) or "NF")
+    identificador = _safe_filename_fragment(
+        nota.get("chave_acesso") or nota.get("numero_nf") or nota.get("id"),
+        fallback="nota",
+    )
+    filename = f"{tipo_nf}_{identificador}.xml"
+
+    return StreamingResponse(
+        io.BytesIO(xml_content.encode("utf-8")),
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
