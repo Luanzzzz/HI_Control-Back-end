@@ -38,10 +38,27 @@ async def _validar_empresa_usuario(db: Client, empresa_id: str, usuario_id: str)
 def _executar_sync_forcada(empresa_id: str) -> None:
     db = get_supabase_admin()
     try:
+        db.table("sync_empresas").upsert(
+            {
+                "empresa_id": empresa_id,
+                "status": "sincronizando",
+                "erro_mensagem": None,
+            },
+            on_conflict="empresa_id",
+        ).execute()
         logger.info("Executando sincronizacao forcada para empresa_id=%s", empresa_id)
         captura_service.sincronizar_empresa(empresa_id, db)
     except Exception:  # noqa: BLE001
         logger.exception("Falha em sincronizacao forcada da empresa_id=%s", empresa_id)
+        try:
+            db.table("sync_empresas").update(
+                {
+                    "status": "erro",
+                    "erro_mensagem": "Falha interna ao executar sincronizacao forcada",
+                }
+            ).eq("empresa_id", empresa_id).execute()
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao atualizar status de erro da sync forcada empresa_id=%s", empresa_id)
 
 
 @router.get("/empresas/{empresa_id}/status")
@@ -86,7 +103,7 @@ async def force_sync_empresa(
         {
             "empresa_id": empresa_id,
             "proximo_sync": now_iso,
-            "status": "pendente",
+            "status": "sincronizando",
             "erro_mensagem": None,
         },
         on_conflict="empresa_id",
@@ -116,4 +133,3 @@ async def get_sync_historico(
         .execute()
     )
     return resp.data or []
-

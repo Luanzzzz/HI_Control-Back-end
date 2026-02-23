@@ -4,7 +4,7 @@ Endpoint agregado de dashboard por empresa.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -221,7 +221,12 @@ async def get_dashboard_empresa(
     cy, cm = hist_start_ano, hist_start_mes
     for _ in range(12):
         chave = f"{cy:04d}-{cm:02d}"
-        buckets[chave] = {"prestados": 0.0, "tomados": 0.0}
+        buckets[chave] = {
+            "prestados": 0.0,
+            "tomados": 0.0,
+            "prestados_quantidade": 0.0,
+            "tomados_quantidade": 0.0,
+        }
         if cm == 12:
             cy, cm = cy + 1, 1
         else:
@@ -239,8 +244,10 @@ async def get_dashboard_empresa(
         valor = float(_to_decimal(row.get("valor_total")))
         if row.get("tipo_operacao") == "saida":
             buckets[chave]["prestados"] += valor
+            buckets[chave]["prestados_quantidade"] += 1
         else:
             buckets[chave]["tomados"] += valor
+            buckets[chave]["tomados_quantidade"] += 1
 
     historico = []
     for chave, valores in buckets.items():
@@ -251,6 +258,8 @@ async def get_dashboard_empresa(
                 "periodo": periodo,
                 "prestados": round(valores["prestados"], 2),
                 "tomados": round(valores["tomados"], 2),
+                "prestados_quantidade": int(valores["prestados_quantidade"]),
+                "tomados_quantidade": int(valores["tomados_quantidade"]),
             }
         )
 
@@ -316,6 +325,8 @@ async def get_dashboard_empresa(
         "notas_total": total_resp.count or 0,
         "pagina": pagina,
         "limite": limite,
+        "periodo_referencia_mes": mes,
+        "periodo_referencia_ano": ano,
     }
 
 
@@ -326,6 +337,8 @@ async def listar_notas_empresa(
     status_filtro: Optional[str] = Query(default="Todos", alias="status"),
     retencao: Optional[str] = Query(default="Todas"),
     busca: Optional[str] = Query(default=""),
+    data_inicio: Optional[date] = Query(default=None),
+    data_fim: Optional[date] = Query(default=None),
     pagina: int = Query(default=1, ge=1),
     limite: int = Query(default=20, ge=1, le=100),
     usuario: Dict[str, Any] = Depends(get_current_user),
@@ -337,6 +350,23 @@ async def listar_notas_empresa(
     situacao = _normalizar_status_param(status_filtro)
     retencao_norm = _normalizar_retencao_param(retencao)
     termo_busca = (busca or "").strip().replace(",", " ").replace("%", "").replace("*", "")
+
+    if data_inicio and data_fim and data_fim < data_inicio:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="data_fim deve ser maior ou igual a data_inicio",
+        )
+
+    inicio_iso = None
+    fim_iso_exclusivo = None
+    if data_inicio:
+        inicio_iso = datetime.combine(data_inicio, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+    if data_fim:
+        fim_iso_exclusivo = datetime.combine(
+            data_fim + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ).isoformat()
 
     colunas = (
         "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, "
@@ -359,6 +389,10 @@ async def listar_notas_empresa(
                 query = query.eq("tipo_nf", tipo_nf)
         if situacao:
             query = query.eq("situacao", situacao)
+        if inicio_iso:
+            query = query.gte("data_emissao", inicio_iso)
+        if fim_iso_exclusivo:
+            query = query.lt("data_emissao", fim_iso_exclusivo)
         if termo_busca:
             query = query.or_(
                 "chave_acesso.ilike.%{0}%,"
