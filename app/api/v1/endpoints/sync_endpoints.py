@@ -4,6 +4,7 @@ Endpoints de controle da sincronizacao SEFAZ.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -33,6 +34,63 @@ async def _validar_empresa_usuario(db: Client, empresa_id: str, usuario_id: str)
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Empresa nao encontrada ou sem permissao de acesso",
         )
+
+
+def _prioridade_recente_habilitada() -> bool:
+    valor = os.getenv("NFSE_ADN_PRIORIZAR_RECENTES", "true").strip().lower()
+    return valor not in {"0", "false", "no", "off"}
+
+
+def _obter_estado_prioridade_recente(db: Client, empresa_id: str) -> Dict[str, bool]:
+    if not _prioridade_recente_habilitada():
+        return {
+            "prioridade_recente_ativa": False,
+            "prioridade_recente_concluida": False,
+        }
+
+    try:
+        resp = (
+            db.table("credenciais_nfse")
+            .select("token, usuario, ativo")
+            .eq("empresa_id", empresa_id)
+            .eq("ativo", True)
+            .limit(20)
+            .execute()
+        )
+        credenciais = resp.data or []
+        if not credenciais:
+            return {
+                "prioridade_recente_ativa": False,
+                "prioridade_recente_concluida": False,
+            }
+
+        auto = None
+        for cred in credenciais:
+            token = str(cred.get("token") or "").strip()
+            usuario = str(cred.get("usuario") or "").strip().upper()
+            if token.upper().startswith("AUTO_CERT_A1") or usuario == "AUTO_CERT_A1":
+                auto = cred
+                break
+
+        if not auto:
+            return {
+                "prioridade_recente_ativa": False,
+                "prioridade_recente_concluida": False,
+            }
+
+        token_upper = str(auto.get("token") or "").strip().upper()
+        concluida = "HOTDONE:1" in token_upper
+        ativa = not concluida
+        return {
+            "prioridade_recente_ativa": ativa,
+            "prioridade_recente_concluida": concluida,
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception("Falha ao obter estado da prioridade recente da empresa_id=%s", empresa_id)
+        return {
+            "prioridade_recente_ativa": False,
+            "prioridade_recente_concluida": False,
+        }
 
 
 def _executar_sync_forcada(empresa_id: str) -> None:
@@ -76,6 +134,7 @@ async def get_sync_status(
         db.table("sync_empresas").insert({"empresa_id": empresa_id}).execute()
         resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
         row = (resp.data or [{}])[0]
+    estado_prioridade = _obter_estado_prioridade_recente(db, empresa_id)
 
     return {
         "empresa_id": empresa_id,
@@ -86,6 +145,8 @@ async def get_sync_status(
         "notas_capturadas_ultima_sync": row.get("notas_capturadas_ultima_sync", 0),
         "erro_mensagem": row.get("erro_mensagem"),
         "ultimo_nsu": row.get("ultimo_nsu", 0),
+        "prioridade_recente_ativa": estado_prioridade["prioridade_recente_ativa"],
+        "prioridade_recente_concluida": estado_prioridade["prioridade_recente_concluida"],
     }
 
 

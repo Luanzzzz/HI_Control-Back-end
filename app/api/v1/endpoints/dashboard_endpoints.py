@@ -4,6 +4,7 @@ Endpoint agregado de dashboard por empresa.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,63 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/empresas", tags=["Dashboard"])
 
 MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+
+
+def _prioridade_recente_habilitada() -> bool:
+    valor = os.getenv("NFSE_ADN_PRIORIZAR_RECENTES", "true").strip().lower()
+    return valor not in {"0", "false", "no", "off"}
+
+
+def _obter_estado_prioridade_recente(db: Client, empresa_id: str) -> Dict[str, bool]:
+    if not _prioridade_recente_habilitada():
+        return {
+            "prioridade_recente_ativa": False,
+            "prioridade_recente_concluida": False,
+        }
+
+    try:
+        resp = (
+            db.table("credenciais_nfse")
+            .select("token, usuario, ativo")
+            .eq("empresa_id", empresa_id)
+            .eq("ativo", True)
+            .limit(20)
+            .execute()
+        )
+        credenciais = resp.data or []
+        if not credenciais:
+            return {
+                "prioridade_recente_ativa": False,
+                "prioridade_recente_concluida": False,
+            }
+
+        auto = None
+        for cred in credenciais:
+            token = str(cred.get("token") or "").strip()
+            usuario = str(cred.get("usuario") or "").strip().upper()
+            if token.upper().startswith("AUTO_CERT_A1") or usuario == "AUTO_CERT_A1":
+                auto = cred
+                break
+
+        if not auto:
+            return {
+                "prioridade_recente_ativa": False,
+                "prioridade_recente_concluida": False,
+            }
+
+        token_upper = str(auto.get("token") or "").strip().upper()
+        concluida = "HOTDONE:1" in token_upper
+        ativa = not concluida
+        return {
+            "prioridade_recente_ativa": ativa,
+            "prioridade_recente_concluida": concluida,
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception("Falha ao obter estado da prioridade recente da empresa_id=%s", empresa_id)
+        return {
+            "prioridade_recente_ativa": False,
+            "prioridade_recente_concluida": False,
+        }
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -151,6 +209,7 @@ async def get_dashboard_empresa(
     # Sync status
     sync_resp = db.table("sync_empresas").select("*").eq("empresa_id", empresa_id).limit(1).execute()
     sync_row = sync_resp.data[0] if sync_resp.data else {}
+    estado_prioridade = _obter_estado_prioridade_recente(db, empresa_id)
 
     # Resumo do mes
     resumo_rows = (
@@ -307,6 +366,8 @@ async def get_dashboard_empresa(
             "notas_capturadas_ultima_sync": sync_row.get("notas_capturadas_ultima_sync", 0),
             "erro_mensagem": sync_row.get("erro_mensagem"),
             "ultimo_nsu": sync_row.get("ultimo_nsu", 0),
+            "prioridade_recente_ativa": estado_prioridade["prioridade_recente_ativa"],
+            "prioridade_recente_concluida": estado_prioridade["prioridade_recente_concluida"],
         },
         "resumo": {
             "prestados_valor": float(prestados_valor),
