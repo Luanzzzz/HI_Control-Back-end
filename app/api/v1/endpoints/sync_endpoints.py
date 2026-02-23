@@ -57,15 +57,6 @@ def _obter_estado_prioridade_recente(db: Client, empresa_id: str) -> Dict[str, b
             "prioridade_recente_concluida": False,
         }
 
-
-def _upsert_sync_empresa_seguro(db: Client, payload: Dict[str, Any]) -> None:
-    try:
-        db.table("sync_empresas").upsert(payload, on_conflict="empresa_id").execute()
-        return
-    except Exception:  # noqa: BLE001
-        fallback = {k: v for k, v in payload.items() if k not in _SYNC_PROGRESS_FIELDS}
-        db.table("sync_empresas").upsert(fallback, on_conflict="empresa_id").execute()
-
     try:
         resp = (
             db.table("credenciais_nfse")
@@ -109,6 +100,15 @@ def _upsert_sync_empresa_seguro(db: Client, payload: Dict[str, Any]) -> None:
             "prioridade_recente_ativa": False,
             "prioridade_recente_concluida": False,
         }
+
+
+def _upsert_sync_empresa_seguro(db: Client, payload: Dict[str, Any]) -> None:
+    try:
+        db.table("sync_empresas").upsert(payload, on_conflict="empresa_id").execute()
+        return
+    except Exception:  # noqa: BLE001
+        fallback = {k: v for k, v in payload.items() if k not in _SYNC_PROGRESS_FIELDS}
+        db.table("sync_empresas").upsert(fallback, on_conflict="empresa_id").execute()
 
 
 def _executar_sync_forcada(
