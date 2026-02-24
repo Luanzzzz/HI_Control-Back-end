@@ -4,12 +4,16 @@ Endpoint agregado de dashboard por empresa.
 from __future__ import annotations
 
 import io
+import ipaddress
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from supabase import Client
@@ -151,6 +155,145 @@ def _normalizar_tipo_nf_interno(value: Optional[str]) -> str:
     if str(value or "") == "CTe":
         return "CTE"
     return tipo
+
+
+def _bool_from_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _parece_pdf(content_type: Optional[str], content: bytes) -> bool:
+    ctype = str(content_type or "").lower()
+    if "application/pdf" in ctype:
+        return True
+    return content.startswith(b"%PDF-")
+
+
+def _url_aceita_para_download_oficial(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        return False
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return False
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    except ValueError:
+        pass
+
+    return True
+
+
+def _extrair_candidatos_pdf_do_html(html: str, base_url: str) -> List[str]:
+    candidatos: List[str] = []
+    padroes = [
+        r'href=["\']([^"\']+)["\']',
+        r'src=["\']([^"\']+)["\']',
+        r'window\.open\(["\']([^"\']+)["\']',
+        r'location\.href\s*=\s*["\']([^"\']+)["\']',
+    ]
+
+    for padrao in padroes:
+        for match in re.finditer(padrao, html, flags=re.IGNORECASE):
+            valor = (match.group(1) or "").strip()
+            if not valor:
+                continue
+            valor_low = valor.lower()
+            if ".pdf" not in valor_low and "pdf" not in valor_low and "danfse" not in valor_low and "imprimir" not in valor_low:
+                continue
+            candidatos.append(urljoin(base_url, valor))
+
+    vistos = set()
+    unicos: List[str] = []
+    for item in candidatos:
+        if item in vistos:
+            continue
+        vistos.add(item)
+        unicos.append(item)
+    return unicos
+
+
+async def _download_url(url: str, timeout_sec: float = 20.0) -> Tuple[bytes, str]:
+    if not _url_aceita_para_download_oficial(url):
+        raise ValueError("URL de PDF oficial invalida ou bloqueada por seguranca.")
+
+    headers = {
+        "User-Agent": "Hi-Control/1.0 (+https://hi-control.vercel.app)",
+        "Accept": "application/pdf, text/html, application/xhtml+xml, */*",
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_sec) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.content, str(resp.headers.get("content-type") or "")
+
+
+async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
+    candidatos = [
+        str(nota.get("pdf_url") or "").strip(),
+        str(nota.get("link_visualizacao") or "").strip(),
+    ]
+
+    xml_content = str(nota.get("xml_completo") or nota.get("xml_resumo") or "").strip()
+    if xml_content:
+        for encontrado in re.findall(r'https?://[^"\'>\s]+', xml_content, flags=re.IGNORECASE):
+            low = encontrado.lower()
+            if ".pdf" in low or "pdf" in low or "danfse" in low or "imprimir" in low:
+                candidatos.append(encontrado.strip())
+
+    candidatos_limpos: List[str] = []
+    vistos = set()
+    for url in candidatos:
+        if not url:
+            continue
+        if url in vistos:
+            continue
+        vistos.add(url)
+        candidatos_limpos.append(url)
+
+    for url in candidatos_limpos:
+        try:
+            conteudo, content_type = await _download_url(url)
+            if _parece_pdf(content_type, conteudo):
+                logger.info("PDF oficial obtido diretamente para nota_id=%s url=%s", nota.get("id"), url)
+                return conteudo
+
+            if "html" in content_type.lower():
+                html = conteudo.decode("utf-8", errors="ignore")
+                for candidato_pdf in _extrair_candidatos_pdf_do_html(html, url):
+                    try:
+                        conteudo_pdf, content_type_pdf = await _download_url(candidato_pdf)
+                        if _parece_pdf(content_type_pdf, conteudo_pdf):
+                            logger.info(
+                                "PDF oficial obtido via pagina de visualizacao para nota_id=%s url=%s",
+                                nota.get("id"),
+                                candidato_pdf,
+                            )
+                            return conteudo_pdf
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "Candidato PDF invalido na pagina de visualizacao da nota_id=%s: %s",
+                            nota.get("id"),
+                            candidato_pdf,
+                        )
+                        continue
+        except Exception:  # noqa: BLE001
+            logger.debug("Falha ao tentar baixar PDF oficial da nota_id=%s URL=%s", nota.get("id"), url, exc_info=True)
+            continue
+
+    return None
 
 
 def _gerar_pdf_resumo_nota(nota: Dict[str, Any]) -> bytes:
@@ -712,6 +855,7 @@ async def baixar_pdf_nota_empresa(
     empresa_id: str,
     nota_id: str,
     download: bool = Query(default=False),
+    permitir_fallback: bool = Query(default=False, alias="fallback"),
     usuario: Dict[str, Any] = Depends(get_current_user),
     db: Client = Depends(get_admin_db),
 ):
@@ -722,7 +866,7 @@ async def baixar_pdf_nota_empresa(
         .select(
             "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, valor_total, "
             "cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, situacao, municipio_nome, "
-            "xml_completo, xml_resumo, link_visualizacao"
+            "xml_completo, xml_resumo, link_visualizacao, pdf_url"
         )
         .eq("empresa_id", empresa_id)
         .eq("id", nota_id)
@@ -736,7 +880,25 @@ async def baixar_pdf_nota_empresa(
             detail="Nota nao encontrada para esta empresa",
         )
 
-    pdf_bytes = _gerar_pdf_nota(nota)
+    tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
+    pdf_bytes = await _obter_pdf_oficial_nota(nota)
+    source = "official"
+
+    fallback_nfse_habilitado = _bool_from_env("NFSE_PERMITIR_PDF_FALLBACK", False)
+    pode_fallback = permitir_fallback or tipo_nf_interno in {"NFE", "NFCE", "CTE"} or fallback_nfse_habilitado
+
+    if not pdf_bytes:
+        if tipo_nf_interno == "NFSE" and not pode_fallback:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    "PDF oficial da NFS-e indisponivel para esta nota. "
+                    "Use o link oficial de visualizacao ou habilite fallback explicitamente."
+                ),
+            )
+        pdf_bytes = _gerar_pdf_nota(nota)
+        source = "generated"
+
     tipo_nf = str(_normalizar_tipo_nf_saida(nota.get("tipo_nf")) or "NF")
     identificador = _safe_filename_fragment(
         nota.get("chave_acesso") or nota.get("numero_nf") or nota.get("id"),
@@ -748,5 +910,8 @@ async def baixar_pdf_nota_empresa(
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "X-HiControl-Pdf-Source": source,
+        },
     )
