@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from supabase import Client
 
 from app.dependencies import get_admin_db, get_current_user
+from app.services.danfe_service import danfe_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/empresas", tags=["Dashboard"])
@@ -133,6 +134,102 @@ def _normalizar_tipo_nf_saida(value: Optional[str]) -> Optional[str]:
     if tipo == "NFSE":
         return "NFSe"
     return value
+
+
+def _normalizar_tipo_nf_interno(value: Optional[str]) -> str:
+    tipo = str(value or "").strip().upper()
+    if tipo in {"NFSE", "NFE", "NFCE", "CTE"}:
+        return tipo
+    if tipo == "NFSE":
+        return "NFSE"
+    if str(value or "") == "NFSe":
+        return "NFSE"
+    if str(value or "") == "NFe":
+        return "NFE"
+    if str(value or "") == "NFCe":
+        return "NFCE"
+    if str(value or "") == "CTe":
+        return "CTE"
+    return tipo
+
+
+def _gerar_pdf_resumo_nota(nota: Dict[str, Any]) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    margem = 15 * mm
+    y = height - margem
+
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(margem, y, "HI-CONTROL - Resumo da Nota Fiscal")
+    y -= 8 * mm
+
+    c.setStrokeColor(colors.lightgrey)
+    c.line(margem, y, width - margem, y)
+    y -= 8 * mm
+
+    campos = [
+        ("Tipo", _normalizar_tipo_nf_saida(nota.get("tipo_nf")) or "-"),
+        ("Numero", str(nota.get("numero_nf") or "-")),
+        ("Serie", str(nota.get("serie") or "-")),
+        ("Data Emissao", str(nota.get("data_emissao") or "-")),
+        ("Valor Total", str(nota.get("valor_total") or "0")),
+        ("Situacao", str(nota.get("situacao") or "-")),
+        ("Chave de Acesso", str(nota.get("chave_acesso") or "-")),
+        ("Emitente", str(nota.get("nome_emitente") or "-")),
+        ("CNPJ Emitente", str(nota.get("cnpj_emitente") or "-")),
+        ("Destinatario", str(nota.get("nome_destinatario") or "-")),
+        ("CNPJ Destinatario", str(nota.get("cnpj_destinatario") or "-")),
+        ("Municipio", str(nota.get("municipio_nome") or "-")),
+        ("Link Visualizacao", str(nota.get("link_visualizacao") or "-")),
+    ]
+
+    c.setFont("Helvetica", 10)
+    for label, valor in campos:
+        if y < (margem + 20 * mm):
+            c.showPage()
+            y = height - margem
+            c.setFont("Helvetica", 10)
+        c.setFillColor(colors.HexColor("#1f2937"))
+        c.drawString(margem, y, f"{label}:")
+        c.setFillColor(colors.black)
+        texto = str(valor)
+        max_len = 95
+        partes = [texto[i:i + max_len] for i in range(0, len(texto), max_len)] or ["-"]
+        c.drawString(margem + 35 * mm, y, partes[0])
+        y -= 6 * mm
+        for parte in partes[1:]:
+            c.drawString(margem + 35 * mm, y, parte)
+            y -= 5 * mm
+
+    c.setFont("Helvetica-Oblique", 8)
+    c.setFillColor(colors.grey)
+    c.drawString(margem, margem - 2 * mm, "Documento auxiliar gerado automaticamente pelo Hi-Control.")
+    c.save()
+    return buffer.getvalue()
+
+
+def _gerar_pdf_nota(nota: Dict[str, Any]) -> bytes:
+    tipo = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
+    xml_content = str(nota.get("xml_completo") or nota.get("xml_resumo") or "").strip()
+
+    if xml_content and tipo in {"NFE", "NFCE", "CTE"}:
+        try:
+            if tipo == "NFE":
+                return danfe_service.gerar_danfe(xml_content)
+            if tipo == "NFCE":
+                return danfe_service.gerar_danfce(xml_content)
+            if tipo == "CTE":
+                return danfe_service.gerar_dacte(xml_content)
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao gerar PDF oficial da nota id=%s, usando fallback.", nota.get("id"))
+
+    return _gerar_pdf_resumo_nota(nota)
 
 
 def _normalizar_status_param(value: Optional[str]) -> Optional[str]:
@@ -607,4 +704,49 @@ async def baixar_xml_nota_empresa(
         io.BytesIO(xml_content.encode("utf-8")),
         media_type="application/xml",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{empresa_id}/notas/{nota_id}/pdf")
+async def baixar_pdf_nota_empresa(
+    empresa_id: str,
+    nota_id: str,
+    download: bool = Query(default=False),
+    usuario: Dict[str, Any] = Depends(get_current_user),
+    db: Client = Depends(get_admin_db),
+):
+    await _validar_empresa_usuario(db, empresa_id, usuario["id"])
+
+    resp = (
+        db.table("notas_fiscais")
+        .select(
+            "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, valor_total, "
+            "cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, situacao, municipio_nome, "
+            "xml_completo, xml_resumo, link_visualizacao"
+        )
+        .eq("empresa_id", empresa_id)
+        .eq("id", nota_id)
+        .limit(1)
+        .execute()
+    )
+    nota = (resp.data or [None])[0]
+    if not nota:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nota nao encontrada para esta empresa",
+        )
+
+    pdf_bytes = _gerar_pdf_nota(nota)
+    tipo_nf = str(_normalizar_tipo_nf_saida(nota.get("tipo_nf")) or "NF")
+    identificador = _safe_filename_fragment(
+        nota.get("chave_acesso") or nota.get("numero_nf") or nota.get("id"),
+        fallback="nota",
+    )
+    filename = f"{tipo_nf}_{identificador}.pdf"
+    disposition = "attachment" if download else "inline"
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
     )
