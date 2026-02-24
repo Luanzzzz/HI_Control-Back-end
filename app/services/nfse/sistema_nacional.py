@@ -410,22 +410,18 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         )
         janela_nsu = self._coerce_int_env("NFSE_ADN_PRIORIDADE_JANELA_NSU", 5000, 200, 200_000)
         max_iter = self._coerce_int_env("NFSE_ADN_PRIORIDADE_MAX_ITER", 18, 6, 30)
-
-        low = 0
-        high = max_probe
+        probe = max(1, int(self.nsu_inicial or 0))
         melhor_nsu_com_documento = -1
 
         for idx in range(1, max_iter + 1):
-            if low > high:
-                break
-            mid = (low + high) // 2
+            probe = min(max_probe, probe)
             response = await self._consultar_lote_adn(
                 client=client,
                 cnpj_limpo=cnpj_limpo,
-                nsu=mid,
+                nsu=probe,
                 max_retries_429=max_retries_429,
                 esperar_429_seg=esperar_429_seg,
-                contexto=f"bootstrap-iter={idx},nsu={mid}",
+                contexto=f"bootstrap-iter={idx},nsu={probe}",
             )
             if response is None:
                 break
@@ -450,20 +446,35 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                 ) from exc
 
             lote = payload.get("LoteDFe") or []
-            if lote:
-                melhor_nsu_com_documento = max(melhor_nsu_com_documento, mid)
-                nsu_lote_max = mid
-                for item in lote:
-                    nsu_item = self._coerce_int(item.get("NSU"), mid)
-                    nsu_lote_max = max(nsu_lote_max, nsu_item)
-                low = max(low, nsu_lote_max + 1)
-            else:
-                high = mid - 1
+            if not lote:
+                break
+
+            nsu_lote_max = probe
+            for item in lote:
+                nsu_item = self._coerce_int(item.get("NSU"), probe)
+                nsu_lote_max = max(nsu_lote_max, nsu_item)
+            melhor_nsu_com_documento = max(melhor_nsu_com_documento, nsu_lote_max)
+
+            proximo_probe = max(probe * 2, nsu_lote_max + 1)
+            if proximo_probe <= probe:
+                break
+            probe = proximo_probe
 
         if melhor_nsu_com_documento < 0:
             return max(0, self.nsu_inicial)
 
-        return max(0, melhor_nsu_com_documento - janela_nsu)
+        # Janela dinamica curta: prioriza documentos mais recentes no primeiro ciclo.
+        janela_minima = self._coerce_int_env("NFSE_ADN_PRIORIDADE_JANELA_MIN", 80, 20, 2000)
+        janela_dinamica = max(janela_minima, melhor_nsu_com_documento // 50)
+        janela_efetiva = min(janela_nsu, janela_dinamica)
+        nsu_inicial_recente = max(0, melhor_nsu_com_documento - janela_efetiva)
+        self.log_info(
+            "Bootstrap NSU recente resolvido: nsu_max=%s janela=%s nsu_inicio=%s",
+            melhor_nsu_com_documento,
+            janela_efetiva,
+            nsu_inicial_recente,
+        )
+        return nsu_inicial_recente
 
     def _carregar_certificado_para_mtls(self) -> Tuple[bytes, str]:
         cert_base64 = self.credentials.get("certificado_a1")
@@ -608,51 +619,67 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
         )
         nome_destinatario = self._find_text(toma, "xNome") or ""
 
-        data_emissao = (
-            self._find_text(inf_nfse, "dhEmi")
-            or self._find_text(inf_nfse, "dCompet")
-            or self._find_text(inf_nfse, "dhProc")
+        data_emissao = self._find_first_text(
+            inf_nfse,
+            ["dhEmi", "dEmi", "dEmissao", "dCompet", "dhProc"],
         )
 
         valor_total = self._to_float(
-            self._find_text(inf_nfse, "vLiq")
-            or self._find_text(inf_nfse, "vServ")
-            or self._find_text(inf_nfse, "vNFSe")
+            self._find_first_text(
+                inf_nfse,
+                [
+                    "vLiq",
+                    "vServ",
+                    "vNFSe",
+                    "vNfse",
+                    "vServPrest",
+                    "vTot",
+                    "ValorServicos",
+                    "valorServicos",
+                    "valor_total",
+                ],
+            )
+            or item_dfe.get("Valor")
+            or item_dfe.get("ValorTotal")
             or "0"
         )
         valor_iss = self._to_float(
-            self._find_text(inf_nfse, "vISSQN")
-            or self._find_text(inf_nfse, "vIss")
+            self._find_first_text(
+                inf_nfse,
+                ["vISSQN", "vIss", "valorIss", "ValorIss"],
+            )
             or "0"
         )
         aliquota_iss = self._to_float(
-            self._find_text(inf_nfse, "pAliqAplic")
-            or self._find_text(inf_nfse, "pAliq")
+            self._find_first_text(
+                inf_nfse,
+                ["pAliqAplic", "pAliq", "Aliquota", "aliquota"],
+            )
             or "0"
         )
 
         chave_acesso = self._extrair_chave_acesso_nfse(inf_nfse, item_dfe)
-        numero_nf = self._find_text(inf_nfse, "nNFSe") or self._find_text(inf_nfse, "nDPS") or ""
-        serie = self._find_text(inf_nfse, "serie") or ""
+        numero_nf = self._find_first_text(inf_nfse, ["nNFSe", "numero", "Numero", "nDPS"]) or ""
+        serie = self._find_first_text(inf_nfse, ["serie", "Serie"]) or ""
 
-        codigo_municipio = self._find_text(inf_nfse, "cLocIncid") or self._find_text(inf_nfse, "cLocPrestacao") or ""
-        nome_municipio = self._find_text(inf_nfse, "xLocIncid") or self._find_text(inf_nfse, "xLocPrestacao") or ""
+        codigo_municipio = self._find_first_text(inf_nfse, ["cLocIncid", "cLocPrestacao", "codigoMunicipio"]) or ""
+        nome_municipio = self._find_first_text(inf_nfse, ["xLocIncid", "xLocPrestacao", "municipioNome"]) or ""
 
-        descricao_servico = (
-            self._find_text(inf_nfse, "xDescServ")
-            or self._find_text(inf_nfse, "xTribMun")
-            or self._find_text(inf_nfse, "xTribNac")
-            or ""
-        )
-        codigo_servico = self._find_text(inf_nfse, "cTribNac") or self._find_text(inf_nfse, "cTribMun") or ""
+        descricao_servico = self._find_first_text(
+            inf_nfse,
+            ["xDescServ", "discriminacao", "xTribMun", "xTribNac"],
+        ) or ""
+        codigo_servico = self._find_first_text(
+            inf_nfse,
+            ["cTribNac", "cTribMun", "itemListaServico", "codigoServico"],
+        ) or ""
 
-        codigo_verificacao = (
-            self._find_text(inf_nfse, "cVerif")
-            or self._find_text(inf_nfse, "codigoVerificacao")
-            or ""
-        )
+        codigo_verificacao = self._find_first_text(
+            inf_nfse,
+            ["cVerif", "codigoVerificacao", "CodVerificacao"],
+        ) or ""
 
-        cstat = self._find_text(inf_nfse, "cStat") or ""
+        cstat = self._find_first_text(inf_nfse, ["cStat", "situacao"]) or ""
         status = self._mapear_status(cstat)
 
         return self.criar_nota_padrao(
@@ -718,6 +745,13 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             return None
         texto = (node.text or "").strip()
         return texto or None
+
+    def _find_first_text(self, root: Optional[ET.Element], names: List[str]) -> Optional[str]:
+        for name in names:
+            valor = self._find_text(root, name)
+            if valor:
+                return valor
+        return None
 
     def _tag_local(self, tag: str) -> str:
         if "}" in tag:

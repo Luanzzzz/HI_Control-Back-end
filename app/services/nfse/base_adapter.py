@@ -187,14 +187,14 @@ class BaseNFSeAdapter(ABC):
         nota.update(kwargs)
         return nota
 
-    def log_info(self, msg: str):
+    def log_info(self, msg: str, *args):
         """Log informativo com prefixo do sistema."""
-        logger.info(f"[NFS-e {self.SISTEMA_NOME}] {msg}")
+        logger.info(f"[NFS-e {self.SISTEMA_NOME}] {msg}", *args)
 
-    def log_warning(self, msg: str):
+    def log_warning(self, msg: str, *args):
         """Log de aviso com prefixo do sistema."""
-        logger.warning(f"[NFS-e {self.SISTEMA_NOME}] {msg}")
+        logger.warning(f"[NFS-e {self.SISTEMA_NOME}] {msg}", *args)
 
-    def log_error(self, msg: str, exc_info: bool = False):
+    def log_error(self, msg: str, *args, exc_info: bool = False):
         """Log de erro com prefixo do sistema."""
-        logger.error(f"[NFS-e {self.SISTEMA_NOME}] {msg}", exc_info=exc_info)
+        logger.error(f"[NFS-e {self.SISTEMA_NOME}] {msg}", *args, exc_info=exc_info)

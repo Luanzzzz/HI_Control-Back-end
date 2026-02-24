@@ -132,6 +132,13 @@ class CapturaService:
                     eta_segundos=self._calcular_eta_segundos(progresso_inicio, 8.0),
                 )
                 self._limpar_notas_mock_antigas(db, empresa_id)
+                removidas_evento = self._limpar_notas_evento_incorretas(db, empresa_id)
+                if removidas_evento > 0:
+                    logger.info(
+                        "Limpeza de artefatos de evento concluida para empresa_id=%s: %s registros removidos",
+                        empresa_id,
+                        removidas_evento,
+                    )
                 if self._certificado_expirado_por_data(empresa.get("certificado_validade")):
                     erro_mensagem = "Certificado expirado"
                     self._marcar_sem_certificado(db, empresa_id, erro_mensagem)
@@ -491,7 +498,8 @@ class CapturaService:
     def _deve_executar_fallback_nfse(self, cstat: str, dfe_notas_processadas: int) -> bool:
         if os.getenv("CAPTURA_NFSE_FALLBACK_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
             return False
-        if dfe_notas_processadas > 0:
+        fallback_com_dfe = os.getenv("CAPTURA_NFSE_FALLBACK_COM_DFE", "true").strip().lower()
+        if dfe_notas_processadas > 0 and fallback_com_dfe in {"0", "false", "no", "off"}:
             return False
         # 137: sem documentos; 138: documentos nao convertidos para nota; 656: consumo indevido.
         return str(cstat or "") in {"137", "138", "656"}
@@ -831,7 +839,17 @@ class CapturaService:
         candidatos = []
         for child in doc_zip:
             nome = child.tag.split("}")[-1] if isinstance(child.tag, str) else ""
-            if nome in {"resNFe", "procNFe", "NFe", "resCTe", "resNFCe"}:
+            if nome in {
+                "resNFe",
+                "procNFe",
+                "NFe",
+                "resCTe",
+                "procCTe",
+                "CTe",
+                "resNFCe",
+                "procNFCe",
+                "NFCe",
+            }:
                 candidatos.append(child)
 
         target = candidatos[0] if candidatos else doc_zip[-1]
@@ -890,14 +908,51 @@ class CapturaService:
         except Exception:  # noqa: BLE001
             return False
 
+    def _extrair_raiz_local_name(self, xml_doc: str) -> str:
+        if not xml_doc:
+            return ""
+        if etree is None:
+            texto = xml_doc.lstrip()
+            if texto.startswith("<"):
+                bruto = texto[1:].split(">", 1)[0].split(None, 1)[0]
+                return bruto.split(":")[-1].strip("/").lower()
+            return ""
+        try:
+            root = etree.fromstring(xml_doc.encode("utf-8"))
+            tag = str(getattr(root, "tag", "") or "")
+            return tag.split("}")[-1].lower()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _documento_eh_evento(self, schema: str, xml_doc: str) -> bool:
+        schema_norm = str(schema or "").strip().lower()
+        if "resevento" in schema_norm or "procevento" in schema_norm:
+            return True
+        if "evento" in schema_norm and all(
+            marcador not in schema_norm
+            for marcador in ("resnfe", "procnfe", "rescte", "proccte", "resnfce", "procnfce")
+        ):
+            return True
+
+        raiz = self._extrair_raiz_local_name(xml_doc)
+        if raiz in {
+            "resevento",
+            "proceventonfe",
+            "proceventocte",
+            "proceventonfce",
+            "evento",
+        }:
+            return True
+        return False
+
     def _montar_payload_nota(self, doc: Dict[str, Any], cnpj_empresa: str, empresa_id: str) -> Optional[Dict[str, Any]]:
         xml_doc = doc.get("xml")
         if not xml_doc:
             return None
 
         schema = str(doc.get("schema") or "").strip().lower()
-        if "evento" in schema and "procnfe" not in schema and "resnfe" not in schema:
-            # Eventos (cancelamento/ciencia/etc) nao devem sobrescrever dados da nota.
+        if self._documento_eh_evento(schema=schema, xml_doc=str(xml_doc)):
+            # Eventos (cancelamento/ciencia/etc) nao devem criar/sobrescrever nota fiscal.
             return None
 
         chave = self._extrair_chave_acesso(xml_doc)
@@ -905,7 +960,7 @@ class CapturaService:
             return None
 
         modelo = self._extrair_primeiro_texto_do_xml(xml_doc, ["mod", "modelo"]) or chave[20:22]
-        numero_nf = self._extrair_primeiro_texto_do_xml(xml_doc, ["nNF", "nNFe", "nDoc"]) or chave[25:34].lstrip("0") or chave[25:34]
+        numero_nf = self._extrair_primeiro_texto_do_xml(xml_doc, ["nNF", "nNFe", "nDoc", "nCT"]) or chave[25:34].lstrip("0") or chave[25:34]
         serie = self._extrair_primeiro_texto_do_xml(xml_doc, ["serie", "nSerie"]) or chave[22:25].lstrip("0") or chave[22:25]
         data_emissao = self._normalizar_data(
             self._extrair_primeiro_texto_do_xml(
@@ -916,7 +971,7 @@ class CapturaService:
         valor_total = self._normalizar_decimal(
             self._extrair_primeiro_texto_do_xml(
                 xml_doc,
-                ["vNF", "vLiq", "vProd", "vPrest", "vTPrest"],
+                ["vNF", "vLiq", "vProd", "vPrest", "vTPrest", "vCT"],
             )
         )
 
@@ -1566,6 +1621,51 @@ class CapturaService:
         except Exception:  # noqa: BLE001
             logger.exception("Falha ao limpar notas mock antigas para empresa_id=%s", empresa_id)
 
+    def _limpar_notas_evento_incorretas(self, db, empresa_id: str) -> int:
+        """
+        Remove registros antigos salvos indevidamente a partir de XML de evento.
+        Esses artefatos aparecem como NFe/NFCe/CTe com valor 0 e status processando.
+        """
+        try:
+            linhas = (
+                db.table("notas_fiscais")
+                .select("id, tipo_nf, valor_total, situacao, xml_completo")
+                .eq("empresa_id", empresa_id)
+                .in_("tipo_nf", ["NFe", "NFCe", "CTe"])
+                .order("data_emissao", desc=True)
+                .limit(5000)
+                .execute()
+            ).data or []
+
+            ids_remover: List[str] = []
+            for row in linhas:
+                valor = float(row.get("valor_total") or 0)
+                situacao = str(row.get("situacao") or "").strip().lower()
+                if valor > 0 and situacao != "processando":
+                    continue
+                xml_doc = str(row.get("xml_completo") or "")
+                if not xml_doc:
+                    continue
+                if not self._documento_eh_evento(schema="", xml_doc=xml_doc):
+                    continue
+                nota_id = str(row.get("id") or "").strip()
+                if nota_id:
+                    ids_remover.append(nota_id)
+
+            if not ids_remover:
+                return 0
+
+            # Supabase aceita lotes com IN; fragmenta por seguranca.
+            removidos = 0
+            for i in range(0, len(ids_remover), 500):
+                lote = ids_remover[i:i + 500]
+                db.table("notas_fiscais").delete().in_("id", lote).execute()
+                removidos += len(lote)
+            return removidos
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao limpar notas de evento incorretas da empresa_id=%s", empresa_id)
+            return 0
+
     def _resetar_cursor_nfse_token_bootstrap(self, db, empresa_id: str) -> None:
         """
         Reseta o token tecnico AUTO_CERT_A1 para disparar bootstrap de notas recentes.
@@ -1585,12 +1685,18 @@ class CapturaService:
 
             for cred in credenciais:
                 token = str(cred.get("token") or "").strip()
+                token_upper = token.upper()
                 usuario = str(cred.get("usuario") or "").strip().upper()
-                if not (token.upper().startswith("AUTO_CERT_A1") or usuario == "AUTO_CERT_A1"):
+                if not (token_upper.startswith("AUTO_CERT_A1") or usuario == "AUTO_CERT_A1"):
                     continue
 
                 cred_id = cred.get("id")
                 if not cred_id or token == "AUTO_CERT_A1|NSU:0":
+                    continue
+
+                # Quando a fase de prioridade recente ja concluiu (HOTDONE),
+                # nao reseta automaticamente para evitar looping infinito em bootstrap.
+                if "HOTDONE:1" in token_upper:
                     continue
 
                 db.table("credenciais_nfse").update({"token": "AUTO_CERT_A1|NSU:0"}).eq("id", cred_id).execute()
@@ -1630,7 +1736,7 @@ class CapturaService:
         return None
 
     def _extrair_chave_acesso(self, xml_doc: str) -> Optional[str]:
-        chave = self._extrair_texto_do_xml(xml_doc, "chNFe")
+        chave = self._extrair_primeiro_texto_do_xml(xml_doc, ["chNFe", "chCTe"])
         if chave and len(chave) == 44 and chave.isdigit():
             return chave
         if etree is None:
@@ -1722,7 +1828,13 @@ class CapturaService:
         return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
 
     def _mapear_tipo_nf(self, modelo: Optional[str]) -> str:
-        mapa = {"55": "NFe", "65": "NFCe", "57": "CTe"}
+        mapa = {
+            "55": "NFe",
+            "65": "NFCe",
+            "57": "CTe",
+            "67": "CTe",  # CT-e OS
+            "58": "CTe",  # MDF-e tratado como transporte para dashboard atual
+        }
         return mapa.get(str(modelo or ""), "NFe")
 
     def _mapear_situacao(self, codigo: Optional[str]) -> str:
