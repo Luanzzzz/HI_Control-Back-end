@@ -69,6 +69,8 @@ class CapturaService:
         db,
         reparar_incompletas: bool = False,
         reset_cursor_recente: bool = False,
+        intervalo_horas: int = 4,
+        tipos_permitidos: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         inicio = datetime.now(timezone.utc)
         logger.info("Captura SEFAZ iniciada para empresa_id=%s", empresa_id)
@@ -91,6 +93,9 @@ class CapturaService:
             self._resetar_cursor_nfse_token_bootstrap(db, empresa_id)
 
         progresso_inicio = datetime.now(timezone.utc)
+        intervalo_horas = max(1, min(24, int(intervalo_horas or 4)))
+        tipos_habilitados = self._normalizar_tipos_habilitados(tipos_permitidos)
+
         try:
             db.table("sync_empresas").update({"inicio_sync_at": progresso_inicio.isoformat()}).eq("empresa_id", empresa_id).execute()
         except Exception:  # noqa: BLE001
@@ -248,13 +253,16 @@ class CapturaService:
                     tipo_nf = str(nota.get("tipo_nf") or "desconhecido")
                     tipos_nf[tipo_nf] = tipos_nf.get(tipo_nf, 0) + 1
 
+            payload = self._filtrar_payload_por_tipos(payload, tipos_habilitados)
+
             logger.info(
-                "Documentos distribuidos empresa_id=%s total_docs=%s notas_validas=%s schemas=%s tipos_nf=%s",
+                "Documentos distribuidos empresa_id=%s total_docs=%s notas_validas=%s schemas=%s tipos_nf=%s tipos_habilitados=%s",
                 empresa_id,
                 len(documentos),
                 len(payload),
                 schemas,
                 tipos_nf,
+                tipos_habilitados,
             )
 
             self._atualizar_sync_progresso(
@@ -273,7 +281,11 @@ class CapturaService:
 
             aviso_sync: Optional[str] = None
             fallback_bloqueante = False
-            if not use_mock and self._deve_executar_fallback_nfse(cstat, len(payload)):
+            if (
+                not use_mock
+                and self._tipo_habilitado("NFSE", tipos_habilitados)
+                and self._deve_executar_fallback_nfse(cstat, len(payload))
+            ):
                 self._atualizar_sync_progresso(
                     db=db,
                     empresa_id=empresa_id,
@@ -341,6 +353,7 @@ class CapturaService:
                     max_nsu,
                     notas_processadas,
                     notas_novas,
+                    intervalo_horas=intervalo_horas,
                     mensagem=aviso_sync,
                 )
 
@@ -1527,6 +1540,7 @@ class CapturaService:
         max_nsu: int,
         notas_processadas: int,
         notas_novas: int,
+        intervalo_horas: int = 4,
         mensagem: Optional[str] = None,
     ) -> None:
         total_atual = int((sync_state or {}).get("total_notas_capturadas") or 0)
@@ -1535,7 +1549,7 @@ class CapturaService:
                 "ultimo_nsu": int(ultimo_nsu),
                 "max_nsu": int(max_nsu),
                 "ultima_sync": datetime.now(timezone.utc).isoformat(),
-                "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+                "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=max(1, min(24, int(intervalo_horas or 4))))).isoformat(),
                 "status": "ok",
                 "notas_capturadas_ultima_sync": int(notas_processadas),
                 "total_notas_capturadas": total_atual + int(notas_novas),
@@ -2019,6 +2033,29 @@ class CapturaService:
             "58": "CTe",  # MDF-e tratado como transporte para dashboard atual
         }
         return mapa.get(str(modelo or ""), "NFe")
+
+    def _normalizar_tipos_habilitados(self, tipos_permitidos: Optional[List[str]]) -> List[str]:
+        if not tipos_permitidos:
+            return ["NFSE", "NFE", "NFCE", "CTE"]
+        out: List[str] = []
+        for item in tipos_permitidos:
+            token = str(item or "").strip().upper()
+            if token in {"NFSE", "NFE", "NFCE", "CTE"} and token not in out:
+                out.append(token)
+        return out or ["NFSE", "NFE", "NFCE", "CTE"]
+
+    def _tipo_habilitado(self, tipo: str, tipos_habilitados: List[str]) -> bool:
+        return str(tipo or "").strip().upper() in set(tipos_habilitados or [])
+
+    def _filtrar_payload_por_tipos(self, payload: List[Dict[str, Any]], tipos_habilitados: List[str]) -> List[Dict[str, Any]]:
+        if not payload:
+            return payload
+        permitidos = set(tipos_habilitados or [])
+        if not permitidos:
+            return []
+        mapa = {"NFE": "NFe", "NFCE": "NFCe", "CTE": "CTe", "NFSE": "NFSe"}
+        tipos_front = {mapa[t] for t in permitidos if t in mapa}
+        return [item for item in payload if str(item.get("tipo_nf") or "") in tipos_front]
 
     def _mapear_situacao(self, codigo: Optional[str]) -> str:
         mapa = {

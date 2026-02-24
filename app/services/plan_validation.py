@@ -40,6 +40,13 @@ class PlanLimits:
         "max_notas_mes": 99999,
     }
 
+    ADMIN = {
+        "historico_dias": None,  # Ilimitado
+        "max_empresas": 9999,
+        "max_consultas_dia": 99999,
+        "max_notas_mes": 999999,
+    }
+
 
 async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
     """
@@ -97,10 +104,11 @@ async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
             "profissional": PlanLimits.PREMIUM,  # Mapeamento para compatibilidade
             "premium": PlanLimits.PREMIUM,
             "enterprise": PlanLimits.ENTERPRISE,
+            "admin": PlanLimits.ADMIN,
         }
-        
+
         limites = limites_map.get(plano_nome, PlanLimits.BASICO)
-        
+
         # Padronizar nome para "premium" se for "profissional"
         nome_padrao = "premium" if plano_nome == "profissional" else plano_nome
         

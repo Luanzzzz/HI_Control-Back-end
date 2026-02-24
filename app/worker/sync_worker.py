@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.services.captura_sefaz_service import captura_service
+from app.services import sync_config_service
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,19 @@ def run_sync_cycle(db=None) -> None:
         logger.info("Sync cycle: nenhuma empresa elegivel")
         return
 
+    empresa_ids = [r.get("empresa_id") for r in elegiveis if r.get("empresa_id")]
+    empresa_usuario_map = {}
+    if empresa_ids:
+        try:
+            empresa_resp = db.table("empresas").select("id, usuario_id").in_("id", empresa_ids).execute()
+            empresa_usuario_map = {
+                str(x.get("id")): str(x.get("usuario_id") or "")
+                for x in (empresa_resp.data or [])
+                if x.get("id")
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Falha ao carregar empresas para configuracao de sync: %s", exc)
+
     logger.info("Sync cycle iniciado: %s empresas elegiveis", len(elegiveis))
     for row in elegiveis:
         empresa_id = row.get("empresa_id")
@@ -61,11 +75,47 @@ def run_sync_cycle(db=None) -> None:
             continue
 
         try:
+            usuario_id = empresa_usuario_map.get(str(empresa_id))
+            resolved = sync_config_service.resolve_empresa_config(
+                db=db,
+                empresa_id=str(empresa_id),
+                usuario_id=usuario_id,
+            )
+            cfg = resolved.get("configuracao_efetiva") or {}
+            janela = sync_config_service.evaluate_schedule_window(cfg)
+
+            if not cfg.get("auto_sync_ativo", True):
+                db.table("sync_empresas").update(
+                    {
+                        "status": "pendente",
+                        "erro_mensagem": "Sincronizacao automatica desativada na configuracao.",
+                        "proximo_sync": (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat(),
+                    }
+                ).eq("empresa_id", empresa_id).execute()
+                continue
+
+            if not janela.get("agora_na_janela", True):
+                db.table("sync_empresas").update(
+                    {
+                        "status": "pendente",
+                        "erro_mensagem": None,
+                        "proximo_sync": janela.get("proximo_inicio_janela_utc"),
+                    }
+                ).eq("empresa_id", empresa_id).execute()
+                continue
+
             db.table("sync_empresas").update({"status": "sincronizando", "erro_mensagem": None}).eq(
                 "empresa_id", empresa_id
             ).execute()
 
-            resultado = captura_service.sincronizar_empresa(empresa_id, db)
+            resultado = captura_service.sincronizar_empresa(
+                empresa_id,
+                db,
+                reparar_incompletas=bool(cfg.get("reparar_incompletas", True)),
+                reset_cursor_recente=bool(cfg.get("prioridade_recente", False)),
+                intervalo_horas=int(cfg.get("intervalo_horas") or 4),
+                tipos_permitidos=list(cfg.get("tipos_notas") or []),
+            )
             status_final = resultado.get("status", "erro")
 
             payload = {"status": status_final}
