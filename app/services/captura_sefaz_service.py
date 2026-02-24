@@ -238,19 +238,23 @@ class CapturaService:
 
             payload = []
             schemas: Dict[str, int] = {}
+            tipos_nf: Dict[str, int] = {}
             for doc in documentos:
                 schema = str(doc.get("schema") or "desconhecido")
                 schemas[schema] = schemas.get(schema, 0) + 1
                 nota = self._montar_payload_nota(doc, cnpj_empresa, empresa_id)
                 if nota:
                     payload.append(nota)
+                    tipo_nf = str(nota.get("tipo_nf") or "desconhecido")
+                    tipos_nf[tipo_nf] = tipos_nf.get(tipo_nf, 0) + 1
 
             logger.info(
-                "Documentos distribuidos empresa_id=%s total_docs=%s notas_validas=%s schemas=%s",
+                "Documentos distribuidos empresa_id=%s total_docs=%s notas_validas=%s schemas=%s tipos_nf=%s",
                 empresa_id,
                 len(documentos),
                 len(payload),
                 schemas,
+                tipos_nf,
             )
 
             self._atualizar_sync_progresso(
@@ -846,9 +850,15 @@ class CapturaService:
                 "resCTe",
                 "procCTe",
                 "CTe",
+                "resCTeOS",
+                "procCTeOS",
+                "CTeOS",
                 "resNFCe",
                 "procNFCe",
                 "NFCe",
+                "resMDFe",
+                "procMDFe",
+                "MDFe",
             }:
                 candidatos.append(child)
 
@@ -959,34 +969,76 @@ class CapturaService:
         if not chave:
             return None
 
-        modelo = self._extrair_primeiro_texto_do_xml(xml_doc, ["mod", "modelo"]) or chave[20:22]
-        numero_nf = self._extrair_primeiro_texto_do_xml(xml_doc, ["nNF", "nNFe", "nDoc", "nCT"]) or chave[25:34].lstrip("0") or chave[25:34]
-        serie = self._extrair_primeiro_texto_do_xml(xml_doc, ["serie", "nSerie"]) or chave[22:25].lstrip("0") or chave[22:25]
+        modelo = self._inferir_modelo_documento(xml_doc=xml_doc, schema=schema, chave=chave)
+        numero_nf = (
+            self._extrair_primeiro_texto_do_xml(xml_doc, self._tags_numero_por_modelo(modelo))
+            or chave[25:34].lstrip("0")
+            or chave[25:34]
+        )
+        serie = (
+            self._extrair_primeiro_texto_do_xml(xml_doc, self._tags_serie_por_modelo(modelo))
+            or chave[22:25].lstrip("0")
+            or chave[22:25]
+        )
         data_emissao = self._normalizar_data(
             self._extrair_primeiro_texto_do_xml(
                 xml_doc,
-                ["dhEmi", "dEmi", "dhSaiEnt", "dhRegEvento", "dhEvento", "dhRecbto", "dhProc"],
+                self._tags_data_por_modelo(modelo),
             )
         )
         valor_total = self._normalizar_decimal(
             self._extrair_primeiro_texto_do_xml(
                 xml_doc,
-                ["vNF", "vLiq", "vProd", "vPrest", "vTPrest", "vCT"],
+                self._tags_valor_por_modelo(modelo),
             )
         )
 
-        cnpj_emitente = self._normalizar_cnpj(
-            self._extrair_primeiro_texto_do_xml(xml_doc, ["CNPJEmit", "CNPJ", "emit_CNPJ"])
-        ) or self._normalizar_cnpj(chave[6:20])
+        cnpj_emitente = (
+            self._normalizar_cnpj(
+                self._extrair_texto_em_secoes(
+                    xml_doc,
+                    self._secoes_emitente_por_modelo(modelo),
+                    self._tags_emitente_cnpj_por_modelo(modelo),
+                )
+            )
+            or self._normalizar_cnpj(
+                self._extrair_primeiro_texto_do_xml(xml_doc, self._tags_emitente_cnpj_por_modelo(modelo))
+            )
+            or self._normalizar_cnpj(chave[6:20])
+        )
         cnpj_destinatario = self._normalizar_cnpj(
-            self._extrair_primeiro_texto_do_xml(xml_doc, ["CNPJDest", "dest_CNPJ", "CPFDest"])
+            self._extrair_texto_em_secoes(
+                xml_doc,
+                self._secoes_destinatario_por_modelo(modelo),
+                self._tags_destinatario_cnpj_por_modelo(modelo),
+            )
+        ) or self._normalizar_cnpj(
+            self._extrair_primeiro_texto_do_xml(
+                xml_doc,
+                ["CNPJDest", "dest_CNPJ", "CNPJReceb", "CNPJTom", "CNPJToma"],
+            )
         )
 
         nome_emitente = (
-            self._extrair_primeiro_texto_do_xml(xml_doc, ["xNomeEmit", "xFant", "xNome"])
+            self._extrair_texto_em_secoes(
+                xml_doc,
+                self._secoes_emitente_por_modelo(modelo),
+                self._tags_emitente_nome_por_modelo(modelo),
+            )
+            or self._extrair_primeiro_texto_do_xml(xml_doc, self._tags_emitente_nome_por_modelo(modelo))
             or ""
         )
-        nome_destinatario = self._extrair_primeiro_texto_do_xml(xml_doc, ["xNomeDest", "xNome"])
+        nome_destinatario = (
+            self._extrair_texto_em_secoes(
+                xml_doc,
+                self._secoes_destinatario_por_modelo(modelo),
+                self._tags_destinatario_nome_por_modelo(modelo),
+            )
+            or self._extrair_primeiro_texto_do_xml(
+                xml_doc,
+                self._tags_destinatario_nome_por_modelo(modelo),
+            )
+        )
 
         tipo_operacao = "entrada"
         if cnpj_emitente == cnpj_empresa:
@@ -997,21 +1049,26 @@ class CapturaService:
             tp_nf = self._extrair_texto_do_xml(xml_doc, "tpNF")
             if tp_nf == "1":
                 tipo_operacao = "saida"
+            elif tp_nf == "0":
+                tipo_operacao = "entrada"
 
         tp_evento = self._extrair_texto_do_xml(xml_doc, "tpEvento")
         if tp_evento and valor_total <= 0 and not self._extrair_texto_do_xml(xml_doc, "nNF"):
             # XML de evento sem corpo da nota: nao deve sobrescrever dados da nota fiscal.
             return None
         situacao = self._mapear_situacao(
-            self._extrair_primeiro_texto_do_xml(xml_doc, ["cSitNFe", "cStat", "cSit", "cStatProc"]) or tp_evento
+            self._extrair_primeiro_texto_do_xml(
+                xml_doc,
+                ["cSitNFe", "cSitCTe", "cStat", "cSit", "cStatProc", "cStatCTe"],
+            ) or tp_evento
         )
         if tp_evento in {"110111", "110112", "110110"}:
             situacao = "cancelada"
         elif situacao == "processando" and (valor_total > 0 or numero_nf):
             situacao = "autorizada"
 
-        protocolo = self._extrair_texto_do_xml(xml_doc, "nProt")
-        xml_resumo = xml_doc if ("resNFe" in (doc.get("schema") or "") or "<resNFe" in xml_doc) else None
+        protocolo = self._extrair_primeiro_texto_do_xml(xml_doc, ["nProt", "nProtCTe", "nProtNFe"])
+        xml_resumo = xml_doc if self._documento_eh_resumo(schema=schema, xml_doc=str(xml_doc)) else None
 
         if not numero_nf and valor_total <= 0 and not nome_emitente:
             # Payload muito incompleto tende a vir de eventos/artefatos que nao devem gerar nota.
@@ -1039,6 +1096,124 @@ class CapturaService:
             "xml_resumo": xml_resumo,
             "ambiente": self._ambiente_norm(),
         }
+
+    def _inferir_modelo_documento(self, xml_doc: str, schema: str, chave: str) -> str:
+        modelo = self._extrair_primeiro_texto_do_xml(xml_doc, ["mod", "modelo", "modCT", "modDF"])
+        if modelo and str(modelo).isdigit():
+            return str(modelo)
+
+        if chave and len(chave) >= 22 and chave[20:22].isdigit():
+            return chave[20:22]
+
+        schema_norm = str(schema or "").lower()
+        if "cteos" in schema_norm:
+            return "67"
+        if "mdfe" in schema_norm:
+            return "58"
+        if "cte" in schema_norm:
+            return "57"
+        if "nfce" in schema_norm:
+            return "65"
+        if "nfe" in schema_norm:
+            return "55"
+        return "55"
+
+    def _tags_numero_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["nCT", "nCTe", "nDoc", "nNF"]
+        if str(modelo) == "65":
+            return ["nNF", "nNFe", "nCFe", "nDoc"]
+        return ["nNF", "nNFe", "nDoc", "nCT"]
+
+    def _tags_serie_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["serie", "nSerie", "serieCTe"]
+        return ["serie", "nSerie"]
+
+    def _tags_data_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["dhEmi", "dEmi", "dhEmissao", "dhRecbto", "dhProc", "dhEvento", "dhRegEvento"]
+        return ["dhEmi", "dEmi", "dhSaiEnt", "dhRecbto", "dhProc", "dhEvento", "dhRegEvento"]
+
+    def _tags_valor_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["vTPrest", "vPrest", "vCT", "vRec", "vCarga", "vNF", "vProd"]
+        if str(modelo) == "65":
+            return ["vNF", "vProd", "vLiq", "vCT"]
+        return ["vNF", "vLiq", "vProd", "vPrest", "vTPrest", "vCT"]
+
+    def _tags_emitente_cnpj_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["CNPJ", "CNPJEmit", "emit_CNPJ", "CNPJRem", "CNPJExped", "CNPJPrest"]
+        return ["CNPJ", "CNPJEmit", "emit_CNPJ"]
+
+    def _tags_destinatario_cnpj_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return [
+                "CNPJ",
+                "CNPJDest",
+                "CNPJReceb",
+                "CNPJTom",
+                "CNPJToma",
+                "CPF",
+                "CPFReceb",
+                "CPFTom",
+                "CPFDest",
+            ]
+        # Em NFe/NFCe permitimos "CNPJ" apenas no bloco "dest" (sem busca global),
+        # evitando capturar CNPJ do emitente por engano.
+        return ["CNPJ", "CNPJDest", "dest_CNPJ", "CPF", "CPFDest"]
+
+    def _tags_emitente_nome_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["xNomeEmit", "xNomeRem", "xNomePrest", "xFant", "xNome"]
+        return ["xNomeEmit", "xFant", "xNome"]
+
+    def _tags_destinatario_nome_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["xNomeDest", "xNomeReceb", "xNomeTom", "xNome"]
+        return ["xNomeDest", "xNome"]
+
+    def _secoes_emitente_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            return ["emit", "prest", "rem"]
+        return ["emit"]
+
+    def _secoes_destinatario_por_modelo(self, modelo: str) -> List[str]:
+        if str(modelo) in {"57", "67", "58"}:
+            # rem e fallback extremo para CTe antigo sem bloco dest/receb/toma.
+            return ["dest", "receb", "toma", "exped", "rem"]
+        return ["dest"]
+
+    def _extrair_texto_em_secoes(self, xml_doc: str, secoes: List[str], campos: List[str]) -> Optional[str]:
+        if etree is None:
+            return None
+        try:
+            root = etree.fromstring(xml_doc.encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+        for secao in secoes:
+            nos_secao = root.xpath(f".//*[local-name()='{secao}']")
+            for no in nos_secao:
+                for campo in campos:
+                    encontrados = no.xpath(f".//*[local-name()='{campo}']")
+                    if not encontrados:
+                        # tambem checa filho direto para reduzir falsos positivos
+                        encontrados = no.xpath(f"./*[local-name()='{campo}']")
+                    if not encontrados:
+                        continue
+                    valor = (encontrados[0].text or "").strip()
+                    if valor:
+                        return valor
+        return None
+
+    def _documento_eh_resumo(self, schema: str, xml_doc: str) -> bool:
+        schema_norm = str(schema or "").lower()
+        if any(token in schema_norm for token in ("resnfe", "rescte", "resnfce")):
+            return True
+        raiz = self._extrair_raiz_local_name(xml_doc)
+        return raiz in {"resnfe", "rescte", "resnfce"}
 
     def _upsert_notas(self, db, payload: List[Dict[str, Any]]) -> Tuple[int, int]:
         if not payload:
@@ -1744,7 +1919,8 @@ class CapturaService:
         try:
             root = etree.fromstring(xml_doc.encode("utf-8"))
             inf_nfe = root.xpath(".//*[local-name()='infNFe']")
-            if not inf_nfe:
+            inf_cte = root.xpath(".//*[local-name()='infCte']")
+            if not inf_nfe and not inf_cte:
                 id_attr = root.xpath(".//@Id")
                 for ident in id_attr:
                     ident = str(ident or "")
@@ -1756,11 +1932,18 @@ class CapturaService:
                     if match_evento:
                         return match_evento.group(1)
             else:
-                ident = inf_nfe[0].attrib.get("Id", "")
-                if ident.startswith("NFe"):
-                    chave = ident[3:]
-                    if len(chave) == 44 and chave.isdigit():
-                        return chave
+                if inf_nfe:
+                    ident_nfe = inf_nfe[0].attrib.get("Id", "")
+                    if ident_nfe.startswith("NFe"):
+                        chave = ident_nfe[3:]
+                        if len(chave) == 44 and chave.isdigit():
+                            return chave
+                if inf_cte:
+                    ident_cte = inf_cte[0].attrib.get("Id", "")
+                    if ident_cte.startswith("CTe"):
+                        chave = ident_cte[3:]
+                        if len(chave) == 44 and chave.isdigit():
+                            return chave
         except Exception:  # noqa: BLE001
             pass
 
