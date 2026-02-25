@@ -171,6 +171,87 @@ def _parece_pdf(content_type: Optional[str], content: bytes) -> bool:
     return content.startswith(b"%PDF-")
 
 
+def _url_eh_tecnica_assinatura(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return True
+
+    host = (parsed.hostname or "").lower()
+    caminho = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    texto = f"{host} {caminho} {query}"
+
+    hosts_tecnicos = (
+        "w3.org",
+        "etsi.org",
+        "xmlsoap.org",
+        "nist.gov",
+        "csrc.nist.gov",
+        "schema.org",
+    )
+    if any(h in host for h in hosts_tecnicos):
+        return True
+
+    marcadores_tecnicos = (
+        "xmldsig",
+        "xmlenc",
+        "xades",
+        "canonicalization",
+        "fips",
+        "sha256",
+        "rsa-sha",
+    )
+    return any(m in texto for m in marcadores_tecnicos)
+
+
+def _url_parece_portal_fiscal(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if _url_eh_tecnica_assinatura(url):
+        return False
+
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    texto = f"{host} {path} {query}"
+
+    sinais_fiscais = (
+        "nfse",
+        "nfs-e",
+        "danfse",
+        "nota",
+        "consulta",
+        "visualiz",
+        "imprimir",
+        "download",
+        "dps",
+        "chave",
+        "verifica",
+        "codigo",
+        "sefaz",
+        "sefin",
+        "prefeitura",
+        "fazenda",
+        "tribut",
+        "iss",
+    )
+
+    if any(s in texto for s in sinais_fiscais):
+        return True
+
+    # Alguns portais municipais usam dominio gov.br sem "nfse" no path.
+    if host.endswith(".gov.br") and any(s in query for s in ("chave", "codigo", "numero", "verificacao")):
+        return True
+
+    return False
+
+
 def _url_aceita_para_download_oficial(url: str) -> bool:
     try:
         parsed = urlparse(url.strip())
@@ -198,6 +279,7 @@ def _url_aceita_para_download_oficial(url: str) -> bool:
 
 def _extrair_candidatos_pdf_do_html(html: str, base_url: str) -> List[str]:
     candidatos: List[str] = []
+    base_host = (urlparse(base_url).hostname or "").lower()
     padroes = [
         r'href=["\']([^"\']+)["\']',
         r'src=["\']([^"\']+)["\']',
@@ -227,7 +309,16 @@ def _extrair_candidatos_pdf_do_html(html: str, base_url: str) -> List[str]:
                 # Mantemos caminhos com querystring para nova tentativa.
                 if "?" not in valor_low:
                     continue
-            candidatos.append(urljoin(base_url, valor))
+            candidato_url = urljoin(base_url, valor)
+            if not _url_aceita_para_download_oficial(candidato_url):
+                continue
+            if _url_eh_tecnica_assinatura(candidato_url):
+                continue
+
+            host_candidato = (urlparse(candidato_url).hostname or "").lower()
+            if base_host and host_candidato and host_candidato != base_host and not _url_parece_portal_fiscal(candidato_url):
+                continue
+            candidatos.append(candidato_url)
 
     vistos = set()
     unicos: List[str] = []
@@ -255,6 +346,7 @@ async def _download_url(url: str, timeout_sec: float = 20.0) -> Tuple[bytes, str
 
 
 async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
+    tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
     candidatos = [
         str(nota.get("pdf_url") or "").strip(),
         str(nota.get("link_visualizacao") or "").strip(),
@@ -284,6 +376,12 @@ async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
     for url in candidatos:
         if not url:
             continue
+        if _url_eh_tecnica_assinatura(url):
+            logger.debug("Ignorando URL tecnica na busca de PDF oficial: %s", url)
+            continue
+        if tipo_nf_interno == "NFSE" and not _url_parece_portal_fiscal(url):
+            logger.debug("Ignorando URL nao fiscal para NFS-e: %s", url)
+            continue
         if url in vistos:
             continue
         vistos.add(url)
@@ -297,9 +395,13 @@ async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
                 return conteudo
 
             if "html" in content_type.lower():
+                if tipo_nf_interno == "NFSE" and not _url_parece_portal_fiscal(url):
+                    continue
                 html = conteudo.decode("utf-8", errors="ignore")
                 for candidato_pdf in _extrair_candidatos_pdf_do_html(html, url):
                     try:
+                        if tipo_nf_interno == "NFSE" and not _url_parece_portal_fiscal(candidato_pdf):
+                            continue
                         conteudo_pdf, content_type_pdf = await _download_url(candidato_pdf)
                         if _parece_pdf(content_type_pdf, conteudo_pdf):
                             logger.info(

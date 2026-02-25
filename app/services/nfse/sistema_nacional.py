@@ -780,11 +780,68 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             return ""
         return url
 
-    def _coletar_urls_no_xml(self, xml_doc: str) -> List[str]:
+    def _url_eh_tecnica_assinatura(self, url: str) -> bool:
+        url_lower = str(url or "").lower()
+        if not url_lower:
+            return True
+
+        bloqueios = (
+            "w3.org",
+            "etsi.org",
+            "xmlsoap.org",
+            "nist.gov",
+            "csrc.nist.gov",
+            "schema.org",
+            "xmldsig",
+            "xmlenc",
+            "xades",
+            "canonicalization",
+            "fips",
+            "sha256",
+            "rsa-sha",
+        )
+        return any(item in url_lower for item in bloqueios)
+
+    def _url_parece_relevante_nfse(self, url: str) -> bool:
+        if not url:
+            return False
+        if self._url_eh_tecnica_assinatura(url):
+            return False
+
+        texto = str(url).lower()
+        sinais = (
+            "nfse",
+            "nfs-e",
+            "danfse",
+            "consulta",
+            "visualiz",
+            "imprimir",
+            "download",
+            "nota",
+            "chave",
+            "codigo",
+            "verificacao",
+            "dps",
+            "sefin",
+            "sefaz",
+            "prefeitura",
+            "fazenda",
+            "tribut",
+            "iss",
+            "gov.br",
+            ".pdf",
+        )
+        return any(s in texto for s in sinais)
+
+    def _coletar_urls_no_xml(self, xml_doc: str, somente_relevantes: bool = True) -> List[str]:
         urls: List[str] = []
         for encontrado in re.findall(r'https?://[^"\'>\s]+', str(xml_doc or ""), flags=re.IGNORECASE):
             normalizada = self._normalizar_url(encontrado)
             if normalizada:
+                if self._url_eh_tecnica_assinatura(normalizada):
+                    continue
+                if somente_relevantes and not self._url_parece_relevante_nfse(normalizada):
+                    continue
                 urls.append(normalizada)
         return urls
 
@@ -818,7 +875,7 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             "Url",
         ]:
             valor = self._normalizar_url(str(item_dfe.get(key) or ""))
-            if valor:
+            if valor and self._url_parece_relevante_nfse(valor):
                 candidatos.append(valor)
 
         # Campos potenciais dentro do XML
@@ -833,11 +890,11 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             "QRCode",
         ]:
             valor = self._normalizar_url(self._find_first_text(inf_nfse, [name]) or "")
-            if valor:
+            if valor and self._url_parece_relevante_nfse(valor):
                 candidatos.append(valor)
 
         # URLs em texto livre do XML
-        candidatos.extend(self._coletar_urls_no_xml(xml_doc))
+        candidatos.extend(self._coletar_urls_no_xml(xml_doc, somente_relevantes=True))
 
         # Template configuravel para provedores que exigem URL de consulta customizada
         template = str(os.getenv("NFSE_LINK_VISUALIZACAO_TEMPLATE", "") or "").strip()
@@ -850,7 +907,7 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                     cnpj_prestador=self.limpar_cnpj(self._find_text(self._find_node(inf_nfse, "emit"), "CNPJ") or ""),
                 )
                 normalizada = self._normalizar_url(url_template)
-                if normalizada:
+                if normalizada and self._url_parece_relevante_nfse(normalizada):
                     candidatos.append(normalizada)
             except Exception:  # noqa: BLE001
                 pass
@@ -885,14 +942,14 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             "UrlDanfsePdf",
         ]:
             valor = self._normalizar_url(str(item_dfe.get(key) or ""))
-            if valor:
+            if valor and self._url_parece_relevante_nfse(valor):
                 candidatos.append(valor)
 
-        for url in self._coletar_urls_no_xml(xml_doc):
+        for url in self._coletar_urls_no_xml(xml_doc, somente_relevantes=True):
             if ".pdf" in url.lower():
                 candidatos.append(url)
 
-        if link_visualizacao and ".pdf" in link_visualizacao.lower():
+        if link_visualizacao and ".pdf" in link_visualizacao.lower() and self._url_parece_relevante_nfse(link_visualizacao):
             candidatos.append(link_visualizacao)
 
         vistos = set()
