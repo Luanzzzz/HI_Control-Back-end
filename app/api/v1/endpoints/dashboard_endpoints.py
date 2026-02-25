@@ -3,6 +3,7 @@ Endpoint agregado de dashboard por empresa.
 """
 from __future__ import annotations
 
+import html
 import io
 import ipaddress
 import logging
@@ -11,7 +12,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -252,6 +253,27 @@ def _url_parece_portal_fiscal(url: str) -> bool:
     return False
 
 
+def _normalizar_url_candidata(url: str) -> str:
+    valor = html.unescape(str(url or "").strip().strip("\"'"))
+    if not valor:
+        return ""
+
+    # Alguns XMLs trazem URL encodada (ex.: https%3A%2F%2F...)
+    for _ in range(2):
+        decodificada = unquote(valor)
+        if decodificada == valor:
+            break
+        if decodificada.lower().startswith(("http://", "https://")):
+            valor = decodificada
+        else:
+            break
+
+    valor = html.unescape(valor)
+    # Remove lixo comum no fim de extrações por regex/html.
+    valor = valor.rstrip(")]};,")
+    return valor
+
+
 def _url_aceita_para_download_oficial(url: str) -> bool:
     try:
         parsed = urlparse(url.strip())
@@ -289,7 +311,7 @@ def _extrair_candidatos_pdf_do_html(html: str, base_url: str) -> List[str]:
 
     for padrao in padroes:
         for match in re.finditer(padrao, html, flags=re.IGNORECASE):
-            valor = (match.group(1) or "").strip()
+            valor = _normalizar_url_candidata(match.group(1) or "")
             if not valor:
                 continue
             valor_low = valor.lower()
@@ -345,17 +367,19 @@ async def _download_url(url: str, timeout_sec: float = 20.0) -> Tuple[bytes, str
         return resp.content, str(resp.headers.get("content-type") or "")
 
 
-async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
+def _coletar_candidatos_url_oficiais_nota(nota: Dict[str, Any]) -> List[str]:
     tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
-    candidatos = [
-        str(nota.get("pdf_url") or "").strip(),
-        str(nota.get("link_visualizacao") or "").strip(),
+    candidatos_brutos = [
+        nota.get("pdf_url"),
+        nota.get("link_visualizacao"),
     ]
 
     xml_content = str(nota.get("xml_completo") or nota.get("xml_resumo") or "").strip()
     if xml_content:
         for encontrado in re.findall(r'https?://[^"\'>\s]+', xml_content, flags=re.IGNORECASE):
-            candidatos.append(encontrado.strip())
+            candidatos_brutos.append(encontrado.strip())
+        for encontrado in re.findall(r'https?%3a%2f%2f[^"\'>\s]+', xml_content, flags=re.IGNORECASE):
+            candidatos_brutos.append(encontrado.strip())
 
     template_link = str(os.getenv("NFSE_LINK_VISUALIZACAO_TEMPLATE", "") or "").strip()
     if template_link:
@@ -367,25 +391,44 @@ async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
                 cnpj_prestador=str(nota.get("cnpj_emitente") or ""),
             ).strip()
             if url_tpl:
-                candidatos.append(url_tpl)
+                candidatos_brutos.append(url_tpl)
         except Exception:  # noqa: BLE001
             logger.debug("Template NFSE_LINK_VISUALIZACAO_TEMPLATE invalido.", exc_info=True)
 
     candidatos_limpos: List[str] = []
     vistos = set()
-    for url in candidatos:
+    for url in candidatos_brutos:
+        url = _normalizar_url_candidata(str(url or ""))
         if not url:
             continue
         if _url_eh_tecnica_assinatura(url):
-            logger.debug("Ignorando URL tecnica na busca de PDF oficial: %s", url)
+            logger.debug("Ignorando URL tecnica na busca de link oficial: %s", url)
             continue
         if tipo_nf_interno == "NFSE" and not _url_parece_portal_fiscal(url):
-            logger.debug("Ignorando URL nao fiscal para NFS-e: %s", url)
+            logger.debug("Ignorando URL nao fiscal para NFS-e em link oficial: %s", url)
             continue
         if url in vistos:
             continue
         vistos.add(url)
         candidatos_limpos.append(url)
+    return candidatos_limpos
+
+
+def _parece_pagina_404(html_content: str) -> bool:
+    texto = str(html_content or "").lower()
+    sinais_404 = (
+        "404 - file or directory not found",
+        "404 not found",
+        "resource you are looking for might have been removed",
+        "recurso não encontrado",
+        "resource not found",
+    )
+    return any(s in texto for s in sinais_404)
+
+
+async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
+    tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
+    candidatos_limpos = _coletar_candidatos_url_oficiais_nota(nota)
 
     for url in candidatos_limpos:
         try:
@@ -397,8 +440,10 @@ async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
             if "html" in content_type.lower():
                 if tipo_nf_interno == "NFSE" and not _url_parece_portal_fiscal(url):
                     continue
-                html = conteudo.decode("utf-8", errors="ignore")
-                for candidato_pdf in _extrair_candidatos_pdf_do_html(html, url):
+                html_content = conteudo.decode("utf-8", errors="ignore")
+                if _parece_pagina_404(html_content):
+                    continue
+                for candidato_pdf in _extrair_candidatos_pdf_do_html(html_content, url):
                     try:
                         if tipo_nf_interno == "NFSE" and not _url_parece_portal_fiscal(candidato_pdf):
                             continue
@@ -419,6 +464,38 @@ async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
                         continue
         except Exception:  # noqa: BLE001
             logger.debug("Falha ao tentar baixar PDF oficial da nota_id=%s URL=%s", nota.get("id"), url, exc_info=True)
+            continue
+
+    return None
+
+
+async def _resolver_url_oficial_visualizacao_nota(nota: Dict[str, Any]) -> Optional[str]:
+    tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
+    candidatos = _coletar_candidatos_url_oficiais_nota(nota)
+
+    for url in candidatos:
+        try:
+            conteudo, content_type = await _download_url(url)
+            if _parece_pdf(content_type, conteudo):
+                return url
+
+            if "html" in content_type.lower():
+                html_content = conteudo.decode("utf-8", errors="ignore")
+                if _parece_pagina_404(html_content):
+                    continue
+
+                for candidato_pdf in _extrair_candidatos_pdf_do_html(html_content, url):
+                    if tipo_nf_interno == "NFSE" and not _url_parece_portal_fiscal(candidato_pdf):
+                        continue
+                    try:
+                        conteudo_pdf, content_type_pdf = await _download_url(candidato_pdf)
+                        if _parece_pdf(content_type_pdf, conteudo_pdf):
+                            return candidato_pdf
+                    except Exception:  # noqa: BLE001
+                        continue
+
+                return url
+        except Exception:  # noqa: BLE001
             continue
 
     return None
@@ -1043,3 +1120,41 @@ async def baixar_pdf_nota_empresa(
             "X-HiControl-Pdf-Source": source,
         },
     )
+
+
+@router.get("/{empresa_id}/notas/{nota_id}/portal-oficial")
+async def obter_portal_oficial_nota_empresa(
+    empresa_id: str,
+    nota_id: str,
+    usuario: Dict[str, Any] = Depends(get_current_user),
+    db: Client = Depends(get_admin_db),
+):
+    await _validar_empresa_usuario(db, empresa_id, usuario["id"])
+
+    resp = (
+        db.table("notas_fiscais")
+        .select(
+            "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, valor_total, "
+            "cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, situacao, municipio_nome, "
+            "xml_completo, xml_resumo, link_visualizacao, pdf_url, codigo_verificacao"
+        )
+        .eq("empresa_id", empresa_id)
+        .eq("id", nota_id)
+        .limit(1)
+        .execute()
+    )
+    nota = (resp.data or [None])[0]
+    if not nota:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nota nao encontrada para esta empresa",
+        )
+
+    url_oficial = await _resolver_url_oficial_visualizacao_nota(nota)
+    if not url_oficial:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Link oficial da nota indisponivel no momento",
+        )
+
+    return {"url": url_oficial}
