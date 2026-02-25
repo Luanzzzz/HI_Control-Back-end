@@ -587,7 +587,7 @@ async def get_dashboard_empresa(
         .select(
             "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, "
             "valor_total, cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, "
-            "situacao, municipio_nome, fonte"
+            "situacao, municipio_nome, fonte, link_visualizacao"
         )
         .eq("empresa_id", empresa_id)
         .gte("data_emissao", inicio_mes.isoformat())
@@ -704,7 +704,7 @@ async def listar_notas_empresa(
     colunas = (
         "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, "
         "valor_total, cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, "
-        "situacao, municipio_nome, fonte, valor_iss, valor_pis, valor_cofins"
+        "situacao, municipio_nome, fonte, link_visualizacao, valor_iss, valor_pis, valor_cofins"
     )
     offset = (pagina - 1) * limite
 
