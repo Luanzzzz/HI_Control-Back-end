@@ -211,8 +211,22 @@ def _extrair_candidatos_pdf_do_html(html: str, base_url: str) -> List[str]:
             if not valor:
                 continue
             valor_low = valor.lower()
-            if ".pdf" not in valor_low and "pdf" not in valor_low and "danfse" not in valor_low and "imprimir" not in valor_low:
-                continue
+            termos_relevantes = (
+                ".pdf",
+                "pdf",
+                "danfse",
+                "imprimir",
+                "consulta",
+                "visualiz",
+                "download",
+                "nfse",
+                "nota",
+            )
+            if not any(termo in valor_low for termo in termos_relevantes):
+                # Em alguns portais o link real vem sem nome de PDF, mas com query tokenizada.
+                # Mantemos caminhos com querystring para nova tentativa.
+                if "?" not in valor_low:
+                    continue
             candidatos.append(urljoin(base_url, valor))
 
     vistos = set()
@@ -249,9 +263,21 @@ async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
     xml_content = str(nota.get("xml_completo") or nota.get("xml_resumo") or "").strip()
     if xml_content:
         for encontrado in re.findall(r'https?://[^"\'>\s]+', xml_content, flags=re.IGNORECASE):
-            low = encontrado.lower()
-            if ".pdf" in low or "pdf" in low or "danfse" in low or "imprimir" in low:
-                candidatos.append(encontrado.strip())
+            candidatos.append(encontrado.strip())
+
+    template_link = str(os.getenv("NFSE_LINK_VISUALIZACAO_TEMPLATE", "") or "").strip()
+    if template_link:
+        try:
+            url_tpl = template_link.format(
+                chave=str(nota.get("chave_acesso") or ""),
+                codigo_verificacao=str(nota.get("codigo_verificacao") or ""),
+                numero=str(nota.get("numero_nf") or ""),
+                cnpj_prestador=str(nota.get("cnpj_emitente") or ""),
+            ).strip()
+            if url_tpl:
+                candidatos.append(url_tpl)
+        except Exception:  # noqa: BLE001
+            logger.debug("Template NFSE_LINK_VISUALIZACAO_TEMPLATE invalido.", exc_info=True)
 
     candidatos_limpos: List[str] = []
     vistos = set()
@@ -866,7 +892,7 @@ async def baixar_pdf_nota_empresa(
         .select(
             "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, data_emissao, valor_total, "
             "cnpj_emitente, nome_emitente, cnpj_destinatario, nome_destinatario, situacao, municipio_nome, "
-            "xml_completo, xml_resumo, link_visualizacao, pdf_url"
+            "xml_completo, xml_resumo, link_visualizacao, pdf_url, codigo_verificacao"
         )
         .eq("empresa_id", empresa_id)
         .eq("id", nota_id)

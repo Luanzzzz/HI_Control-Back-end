@@ -624,6 +624,7 @@ class NFSeService:
                     "municipio_nome": nota.get("municipio_nome", ""),
                     "codigo_verificacao": nota.get("codigo_verificacao", ""),
                     "link_visualizacao": nota.get("link_visualizacao", ""),
+                    "pdf_url": nota.get("pdf_url", ""),
                     "descricao_servico": nota.get("descricao_servico", ""),
                     "codigo_servico": nota.get("codigo_servico", ""),
                     "valor_iss": nota.get("valor_iss", 0),

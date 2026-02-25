@@ -679,6 +679,20 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             ["cVerif", "codigoVerificacao", "CodVerificacao"],
         ) or ""
 
+        link_visualizacao = self._resolver_link_visualizacao_nfse(
+            inf_nfse=inf_nfse,
+            item_dfe=item_dfe,
+            xml_doc=xml_doc,
+            chave_acesso=chave_acesso,
+            codigo_verificacao=codigo_verificacao,
+        )
+        pdf_url = self._resolver_pdf_url_nfse(
+            inf_nfse=inf_nfse,
+            item_dfe=item_dfe,
+            xml_doc=xml_doc,
+            link_visualizacao=link_visualizacao,
+        )
+
         cstat = self._find_first_text(inf_nfse, ["cStat", "situacao"]) or ""
         status = self._mapear_status(cstat)
 
@@ -698,7 +712,8 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             descricao_servico=descricao_servico,
             codigo_servico=codigo_servico,
             codigo_verificacao=codigo_verificacao,
-            link_visualizacao="",
+            link_visualizacao=link_visualizacao,
+            pdf_url=pdf_url,
             xml_content=xml_doc,
             municipio_codigo=str(codigo_municipio),
             municipio_nome=nome_municipio,
@@ -752,6 +767,143 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             if valor:
                 return valor
         return None
+
+    def _normalizar_url(self, valor: str) -> str:
+        url = str(valor or "").strip()
+        if not url:
+            return ""
+        if url.startswith("//"):
+            return f"https:{url}"
+        if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+            if "." in url and "/" in url:
+                return f"https://{url.lstrip('/')}"
+            return ""
+        return url
+
+    def _coletar_urls_no_xml(self, xml_doc: str) -> List[str]:
+        urls: List[str] = []
+        for encontrado in re.findall(r'https?://[^"\'>\s]+', str(xml_doc or ""), flags=re.IGNORECASE):
+            normalizada = self._normalizar_url(encontrado)
+            if normalizada:
+                urls.append(normalizada)
+        return urls
+
+    def _resolver_link_visualizacao_nfse(
+        self,
+        inf_nfse: Optional[ET.Element],
+        item_dfe: Dict[str, Any],
+        xml_doc: str,
+        chave_acesso: str,
+        codigo_verificacao: str,
+    ) -> str:
+        candidatos: List[str] = []
+
+        # Campos comuns vindos do lote DFe/json
+        for key in [
+            "linkVisualizacao",
+            "LinkVisualizacao",
+            "urlVisualizacao",
+            "UrlVisualizacao",
+            "urlConsulta",
+            "UrlConsulta",
+            "urlConsultaNfse",
+            "UrlConsultaNfse",
+            "urlNfse",
+            "UrlNfse",
+            "urlDanfse",
+            "UrlDanfse",
+            "linkDanfse",
+            "LinkDanfse",
+            "url",
+            "Url",
+        ]:
+            valor = self._normalizar_url(str(item_dfe.get(key) or ""))
+            if valor:
+                candidatos.append(valor)
+
+        # Campos potenciais dentro do XML
+        for name in [
+            "linkVisualizacao",
+            "urlVisualizacao",
+            "urlConsulta",
+            "urlConsultaNfse",
+            "urlNfse",
+            "urlDanfse",
+            "qrCode",
+            "QRCode",
+        ]:
+            valor = self._normalizar_url(self._find_first_text(inf_nfse, [name]) or "")
+            if valor:
+                candidatos.append(valor)
+
+        # URLs em texto livre do XML
+        candidatos.extend(self._coletar_urls_no_xml(xml_doc))
+
+        # Template configuravel para provedores que exigem URL de consulta customizada
+        template = str(os.getenv("NFSE_LINK_VISUALIZACAO_TEMPLATE", "") or "").strip()
+        if template:
+            try:
+                url_template = template.format(
+                    chave=chave_acesso or "",
+                    codigo_verificacao=codigo_verificacao or "",
+                    numero=self._find_first_text(inf_nfse, ["nNFSe", "numero", "Numero", "nDPS"]) or "",
+                    cnpj_prestador=self.limpar_cnpj(self._find_text(self._find_node(inf_nfse, "emit"), "CNPJ") or ""),
+                )
+                normalizada = self._normalizar_url(url_template)
+                if normalizada:
+                    candidatos.append(normalizada)
+            except Exception:  # noqa: BLE001
+                pass
+
+        vistos = set()
+        for url in candidatos:
+            if not url:
+                continue
+            if url in vistos:
+                continue
+            vistos.add(url)
+            return url
+
+        return ""
+
+    def _resolver_pdf_url_nfse(
+        self,
+        inf_nfse: Optional[ET.Element],
+        item_dfe: Dict[str, Any],
+        xml_doc: str,
+        link_visualizacao: str,
+    ) -> str:
+        candidatos: List[str] = []
+        for key in [
+            "pdfUrl",
+            "pdf_url",
+            "urlPdf",
+            "UrlPdf",
+            "linkPdf",
+            "LinkPdf",
+            "urlDanfsePdf",
+            "UrlDanfsePdf",
+        ]:
+            valor = self._normalizar_url(str(item_dfe.get(key) or ""))
+            if valor:
+                candidatos.append(valor)
+
+        for url in self._coletar_urls_no_xml(xml_doc):
+            if ".pdf" in url.lower():
+                candidatos.append(url)
+
+        if link_visualizacao and ".pdf" in link_visualizacao.lower():
+            candidatos.append(link_visualizacao)
+
+        vistos = set()
+        for url in candidatos:
+            if not url:
+                continue
+            if url in vistos:
+                continue
+            vistos.add(url)
+            return url
+        return ""
 
     def _tag_local(self, tag: str) -> str:
         if "}" in tag:
@@ -912,6 +1064,12 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                         or ""
                     ),
                     link_visualizacao=nota_raw.get("linkVisualizacao", ""),
+                    pdf_url=(
+                        nota_raw.get("pdfUrl")
+                        or nota_raw.get("pdf_url")
+                        or nota_raw.get("urlPdf")
+                        or ""
+                    ),
                     xml_content=nota_raw.get("xml") or nota_raw.get("xmlNfse") or "",
                     municipio_codigo=str(
                         nota_raw.get("codigoMunicipio")
