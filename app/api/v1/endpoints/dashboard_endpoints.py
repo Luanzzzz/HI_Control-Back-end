@@ -9,23 +9,35 @@ import ipaddress
 import logging
 import os
 import re
+import tempfile
+import base64
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    pkcs12,
+)
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from supabase import Client
 
 from app.dependencies import get_admin_db, get_current_user
+from app.services.certificado_service import certificado_service
 from app.services.danfe_service import danfe_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/empresas", tags=["Dashboard"])
 
 MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+NFSE_DANFSE_URL_PRODUCAO = "https://adn.nfse.gov.br/danfse"
+NFSE_DANFSE_URL_HOMOLOGACAO = "https://adn.producaorestrita.nfse.gov.br/danfse"
 
 
 def _prioridade_recente_habilitada() -> bool:
@@ -182,6 +194,10 @@ def _url_eh_tecnica_assinatura(url: str) -> bool:
     caminho = (parsed.path or "").lower()
     query = (parsed.query or "").lower()
     texto = f"{host} {caminho} {query}"
+
+    # URL de namespace/schema do XML NFS-e, nao e portal de consulta de nota.
+    if "sped.fazenda.gov.br" in host:
+        return True
 
     hosts_tecnicos = (
         "w3.org",
@@ -369,6 +385,7 @@ async def _download_url(url: str, timeout_sec: float = 20.0) -> Tuple[bytes, str
 
 def _coletar_candidatos_url_oficiais_nota(nota: Dict[str, Any]) -> List[str]:
     tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
+    chave_acesso_50 = _extrair_chave_acesso_50_da_nota(nota)
     candidatos_brutos = [
         nota.get("pdf_url"),
         nota.get("link_visualizacao"),
@@ -385,7 +402,7 @@ def _coletar_candidatos_url_oficiais_nota(nota: Dict[str, Any]) -> List[str]:
     if template_link:
         try:
             url_tpl = template_link.format(
-                chave=str(nota.get("chave_acesso") or ""),
+                chave=str(chave_acesso_50 or nota.get("chave_acesso") or ""),
                 codigo_verificacao=str(nota.get("codigo_verificacao") or ""),
                 numero=str(nota.get("numero_nf") or ""),
                 cnpj_prestador=str(nota.get("cnpj_emitente") or ""),
@@ -426,8 +443,404 @@ def _parece_pagina_404(html_content: str) -> bool:
     return any(s in texto for s in sinais_404)
 
 
-async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
+def _sanitizar_link_visualizacao(url: Any) -> str:
+    valor = _normalizar_url_candidata(str(url or ""))
+    if not valor:
+        return ""
+    if _url_eh_tecnica_assinatura(valor):
+        return ""
+    if not _url_parece_portal_fiscal(valor):
+        return ""
+    return valor
+
+
+def _extrair_primeira_chave_50(*valores: Any) -> str:
+    for valor in valores:
+        texto = str(valor or "")
+        if not texto:
+            continue
+        match = re.search(r"(\d{50})", texto)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _extrair_chave_acesso_50_da_nota(nota: Dict[str, Any]) -> str:
+    chave_atual = _extrair_primeira_chave_50(nota.get("chave_acesso"))
+    if chave_atual:
+        return chave_atual
+
+    xml_content = str(nota.get("xml_completo") or nota.get("xml_resumo") or "")
+    if xml_content:
+        chave_xml = _extrair_primeira_chave_50(xml_content)
+        if chave_xml:
+            return chave_xml
+
+    return ""
+
+
+def _obter_endpoints_danfse_oficial() -> List[str]:
+    prod = str(os.getenv("NFSE_DANFSE_URL_PRODUCAO", NFSE_DANFSE_URL_PRODUCAO)).strip()
+    hml = str(os.getenv("NFSE_DANFSE_URL_HOMOLOGACAO", NFSE_DANFSE_URL_HOMOLOGACAO)).strip()
+
+    ambiente = str(os.getenv("SEFAZ_AMBIENTE", "producao")).strip().lower()
+    tentar_hml_fallback = _bool_from_env("NFSE_DANFSE_TENTAR_HOMOLOGACAO_FALLBACK", True)
+
+    candidatos: List[str] = []
+    if ambiente.startswith("homolog"):
+        candidatos.extend([hml, prod] if tentar_hml_fallback else [hml])
+    else:
+        candidatos.extend([prod, hml] if tentar_hml_fallback else [prod])
+
+    unicos: List[str] = []
+    vistos = set()
+    for base in candidatos:
+        base = base.rstrip("/")
+        if not base or base in vistos:
+            continue
+        vistos.add(base)
+        unicos.append(base)
+    return unicos
+
+
+def _descriptografar_senha_certificado_resiliente(senha_encrypted: str) -> Optional[str]:
+    valor = str(senha_encrypted or "").strip()
+    if not valor:
+        return None
+
+    try:
+        return certificado_service.descriptografar_senha(valor)
+    except Exception:
+        logger.debug("Falha no decrypt padrao da senha do certificado, tentando fallback local.")
+
+    try:
+        return base64.b64decode(valor).decode("utf-8")
+    except Exception:
+        pass
+
+    chave_fernet = str(os.getenv("CERTIFICATE_ENCRYPTION_KEY", "") or "").strip()
+    if chave_fernet:
+        try:
+            fernet = Fernet(chave_fernet.encode("utf-8"))
+            return fernet.decrypt(valor.encode("utf-8")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            logger.debug("Falha no decrypt Fernet local da senha do certificado.")
+        except Exception:  # noqa: BLE001
+            logger.debug("Erro inesperado no decrypt Fernet local da senha do certificado.", exc_info=True)
+
+    # Ultimo fallback: alguns ambientes antigos podem ter gravado senha em texto puro.
+    if len(valor) <= 128 and all(ch.isprintable() for ch in valor):
+        return valor
+
+    return None
+
+
+def _descriptografar_certificado_resiliente(cert_base64: str) -> Optional[bytes]:
+    valor = str(cert_base64 or "").strip()
+    if not valor:
+        return None
+
+    chave_fernet = str(os.getenv("CERTIFICATE_ENCRYPTION_KEY", "") or "").strip()
+
+    def _tentar_fernet_local(payload: bytes) -> bytes:
+        if not payload:
+            return payload
+        token_fernet = payload.startswith(b"gAAAA")
+        if not token_fernet:
+            try:
+                token_fernet = payload.decode("ascii", errors="ignore").startswith("gAAAA")
+            except Exception:
+                token_fernet = False
+        if not token_fernet or not chave_fernet:
+            return payload
+        try:
+            fernet = Fernet(chave_fernet.encode("utf-8"))
+            return fernet.decrypt(payload)
+        except Exception:
+            logger.debug("Falha no decrypt Fernet local do certificado.")
+            return payload
+
+    try:
+        cert_bytes = certificado_service.descriptografar_certificado(valor)
+        cert_bytes = _tentar_fernet_local(cert_bytes)
+        if cert_bytes:
+            return cert_bytes
+    except Exception:
+        logger.debug("Falha no decrypt padrao do certificado, tentando fallback local.")
+
+    try:
+        decoded = base64.b64decode(valor)
+        decoded = _tentar_fernet_local(decoded)
+        if decoded:
+            return decoded
+    except Exception:
+        pass
+
+    return None
+
+
+def _obter_url_consulta_publica_nfse(chave_50: str) -> str:
+    template = str(
+        os.getenv(
+            "NFSE_CONSULTA_PUBLICA_URL_TEMPLATE",
+            "https://www.nfse.gov.br/consultapublica/?tpc=1&chave={chave}",
+        )
+        or ""
+    ).strip()
+    if not template:
+        return ""
+
+    try:
+        url = template.format(chave=chave_50).strip()
+    except Exception:  # noqa: BLE001
+        logger.debug("Template NFSE_CONSULTA_PUBLICA_URL_TEMPLATE invalido.", exc_info=True)
+        return ""
+
+    url = _normalizar_url_candidata(url)
+    if not url:
+        return ""
+    if _url_eh_tecnica_assinatura(url):
+        return ""
+    if not _url_parece_portal_fiscal(url):
+        return ""
+    return url
+
+
+def _obter_certificado_empresa_para_mtls(db: Client, empresa_id: str) -> Optional[Tuple[bytes, str]]:
+    try:
+        resp = (
+            db.table("empresas")
+            .select("certificado_a1, certificado_senha_encrypted")
+            .eq("id", empresa_id)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        if not row:
+            return None
+
+        cert_base64 = row.get("certificado_a1")
+        senha_encrypted = row.get("certificado_senha_encrypted")
+        if not cert_base64 or not senha_encrypted:
+            return None
+
+        cert_bytes = _descriptografar_certificado_resiliente(cert_base64)
+        if not cert_bytes:
+            return None
+        senha = _descriptografar_senha_certificado_resiliente(senha_encrypted)
+        if senha is None:
+            logger.warning(
+                "Nao foi possivel descriptografar senha do certificado da empresa_id=%s; tentando PFX sem senha.",
+                empresa_id,
+            )
+            senha = ""
+        return cert_bytes, senha
+    except Exception:  # noqa: BLE001
+        logger.exception("Falha ao carregar certificado para mTLS da empresa_id=%s", empresa_id)
+        return None
+
+
+def _gerar_cert_key_temp(cert_bytes: bytes, senha_cert: str) -> Tuple[str, str]:
+    senhas_candidatas: List[Optional[str]] = []
+    senha_limpa = str(senha_cert or "").strip()
+    if senha_limpa:
+        senhas_candidatas.append(senha_limpa)
+    senhas_candidatas.append(None)
+
+    ultimo_erro: Optional[Exception] = None
+    for senha in senhas_candidatas:
+        try:
+            senha_bytes = senha.encode("utf-8") if senha else None
+            private_key, certificate, additional = pkcs12.load_key_and_certificates(cert_bytes, senha_bytes)
+            if private_key is None or certificate is None:
+                continue
+
+            cert_chain = certificate.public_bytes(Encoding.PEM)
+            if additional:
+                for cert_extra in additional:
+                    cert_chain += cert_extra.public_bytes(Encoding.PEM)
+
+            key_pem = private_key.private_bytes(
+                encoding=Encoding.PEM,
+                format=PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=NoEncryption(),
+            )
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as cert_tmp:
+                cert_tmp.write(cert_chain)
+                cert_path = cert_tmp.name
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as key_tmp:
+                key_tmp.write(key_pem)
+                key_path = key_tmp.name
+
+            return cert_path, key_path
+        except Exception as exc:  # noqa: BLE001
+            ultimo_erro = exc
+            continue
+
+    if ultimo_erro:
+        raise ValueError("PFX invalido ou senha do certificado incorreta") from ultimo_erro
+    raise ValueError("PFX invalido sem certificado/chave privada")
+
+
+def _decodificar_pdf_base64(valor: Any) -> Optional[bytes]:
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+    texto = re.sub(r"\s+", "", texto)
+    try:
+        data = base64.b64decode(texto, validate=False)
+    except Exception:  # noqa: BLE001
+        return None
+    if _parece_pdf("application/pdf", data):
+        return data
+    return None
+
+
+async def _obter_pdf_nfse_via_danfse_oficial(
+    *,
+    db: Client,
+    empresa_id: str,
+    nota: Dict[str, Any],
+) -> Optional[bytes]:
+    import asyncio
+
+    try:
+        chave_50 = _extrair_chave_acesso_50_da_nota(nota)
+        if not chave_50:
+            return None
+
+        cert_info = _obter_certificado_empresa_para_mtls(db, empresa_id)
+        if not cert_info:
+            return None
+
+        cert_bytes, senha = cert_info
+        cert_path = ""
+        key_path = ""
+        try:
+            cert_path, key_path = _gerar_cert_key_temp(cert_bytes, senha)
+            endpoints = _obter_endpoints_danfse_oficial()
+            headers = {
+                "Accept": "application/pdf, application/json, */*",
+                "User-Agent": "Hi-Control/1.0 (+https://hi-control.vercel.app)",
+            }
+            try:
+                max_retries = int(os.getenv("NFSE_DANFSE_MAX_RETRIES", "3"))
+            except ValueError:
+                max_retries = 3
+            max_retries = max(1, min(6, max_retries))
+
+            try:
+                base_delay_ms = int(os.getenv("NFSE_DANFSE_RETRY_DELAY_MS", "800"))
+            except ValueError:
+                base_delay_ms = 800
+            base_delay_ms = max(100, min(5000, base_delay_ms))
+
+            for base in endpoints:
+                url = f"{base}/{chave_50}"
+                resp = None
+                for tentativa in range(1, max_retries + 1):
+                    try:
+                        async with httpx.AsyncClient(
+                            timeout=45.0,
+                            verify=True,
+                            cert=(cert_path, key_path),
+                            follow_redirects=True,
+                        ) as client:
+                            resp = await client.get(url, headers=headers)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "Falha de rede ao consultar DANFSe oficial URL=%s tentativa=%s/%s",
+                            url,
+                            tentativa,
+                            max_retries,
+                            exc_info=True,
+                        )
+                        resp = None
+
+                    if resp is not None and resp.status_code not in {429, 502, 503, 504}:
+                        break
+
+                    if tentativa < max_retries:
+                        await asyncio.sleep((base_delay_ms / 1000.0) * tentativa)
+
+                if resp is None:
+                    continue
+
+                ctype = str(resp.headers.get("content-type") or "").lower()
+                if resp.status_code == 200 and _parece_pdf(ctype, resp.content):
+                    logger.info(
+                        "PDF oficial DANFSe obtido via mTLS para nota_id=%s empresa_id=%s",
+                        nota.get("id"),
+                        empresa_id,
+                    )
+                    return resp.content
+
+                if resp.status_code == 200 and "json" in ctype:
+                    try:
+                        payload = resp.json()
+                    except Exception:  # noqa: BLE001
+                        payload = {}
+
+                    # Alguns gateways podem responder JSON com base64.
+                    for key in ("pdfBase64", "arquivoPdfBase64", "arquivoBase64", "conteudoBase64"):
+                        pdf = _decodificar_pdf_base64(payload.get(key))
+                        if pdf:
+                            return pdf
+
+                    for key in ("url", "link", "urlPdf", "urlDanfse", "linkDanfse"):
+                        url_pdf = _normalizar_url_candidata(str(payload.get(key) or ""))
+                        if not url_pdf or not _url_aceita_para_download_oficial(url_pdf):
+                            continue
+                        try:
+                            conteudo, content_type = await _download_url(url_pdf)
+                            if _parece_pdf(content_type, conteudo):
+                                return conteudo
+                        except Exception:  # noqa: BLE001
+                            continue
+
+                logger.debug(
+                    "DANFSe oficial indisponivel para nota_id=%s URL=%s status=%s",
+                    nota.get("id"),
+                    url,
+                    resp.status_code,
+                )
+        finally:
+            for path in (cert_path, key_path):
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Falha inesperada ao obter DANFSe oficial para nota_id=%s empresa_id=%s",
+            nota.get("id"),
+            empresa_id,
+        )
+        return None
+
+    return None
+
+
+async def _obter_pdf_oficial_nota(
+    nota: Dict[str, Any],
+    *,
+    db: Client,
+    empresa_id: str,
+) -> Optional[bytes]:
     tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
+
+    if tipo_nf_interno == "NFSE":
+        pdf_danfse = await _obter_pdf_nfse_via_danfse_oficial(
+            db=db,
+            empresa_id=empresa_id,
+            nota=nota,
+        )
+        if pdf_danfse:
+            return pdf_danfse
+
     candidatos_limpos = _coletar_candidatos_url_oficiais_nota(nota)
 
     for url in candidatos_limpos:
@@ -469,8 +882,23 @@ async def _obter_pdf_oficial_nota(nota: Dict[str, Any]) -> Optional[bytes]:
     return None
 
 
-async def _resolver_url_oficial_visualizacao_nota(nota: Dict[str, Any]) -> Optional[str]:
+async def _resolver_url_oficial_visualizacao_nota(
+    nota: Dict[str, Any],
+    *,
+    db: Client,
+    empresa_id: str,
+) -> Optional[str]:
+    _ = db
+    _ = empresa_id
     tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
+
+    if tipo_nf_interno == "NFSE":
+        chave_50 = _extrair_chave_acesso_50_da_nota(nota)
+        if chave_50:
+            url_consulta_publica = _obter_url_consulta_publica_nfse(chave_50)
+            if url_consulta_publica:
+                return url_consulta_publica
+
     candidatos = _coletar_candidatos_url_oficiais_nota(nota)
 
     for url in candidatos:
@@ -804,6 +1232,7 @@ async def get_dashboard_empresa(
     notas_data = notas_resp.data or []
     for nota in notas_data:
         nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
+        nota["link_visualizacao"] = _sanitizar_link_visualizacao(nota.get("link_visualizacao"))
 
     estimadas = sync_row.get("notas_estimadas_total")
     processadas = sync_row.get("notas_processadas_parcial")
@@ -947,6 +1376,7 @@ async def listar_notas_empresa(
         notas = resp.data or []
         for nota in notas:
             nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
+            nota["link_visualizacao"] = _sanitizar_link_visualizacao(nota.get("link_visualizacao"))
             nota.pop("valor_iss", None)
             nota.pop("valor_pis", None)
             nota.pop("valor_cofins", None)
@@ -966,6 +1396,7 @@ async def listar_notas_empresa(
     notas = filtradas[offset: offset + limite]
     for nota in notas:
         nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
+        nota["link_visualizacao"] = _sanitizar_link_visualizacao(nota.get("link_visualizacao"))
         nota.pop("valor_iss", None)
         nota.pop("valor_pis", None)
         nota.pop("valor_cofins", None)
@@ -1007,6 +1438,7 @@ async def obter_nota_empresa(
         )
 
     nota["tipo_nf"] = _normalizar_tipo_nf_saida(nota.get("tipo_nf"))
+    nota["link_visualizacao"] = _sanitizar_link_visualizacao(nota.get("link_visualizacao"))
     return {"nota": nota}
 
 
@@ -1086,11 +1518,19 @@ async def baixar_pdf_nota_empresa(
         )
 
     tipo_nf_interno = _normalizar_tipo_nf_interno(nota.get("tipo_nf"))
-    pdf_bytes = await _obter_pdf_oficial_nota(nota)
+    pdf_bytes = await _obter_pdf_oficial_nota(
+        nota,
+        db=db,
+        empresa_id=empresa_id,
+    )
     source = "official"
 
+    # Para NFS-e, fallback para PDF auxiliar deve ocorrer apenas quando explicitamente solicitado.
+    # Isso evita exibir PDF interno como se fosse documento oficial.
     fallback_nfse_habilitado = _bool_from_env("NFSE_PERMITIR_PDF_FALLBACK", False)
-    pode_fallback = permitir_fallback or tipo_nf_interno in {"NFE", "NFCE", "CTE"} or fallback_nfse_habilitado
+    pode_fallback = permitir_fallback or tipo_nf_interno in {"NFE", "NFCE", "CTE"} or (
+        tipo_nf_interno != "NFSE" and fallback_nfse_habilitado
+    )
 
     if not pdf_bytes:
         if tipo_nf_interno == "NFSE" and not pode_fallback:
@@ -1150,7 +1590,11 @@ async def obter_portal_oficial_nota_empresa(
             detail="Nota nao encontrada para esta empresa",
         )
 
-    url_oficial = await _resolver_url_oficial_visualizacao_nota(nota)
+    url_oficial = await _resolver_url_oficial_visualizacao_nota(
+        nota,
+        db=db,
+        empresa_id=empresa_id,
+    )
     if not url_oficial:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
