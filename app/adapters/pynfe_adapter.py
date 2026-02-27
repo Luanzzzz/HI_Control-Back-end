@@ -209,24 +209,30 @@ class PyNFeAdapter:
         else:
             raise ValueError("Destinatário deve ter CPF ou CNPJ")
 
-        # Indicador IE: 1=Contribuinte, 2=Isento, 9=Não contribuinte
-        indicador_ie = int(destinatario.indicador_inscricao_estadual)
+        # Indicador IE: 1=Contribuinte ICMS, 2=Isento, 9=Não contribuinte
+        # Heurística: tem IE → contribuinte (1), senão pessoa física → não contribuinte (9)
+        if destinatario.inscricao_estadual:
+            indicador_ie = 1
+        elif destinatario.cpf:
+            indicador_ie = 9
+        else:
+            indicador_ie = 9
 
         cliente = Cliente(
-            razao_social=destinatario.razao_social,
+            razao_social=destinatario.nome,
             tipo_documento=tipo_documento,
             email=destinatario.email or '',
             numero_documento=numero_documento,
             indicador_ie=indicador_ie,
             inscricao_estadual=destinatario.inscricao_estadual or '',
-            endereco_logradouro=destinatario.endereco_logradouro,
-            endereco_numero=destinatario.endereco_numero,
-            endereco_complemento=destinatario.endereco_complemento or '',
-            endereco_bairro=destinatario.endereco_bairro,
+            endereco_logradouro=destinatario.logradouro,
+            endereco_numero=destinatario.numero,
+            endereco_complemento=destinatario.complemento or '',
+            endereco_bairro=destinatario.bairro,
             endereco_municipio=destinatario.municipio,
             endereco_uf=destinatario.uf,
             endereco_cep=''.join(filter(str.isdigit, destinatario.cep)),
-            endereco_pais=destinatario.codigo_pais or CODIGO_BRASIL,
+            endereco_pais=CODIGO_BRASIL,
             endereco_telefone=destinatario.telefone or '',
         )
 
@@ -248,6 +254,9 @@ class PyNFeAdapter:
         PIS = self.get_module('PIS')
         COFINS = self.get_module('COFINS')
 
+        # Campos tributáveis: usar mesmos valores comerciais se não informados separadamente
+        ean_val = item.ean or 'SEM GTIN'
+
         # Criar produto base
         produto = Produto(
             codigo=item.codigo_produto,
@@ -258,11 +267,11 @@ class PyNFeAdapter:
             quantidade_comercial=float(item.quantidade_comercial),
             valor_unitario_comercial=float(item.valor_unitario_comercial),
             valor_total_bruto=float(item.valor_total_bruto),
-            unidade_tributavel=item.unidade_tributavel or item.unidade_comercial,
-            quantidade_tributavel=float(item.quantidade_tributavel or item.quantidade_comercial),
-            valor_unitario_tributavel=float(item.valor_unitario_tributavel or item.valor_unitario_comercial),
-            ean=item.ean or 'SEM GTIN',
-            ean_tributavel=item.ean_tributavel or item.ean or 'SEM GTIN',
+            unidade_tributavel=item.unidade_comercial,
+            quantidade_tributavel=float(item.quantidade_comercial),
+            valor_unitario_tributavel=float(item.valor_unitario_comercial),
+            ean=ean_val,
+            ean_tributavel=ean_val,
             ind_total=1,  # 1=Compõe total da NF-e
             cest=item.cest,
             valor_frete=float(item.valor_frete or 0),
@@ -271,50 +280,50 @@ class PyNFeAdapter:
             valor_outras_despesas=float(item.valor_outras_despesas or 0),
         )
 
-        # Configurar ICMS
+        # Configurar ICMS (item.icms direto, não item.impostos.icms)
         icms = ICMS(
-            origem=int(item.impostos.icms.origem),
-            situacao_tributaria=item.impostos.icms.cst,
-            modalidade_base_calculo=item.impostos.icms.modalidade_bc or 0,
-            base_calculo=float(item.impostos.icms.base_calculo),
-            aliquota=float(item.impostos.icms.aliquota),
-            valor=float(item.impostos.icms.valor),
+            origem=int(item.icms.origem),
+            situacao_tributaria=item.icms.cst,
+            modalidade_base_calculo=item.icms.modalidade_bc or 0,
+            base_calculo=float(item.icms.base_calculo),
+            aliquota=float(item.icms.aliquota),
+            valor=float(item.icms.valor),
         )
 
         # ICMS ST (se houver)
-        if item.impostos.icms.base_calculo_st:
-            icms.modalidade_base_calculo_st = item.impostos.icms.modalidade_bc_st or 4
-            icms.base_calculo_st = float(item.impostos.icms.base_calculo_st)
-            icms.aliquota_st = float(item.impostos.icms.aliquota_st or 0)
-            icms.valor_st = float(item.impostos.icms.valor_st or 0)
+        if item.icms.base_calculo_st:
+            icms.modalidade_base_calculo_st = item.icms.modalidade_bc_st or 4
+            icms.base_calculo_st = float(item.icms.base_calculo_st)
+            icms.aliquota_st = float(item.icms.aliquota_st or 0)
+            icms.valor_st = float(item.icms.valor_st or 0)
 
         produto.icms = [icms]
 
         # IPI (opcional)
-        if item.impostos.ipi:
+        if item.ipi:
             ipi = IPI(
-                situacao_tributaria=item.impostos.ipi.cst,
-                base_calculo=float(item.impostos.ipi.base_calculo),
-                aliquota=float(item.impostos.ipi.aliquota),
-                valor=float(item.impostos.ipi.valor),
+                situacao_tributaria=item.ipi.cst,
+                base_calculo=float(item.ipi.base_calculo),
+                aliquota=float(item.ipi.aliquota),
+                valor=float(item.ipi.valor),
             )
             produto.ipi = [ipi]
 
         # PIS
         pis = PIS(
-            situacao_tributaria=item.impostos.pis.cst,
-            base_calculo=float(item.impostos.pis.base_calculo),
-            aliquota=float(item.impostos.pis.aliquota),
-            valor=float(item.impostos.pis.valor),
+            situacao_tributaria=item.pis.cst,
+            base_calculo=float(item.pis.base_calculo),
+            aliquota=float(item.pis.aliquota),
+            valor=float(item.pis.valor),
         )
         produto.pis = [pis]
 
         # COFINS
         cofins = COFINS(
-            situacao_tributaria=item.impostos.cofins.cst,
-            base_calculo=float(item.impostos.cofins.base_calculo),
-            aliquota=float(item.impostos.cofins.aliquota),
-            valor=float(item.impostos.cofins.valor),
+            situacao_tributaria=item.cofins.cst,
+            base_calculo=float(item.cofins.base_calculo),
+            aliquota=float(item.cofins.aliquota),
+            valor=float(item.cofins.valor),
         )
         produto.cofins = [cofins]
 
@@ -388,8 +397,8 @@ class PyNFeAdapter:
         if nfe_data.cobranca and nfe_data.cobranca.duplicatas:
             for dup in nfe_data.cobranca.duplicatas:
                 nota.adicionar_duplicata(
-                    numero=dup.numero_duplicata,
-                    data_vencimento=dup.data_vencimento,
+                    numero=dup.numero,
+                    data_vencimento=dup.vencimento,
                     valor=str(dup.valor)
                 )
 
@@ -399,11 +408,14 @@ class PyNFeAdapter:
         """Cria objeto Transportadora do PyNFE"""
         Transportadora = self.get_module('Transportadora')
 
+        # Model tem cnpj e cpf separados; PyNFE recebe cpf_cnpj unificado
+        cpf_cnpj = ''.join(filter(str.isdigit, transp_data.cnpj or transp_data.cpf or ''))
+
         return Transportadora(
             razao_social=transp_data.razao_social or '',
-            cpf_cnpj=''.join(filter(str.isdigit, transp_data.cnpj_cpf or '')),
+            cpf_cnpj=cpf_cnpj,
             inscricao_estadual=transp_data.inscricao_estadual or '',
-            endereco=transp_data.endereco or '',
+            endereco=transp_data.endereco_completo or '',
             municipio=transp_data.municipio or '',
             uf=transp_data.uf or '',
         )

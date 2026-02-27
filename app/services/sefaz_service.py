@@ -1030,7 +1030,7 @@ class SefazService:
                             cpf_destinatario=row.get("cpf_destinatario"),
                             nome_destinatario=row.get("nome_destinatario"),
                             situacao=row.get("situacao", "autorizada"),
-                            situacao_codigo="1" if row.get("situacao") == "autorizada" else "3",
+                            situacao_codigo="1" if row.get("situacao") == "autorizada" else "2" if row.get("situacao") == "denegada" else "3",
                             protocolo=row.get("protocolo"),
                             xml_resumo=row.get("xml_resumo") or row.get("xml_completo"),
                         )

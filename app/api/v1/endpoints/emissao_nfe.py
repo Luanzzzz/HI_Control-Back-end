@@ -199,22 +199,35 @@ async def autorizar_nfe(
             user_id,
         )
 
-        # 7. Construir resposta
+        # 7. Construir resposta com campos corretos do NotaFiscalCompletaResponse
+        agora = datetime.now()
+        totais = nfe_data.calcular_totais()
         response = NotaFiscalCompletaResponse(
             id=nota_id,
+            empresa_id=nfe_data.empresa_id,
             chave_acesso=sefaz_response.chave_acesso,
+            protocolo=sefaz_response.protocolo,
             numero_nf=nfe_data.numero_nf,
             serie=nfe_data.serie,
             modelo=nfe_data.modelo,
             situacao="autorizada",
-            protocolo=sefaz_response.protocolo,
-            data_autorizacao=datetime.now(),
-            valor_total=nfe_data.calcular_totais()["valor_total_nota"],
-            itens=nfe_data.itens,
-            transporte=nfe_data.transporte,
-            cobranca=nfe_data.cobranca,
-            destinatario=nfe_data.destinatario,
-            sefaz_response=sefaz_response,
+            situacao_sefaz_codigo=sefaz_response.status_codigo,
+            situacao_sefaz_motivo=sefaz_response.status_descricao,
+            ambiente=nfe_data.ambiente,
+            data_emissao=nfe_data.data_emissao,
+            data_autorizacao=agora,
+            cnpj_emitente=empresa.get("cnpj", ""),
+            nome_emitente=empresa.get("razao_social", ""),
+            destinatario_documento=nfe_data.destinatario.cnpj or nfe_data.destinatario.cpf or "",
+            destinatario_nome=nfe_data.destinatario.nome,
+            valor_produtos=totais["valor_produtos"],
+            valor_total=totais["valor_total"],
+            total_icms=totais["total_icms"],
+            total_pis=totais["total_pis"],
+            total_cofins=totais["total_cofins"],
+            total_ipi=totais["total_ipi"],
+            created_at=agora,
+            updated_at=agora,
         )
 
         logger.info(
@@ -453,6 +466,28 @@ async def cancelar_nfe(
                 detail="Data de autorização não encontrada"
             )
 
+        # Converter string do banco para datetime (o sefaz_service precisa de datetime)
+        from datetime import timedelta
+        data_autorizacao_raw = nota["data_autorizacao"]
+        if isinstance(data_autorizacao_raw, str):
+            # Supabase retorna ISO 8601 com ou sem timezone
+            data_autorizacao_raw = data_autorizacao_raw.replace("Z", "+00:00")
+            try:
+                data_autorizacao_dt = datetime.fromisoformat(data_autorizacao_raw)
+            except ValueError:
+                data_autorizacao_dt = datetime.fromisoformat(data_autorizacao_raw[:19])
+        else:
+            data_autorizacao_dt = data_autorizacao_raw
+
+        # Verificar prazo de 24h antes de chamar o serviço
+        from datetime import timezone
+        agora = datetime.now(timezone.utc) if data_autorizacao_dt.tzinfo else datetime.now()
+        if agora - data_autorizacao_dt > timedelta(hours=24):
+            raise HTTPException(
+                status_code=400,
+                detail="Cancelamento não permitido após 24 horas da autorização da NF-e"
+            )
+
         # 4. Carregar certificado
         empresa = await _validar_empresa_usuario(db, nota["empresa_id"], user_id)
 
@@ -478,7 +513,7 @@ async def cancelar_nfe(
             empresa_uf=empresa["uf"],
             cert_bytes=cert_bytes,
             senha_cert=senha_cert,
-            data_autorizacao=nota["data_autorizacao"],
+            data_autorizacao=data_autorizacao_dt,
         )
 
         # 6. Atualizar no banco
@@ -583,7 +618,7 @@ async def _salvar_nfe_banco(
     # Inserir nota fiscal
     nota_data = {
         "empresa_id": nfe_data.empresa_id,
-        "tipo_nf": "NFe" if nfe_data.modelo == "55" else "NFCe",
+        "tipo_nf": "NFe" if nfe_data.modelo == "55" else "NFCe" if nfe_data.modelo == "65" else "CTe",
         "numero_nf": nfe_data.numero_nf,
         "serie": nfe_data.serie,
         "modelo": nfe_data.modelo,
@@ -638,9 +673,10 @@ async def _salvar_nfe_banco(
             "modalidade_frete": nfe_data.transporte.modalidade_frete,
         }
         if nfe_data.transporte.transportadora:
+            t = nfe_data.transporte.transportadora
             transp_data.update({
-                "transportadora_cnpj": nfe_data.transporte.transportadora.cnpj_cpf,
-                "transportadora_razao_social": nfe_data.transporte.transportadora.razao_social,
+                "transportadora_cnpj": t.cnpj or t.cpf,
+                "transportadora_razao_social": t.razao_social,
             })
         db.table("nota_fiscal_transporte").insert(transp_data).execute()
 
@@ -649,8 +685,8 @@ async def _salvar_nfe_banco(
         for dup in nfe_data.cobranca.duplicatas:
             dup_data = {
                 "nota_fiscal_id": nota_id,
-                "numero_duplicata": dup.numero_duplicata,
-                "data_vencimento": dup.data_vencimento,
+                "numero_duplicata": dup.numero,
+                "data_vencimento": dup.vencimento.isoformat(),
                 "valor": float(dup.valor),
             }
             db.table("nota_fiscal_duplicatas").insert(dup_data).execute()
@@ -667,10 +703,9 @@ async def _buscar_nfe_por_chave(
     response = db.table("notas_fiscais") \
         .select("*") \
         .eq("chave_acesso", chave_acesso) \
-        .single() \
         .execute()
 
-    return response.data if response.data else None
+    return response.data[0] if response.data else None
 
 
 async def _atualizar_status_nfe(
@@ -795,13 +830,17 @@ async def inutilizar_numeracao(
             )
         senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
+        import datetime as dt
+        ano_atual = dt.datetime.now().year % 100  # 2 dígitos
+
         sefaz_response = sefaz_service.inutilizar_numeracao(
             empresa_cnpj=empresa["cnpj"],
             empresa_uf=empresa["uf"],
             serie=serie,
-            numero_inicio=numero_inicio,
-            numero_fim=numero_fim,
-            justificativa=justificativa,
+            numero_inicial=numero_inicio,
+            numero_final=numero_fim,
+            ano=ano_atual,
+            motivo=justificativa,
             cert_bytes=cert_bytes,
             senha_cert=senha_cert,
         )

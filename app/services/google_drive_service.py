@@ -8,6 +8,7 @@ Fluxo:
 4. Importa e processa usando o mesmo pipeline do email
 """
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,7 @@ class GoogleDriveService:
 
     _instance = None
     _fernet: Optional[Fernet] = None
+    _export_tasks: Dict[str, Any] = {}
 
     def __new__(cls):
         if cls._instance is None:
@@ -30,13 +32,30 @@ class GoogleDriveService:
         return cls._instance
 
     def _initialize(self):
-        import os
         key = os.getenv("CERTIFICATE_ENCRYPTION_KEY")
         if key:
             try:
                 self._fernet = Fernet(key.encode())
             except Exception as e:
                 logger.error(f"Erro ao inicializar Fernet para Drive: {e}")
+
+    def _obter_scopes_oauth(self) -> List[str]:
+        """
+        Resolve scopes OAuth para o Google Drive.
+
+        Usa GOOGLE_DRIVE_OAUTH_SCOPES (csv) quando definido.
+        Fallback inclui escrita para exportacao em massa.
+        """
+        custom_scopes = str(os.getenv("GOOGLE_DRIVE_OAUTH_SCOPES", "") or "").strip()
+        if custom_scopes:
+            scopes = [scope.strip() for scope in custom_scopes.split(",") if scope.strip()]
+            if scopes:
+                return scopes
+
+        return [
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata.readonly",
+        ]
 
     def encrypt(self, value: str) -> str:
         if not self._fernet:
@@ -57,8 +76,6 @@ class GoogleDriveService:
 
     def gerar_url_autorizacao(self, state: Optional[str] = None) -> str:
         """Gera URL de autorização OAuth2 do Google."""
-        import os
-
         client_id = os.getenv("GOOGLE_CLIENT_ID", "")
         redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "")
 
@@ -67,10 +84,7 @@ class GoogleDriveService:
                 "GOOGLE_CLIENT_ID e GOOGLE_REDIRECT_URI devem estar configurados"
             )
 
-        scopes = [
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/drive.metadata.readonly",
-        ]
+        scopes = self._obter_scopes_oauth()
 
         params = {
             "client_id": client_id,
@@ -213,9 +227,11 @@ class GoogleDriveService:
         db = get_supabase_admin()
         result = (
             db.table("configuracoes_drive")
-            .select("id, user_id, empresa_id, provedor, pasta_id, "
-                    "pasta_nome, ultima_sincronizacao, total_importadas, "
-                    "ativo, created_at, updated_at")
+            .select(
+                "id, user_id, empresa_id, provedor, pasta_id, "
+                "pasta_nome, pasta_raiz_export_id, pasta_raiz_export_nome, "
+                "ultima_sincronizacao, total_importadas, ativo, created_at, updated_at"
+            )
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .execute()
@@ -234,6 +250,86 @@ class GoogleDriveService:
             .execute()
         )
         return bool(result.data)
+
+    async def obter_configuracao_ativa(
+        self,
+        user_id: str,
+        empresa_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve configuracao de Drive ativa para o usuario.
+
+        Prioridade:
+        1) config vinculada a empresa_id (quando informado)
+        2) config global (empresa_id nulo)
+        3) primeira configuracao ativa disponivel
+        """
+        from app.db.supabase_client import get_supabase_admin
+
+        db = get_supabase_admin()
+        result = (
+            db.table("configuracoes_drive")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("ativo", True)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return None
+
+        if empresa_id:
+            for row in rows:
+                if str(row.get("empresa_id") or "") == str(empresa_id):
+                    return row
+
+        for row in rows:
+            if not row.get("empresa_id"):
+                return row
+
+        return rows[0]
+
+    async def _persistir_access_token(
+        self,
+        config_id: str,
+        access_token: str,
+    ) -> None:
+        from app.db.supabase_client import get_supabase_admin
+
+        db = get_supabase_admin()
+        try:
+            db.table("configuracoes_drive").update(
+                {"oauth_access_token_encrypted": self.encrypt(access_token)}
+            ).eq("id", config_id).execute()
+        except Exception:
+            logger.debug("Falha ao persistir access token renovado do Google Drive.", exc_info=True)
+
+    async def obter_access_token_config(self, config: Dict[str, Any]) -> str:
+        access_token = self.decrypt(config.get("oauth_access_token_encrypted", ""))
+        if access_token:
+            return access_token
+
+        access_token = await self._refresh_token(config)
+        if not access_token:
+            raise ValueError("Token expirado. Reautorize o Google Drive.")
+
+        config_id = str(config.get("id") or "")
+        if config_id:
+            await self._persistir_access_token(config_id, access_token)
+
+        return access_token
+
+    def _escape_drive_query_value(self, value: str) -> str:
+        return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+    def _sanitize_folder_name(self, value: str, fallback: str = "Pasta") -> str:
+        texto = str(value or "").strip()
+        if not texto:
+            texto = fallback
+        texto = re.sub(r'[<>:"/\\|?*]+', "_", texto)
+        texto = re.sub(r"\s+", " ", texto).strip().rstrip(".")
+        return (texto or fallback)[:120]
 
     # ============================================
     # LISTAR PASTAS
@@ -257,14 +353,7 @@ class GoogleDriveService:
             raise ValueError("Configuração não encontrada")
 
         config = result.data
-        access_token = self.decrypt(
-            config.get("oauth_access_token_encrypted", "")
-        )
-
-        if not access_token:
-            access_token = await self._refresh_token(config)
-            if not access_token:
-                raise ValueError("Token expirado. Reautorize o Google Drive.")
+        access_token = await self.obter_access_token_config(config)
 
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -316,45 +405,52 @@ class GoogleDriveService:
 
         db = get_supabase_admin()
 
-        # 1. Buscar configuracao ativa do Drive para esta empresa
-        result = (
-            db.table("configuracoes_drive")
-            .select("*")
-            .eq("empresa_id", empresa_id)
-            .eq("ativo", True)
+        empresa_resp = (
+            db.table("empresas")
+            .select("id, usuario_id")
+            .eq("id", empresa_id)
             .limit(1)
             .execute()
         )
+        if not empresa_resp.data:
+            logger.warning("Empresa nao encontrada ao tentar salvar XML no Drive: %s", empresa_id)
+            return None
 
-        if not result.data:
+        usuario_id = str(empresa_resp.data[0].get("usuario_id") or "")
+        if not usuario_id:
+            logger.warning("Empresa sem usuario_id ao salvar XML no Drive: %s", empresa_id)
+            return None
+
+        # 1. Buscar configuracao ativa (empresa ou global do contador)
+        config = await self.obter_configuracao_ativa(usuario_id, empresa_id=empresa_id)
+        if not config:
             logger.debug(
                 f"Drive nao configurado para empresa {empresa_id}, pulando upload"
             )
             return None
 
-        config = result.data[0]
-        pasta_raiz_id = config.get("pasta_id")
+        pasta_raiz_id = config.get("pasta_raiz_export_id") or config.get("pasta_id")
         if not pasta_raiz_id:
-            logger.warning(
-                f"Config Drive sem pasta_id para empresa {empresa_id}"
-            )
-            return None
+            try:
+                pasta_raiz = await self.garantir_pasta_raiz_exportacao(
+                    user_id=usuario_id,
+                    config=config,
+                )
+                pasta_raiz_id = pasta_raiz.get("pasta_raiz_id")
+            except Exception:
+                logger.exception("Falha ao garantir pasta raiz no Drive para empresa %s", empresa_id)
+                return None
 
         # 2. Obter access token
-        access_token = self.decrypt(
-            config.get("oauth_access_token_encrypted", "")
-        )
-        if not access_token:
-            access_token = await self._refresh_token(config)
-            if not access_token:
-                logger.error(
-                    f"Token Drive expirado para empresa {empresa_id}"
-                )
-                return None
+        try:
+            access_token = await self.obter_access_token_config(config)
+        except Exception:
+            logger.error("Token Drive expirado para empresa %s", empresa_id)
+            return None
 
         # 3. Montar estrutura de pastas
         # Sanitizar nome da empresa para nome de pasta
-        empresa_folder_name = re.sub(r'[<>:"/\\|?*]', '_', empresa_nome.strip())
+        empresa_folder_name = self._sanitize_folder_name(empresa_nome, fallback="Empresa")
 
         # Ano-Mes (ex: "2026-02")
         data_emissao = nota_info.get("data_emissao", "")
@@ -434,10 +530,14 @@ class GoogleDriveService:
         parent_id: str,
     ) -> str:
         """Busca pasta pelo nome ou cria se nao existir."""
+        folder_name = self._sanitize_folder_name(folder_name, fallback="Pasta")
+        folder_name_query = self._escape_drive_query_value(folder_name)
+        parent_query = self._escape_drive_query_value(parent_id)
+
         # Buscar pasta existente
         query = (
-            f"name='{folder_name}' and "
-            f"'{parent_id}' in parents and "
+            f"name='{folder_name_query}' and "
+            f"'{parent_query}' in parents and "
             f"mimeType='application/vnd.google-apps.folder' and "
             f"trashed=false"
         )
@@ -484,9 +584,11 @@ class GoogleDriveService:
         folder_id: str,
     ) -> bool:
         """Verifica se arquivo com mesmo nome ja existe na pasta."""
+        filename_query = self._escape_drive_query_value(filename)
+        folder_query = self._escape_drive_query_value(folder_id)
         query = (
-            f"name='{filename}' and "
-            f"'{folder_id}' in parents and "
+            f"name='{filename_query}' and "
+            f"'{folder_query}' in parents and "
             f"trashed=false"
         )
         resp = await client.get(
@@ -500,6 +602,33 @@ class GoogleDriveService:
             return len(files) > 0
 
         return False
+
+    async def _obter_arquivo_por_nome_em_pasta(
+        self,
+        client: Any,
+        headers: Dict[str, str],
+        filename: str,
+        folder_id: str,
+    ) -> Optional[str]:
+        """Retorna o file_id do primeiro arquivo encontrado com mesmo nome na pasta."""
+        filename_query = self._escape_drive_query_value(filename)
+        folder_query = self._escape_drive_query_value(folder_id)
+        query = (
+            f"name='{filename_query}' and "
+            f"'{folder_query}' in parents and "
+            f"trashed=false"
+        )
+        resp = await client.get(
+            "https://www.googleapis.com/drive/v3/files",
+            headers=headers,
+            params={"q": query, "fields": "files(id,name)", "pageSize": 1},
+        )
+        if resp.status_code != 200:
+            return None
+        files = resp.json().get("files", [])
+        if not files:
+            return None
+        return str(files[0].get("id") or "")
 
     async def _upload_file(
         self,
@@ -546,6 +675,663 @@ class GoogleDriveService:
     # ============================================
     # SINCRONIZAÇÃO (DRIVE -> SISTEMA)
     # ============================================
+
+    async def garantir_pasta_raiz_exportacao(
+        self,
+        *,
+        user_id: str,
+        config: Optional[Dict[str, Any]] = None,
+        access_token: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Garante pasta raiz de exportacao no Drive e persiste na configuracao."""
+        from app.db.supabase_client import get_supabase_admin
+        import httpx
+
+        db = get_supabase_admin()
+        cfg = config or await self.obter_configuracao_ativa(user_id)
+        if not cfg:
+            raise ValueError("Google Drive nao conectado para este usuario.")
+
+        token = access_token or await self.obter_access_token_config(cfg)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        root_name = self._sanitize_folder_name(
+            str(
+                cfg.get("pasta_raiz_export_nome")
+                or os.getenv("GOOGLE_DRIVE_EXPORT_ROOT_FOLDER", "Hi-Control Exportacoes")
+            ),
+            fallback="Hi-Control Exportacoes",
+        )
+        root_id = str(cfg.get("pasta_raiz_export_id") or "").strip()
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if root_id:
+                check_resp = await client.get(
+                    f"https://www.googleapis.com/drive/v3/files/{root_id}",
+                    headers=headers,
+                    params={"fields": "id,name,mimeType,trashed"},
+                )
+                if check_resp.status_code == 200:
+                    payload = check_resp.json()
+                    if payload.get("mimeType") == "application/vnd.google-apps.folder" and not payload.get("trashed"):
+                        root_name = str(payload.get("name") or root_name)
+                    else:
+                        root_id = ""
+                else:
+                    root_id = ""
+
+            if not root_id:
+                root_id = await self._get_or_create_folder(client, headers, root_name, "root")
+
+        if (
+            root_id != str(cfg.get("pasta_raiz_export_id") or "")
+            or root_name != str(cfg.get("pasta_raiz_export_nome") or "")
+        ):
+            db.table("configuracoes_drive").update(
+                {
+                    "pasta_raiz_export_id": root_id,
+                    "pasta_raiz_export_nome": root_name,
+                }
+            ).eq("id", cfg["id"]).execute()
+
+        return {
+            "config_id": str(cfg["id"]),
+            "pasta_raiz_id": root_id,
+            "pasta_raiz_nome": root_name,
+            "access_token": token,
+        }
+
+    async def sincronizar_pastas_clientes(
+        self,
+        *,
+        user_id: str,
+        empresa_ids: Optional[List[str]] = None,
+        config: Optional[Dict[str, Any]] = None,
+        access_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Cria/garante estrutura de pastas por cliente:
+        [Pasta Raiz]/[CNPJ - Razao Social]
+        """
+        from app.db.supabase_client import get_supabase_admin
+        import httpx
+
+        db = get_supabase_admin()
+        raiz = await self.garantir_pasta_raiz_exportacao(
+            user_id=user_id,
+            config=config,
+            access_token=access_token,
+        )
+        token = raiz["access_token"]
+        root_id = raiz["pasta_raiz_id"]
+
+        query = (
+            db.table("empresas")
+            .select("id, cnpj, razao_social")
+            .eq("usuario_id", user_id)
+            .is_("deleted_at", "null")
+        )
+        if empresa_ids:
+            query = query.in_("id", [str(eid) for eid in empresa_ids])
+
+        empresas = query.execute().data or []
+        headers = {"Authorization": f"Bearer {token}"}
+        mapeadas: List[Dict[str, Any]] = []
+        criadas = 0
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for empresa in empresas:
+                empresa_id = str(empresa.get("id") or "")
+                if not empresa_id:
+                    continue
+
+                cnpj_digits = re.sub(r"\D", "", str(empresa.get("cnpj") or ""))
+                nome_empresa = str(empresa.get("razao_social") or "Empresa")
+                nome_pasta = self._sanitize_folder_name(
+                    f"{cnpj_digits or 'SEM-CNPJ'} - {nome_empresa}",
+                    fallback=nome_empresa,
+                )
+
+                pasta_empresa_id = await self._get_or_create_folder(
+                    client,
+                    headers,
+                    nome_pasta,
+                    root_id,
+                )
+
+                existente = (
+                    db.table("drive_pastas_empresas")
+                    .select("id")
+                    .eq("user_id", user_id)
+                    .eq("empresa_id", empresa_id)
+                    .limit(1)
+                    .execute()
+                )
+
+                payload = {
+                    "user_id": user_id,
+                    "empresa_id": empresa_id,
+                    "pasta_raiz_id": root_id,
+                    "pasta_empresa_id": pasta_empresa_id,
+                    "pasta_empresa_nome": nome_pasta,
+                    "criado_automaticamente": True,
+                    "ativo": True,
+                }
+
+                if existente.data:
+                    db.table("drive_pastas_empresas").update(payload).eq("id", existente.data[0]["id"]).execute()
+                else:
+                    db.table("drive_pastas_empresas").insert(payload).execute()
+                    criadas += 1
+
+                mapeadas.append(payload)
+
+        return {
+            "pasta_raiz_id": root_id,
+            "pasta_raiz_nome": raiz["pasta_raiz_nome"],
+            "total_empresas": len(mapeadas),
+            "pastas_criadas": criadas,
+            "mapeamentos": mapeadas,
+        }
+
+    def _normalizar_mes_referencia(self, data_emissao: Any) -> str:
+        valor = str(data_emissao or "").strip()
+        if len(valor) >= 7:
+            return valor[:7]
+        return datetime.now().strftime("%Y-%m")
+
+    def _montar_nome_arquivo_xml(self, nota: Dict[str, Any], mes_ref: str) -> str:
+        chave = re.sub(r"\s+", "", str(nota.get("chave_acesso") or ""))
+        numero = self._sanitize_folder_name(str(nota.get("numero_nf") or "sem-numero"), fallback="sem-numero")
+        tipo_nf = self._sanitize_folder_name(str(nota.get("tipo_nf") or "NF"), fallback="NF")
+        if chave:
+            return f"{tipo_nf}_{chave}.xml"
+        return f"{tipo_nf}_{numero}_{mes_ref}.xml"
+
+    async def _atualizar_job_exportacao(self, job_id: str, campos: Dict[str, Any]) -> None:
+        from app.db.supabase_client import get_supabase_admin
+
+        db = get_supabase_admin()
+        db.table("drive_export_jobs").update(campos).eq("id", job_id).execute()
+
+    async def _registrar_item_exportacao(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        empresa_id: str,
+        nota: Dict[str, Any],
+        status_item: str,
+        mensagem: Optional[str] = None,
+        arquivo_nome: Optional[str] = None,
+        pasta_destino_id: Optional[str] = None,
+        drive_file_id: Optional[str] = None,
+    ) -> None:
+        from app.db.supabase_client import get_supabase_admin
+
+        db = get_supabase_admin()
+        nota_id = str(nota.get("id") or "")
+        payload = {
+            "job_id": job_id,
+            "user_id": user_id,
+            "empresa_id": empresa_id,
+            "nota_id": nota_id if nota_id else None,
+            "chave_acesso": nota.get("chave_acesso"),
+            "numero_nf": str(nota.get("numero_nf") or ""),
+            "mes_referencia": self._normalizar_mes_referencia(nota.get("data_emissao")),
+            "tipo_operacao": nota.get("tipo_operacao"),
+            "arquivo_nome": arquivo_nome or "",
+            "pasta_destino_id": pasta_destino_id,
+            "drive_file_id": drive_file_id,
+            "status": status_item,
+            "mensagem": mensagem,
+        }
+
+        existente = (
+            db.table("drive_export_job_itens")
+            .select("id")
+            .eq("job_id", job_id)
+            .eq("nota_id", payload["nota_id"])
+            .limit(1)
+            .execute()
+        )
+        if existente.data:
+            db.table("drive_export_job_itens").update(payload).eq("id", existente.data[0]["id"]).execute()
+        else:
+            db.table("drive_export_job_itens").insert(payload).execute()
+
+    def _aplicar_filtros_exportacao_notas(
+        self,
+        query: Any,
+        filtros: Dict[str, Any],
+    ) -> Any:
+        data_inicio = str(filtros.get("data_inicio") or "").strip()
+        data_fim = str(filtros.get("data_fim") or "").strip()
+        status = str(filtros.get("status") or "").strip().lower()
+        busca = str(filtros.get("busca") or "").strip()
+        tipo = str(filtros.get("tipo") or "").strip()
+
+        if data_inicio:
+            query = query.gte("data_emissao", f"{data_inicio}T00:00:00")
+        if data_fim:
+            query = query.lte("data_emissao", f"{data_fim}T23:59:59")
+
+        if status and status not in {"todos", "todas"}:
+            if status == "ativa":
+                query = query.eq("situacao", "autorizada")
+            else:
+                query = query.eq("situacao", status)
+
+        if tipo and tipo.lower() not in {"todos", "todas"}:
+            tipo_map = {
+                "nfe": "NFe",
+                "nfse": "NFSe",
+                "nfce": "NFCe",
+                "cte": "CTe",
+            }
+            query = query.eq("tipo_nf", tipo_map.get(tipo.replace("-", "").lower(), tipo))
+
+        if busca:
+            termo = busca.replace("'", "")
+            query = query.or_(
+                ",".join(
+                    [
+                        f"numero_nf.ilike.%{termo}%",
+                        f"chave_acesso.ilike.%{termo}%",
+                        f"nome_emitente.ilike.%{termo}%",
+                        f"nome_destinatario.ilike.%{termo}%",
+                        f"cnpj_emitente.ilike.%{termo}%",
+                        f"cnpj_destinatario.ilike.%{termo}%",
+                    ]
+                )
+            )
+
+        incluir_tomadas = bool(filtros.get("incluir_tomadas", True))
+        incluir_prestadas = bool(filtros.get("incluir_prestadas", True))
+        if incluir_tomadas and not incluir_prestadas:
+            query = query.eq("tipo_operacao", "entrada")
+        elif incluir_prestadas and not incluir_tomadas:
+            query = query.eq("tipo_operacao", "saida")
+
+        return query
+
+    async def iniciar_exportacao_xml_massa(
+        self,
+        *,
+        user_id: str,
+        empresa_ids: Optional[List[str]] = None,
+        filtros: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        from app.db.supabase_client import get_supabase_admin
+        import asyncio
+
+        db = get_supabase_admin()
+        filtros = filtros or {}
+        empresa_ids_norm = [str(item) for item in (empresa_ids or []) if str(item).strip()]
+
+        config = await self.obter_configuracao_ativa(user_id)
+        if not config:
+            raise ValueError("Google Drive nao conectado. Conecte o Drive antes de exportar.")
+
+        root_info = await self.garantir_pasta_raiz_exportacao(user_id=user_id, config=config)
+        await self.sincronizar_pastas_clientes(
+            user_id=user_id,
+            empresa_ids=empresa_ids_norm or None,
+            config=config,
+            access_token=root_info["access_token"],
+        )
+
+        empresas_query = (
+            db.table("empresas")
+            .select("id")
+            .eq("usuario_id", user_id)
+            .is_("deleted_at", "null")
+        )
+        if empresa_ids_norm:
+            empresas_query = empresas_query.in_("id", empresa_ids_norm)
+        empresas = empresas_query.execute().data or []
+        empresa_ids_job = [str(row.get("id")) for row in empresas if row.get("id")]
+        if not empresa_ids_job:
+            raise ValueError("Nenhuma empresa encontrada para exportacao.")
+
+        total_estimado = 0
+        for empresa_id in empresa_ids_job:
+            count_query = (
+                db.table("notas_fiscais")
+                .select("id", count="exact")
+                .eq("empresa_id", empresa_id)
+            )
+            count_query = self._aplicar_filtros_exportacao_notas(count_query, filtros)
+            count_resp = count_query.limit(1).execute()
+            total_estimado += int(count_resp.count or 0)
+
+        job_payload = {
+            "user_id": user_id,
+            "config_drive_id": config["id"],
+            "status": "pendente",
+            "empresa_ids": empresa_ids_job,
+            "filtros": filtros,
+            "total_notas": total_estimado,
+            "notas_processadas": 0,
+            "notas_exportadas": 0,
+            "notas_duplicadas": 0,
+            "notas_erro": 0,
+            "progresso_percentual": 0,
+            "mensagem": "Exportacao enfileirada...",
+            "pasta_raiz_id": root_info["pasta_raiz_id"],
+        }
+
+        job_resp = db.table("drive_export_jobs").insert(job_payload).execute()
+        if not job_resp.data:
+            raise ValueError("Nao foi possivel criar job de exportacao.")
+
+        job = job_resp.data[0]
+        job_id = str(job["id"])
+        task = asyncio.create_task(self._executar_exportacao_job(job_id))
+        self._export_tasks[job_id] = task
+
+        def _cleanup_task(_task: Any) -> None:
+            self._export_tasks.pop(job_id, None)
+
+        task.add_done_callback(_cleanup_task)
+        return job
+
+    async def obter_status_exportacao(self, *, job_id: str, user_id: str) -> Dict[str, Any]:
+        from app.db.supabase_client import get_supabase_admin
+
+        db = get_supabase_admin()
+        resp = (
+            db.table("drive_export_jobs")
+            .select("*")
+            .eq("id", job_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            raise ValueError("Job de exportacao nao encontrado.")
+        job = resp.data[0]
+        job["em_execucao"] = bool(self._export_tasks.get(job_id))
+        return job
+
+    async def listar_exportacoes(self, *, user_id: str, limite: int = 20) -> List[Dict[str, Any]]:
+        from app.db.supabase_client import get_supabase_admin
+
+        db = get_supabase_admin()
+        resp = (
+            db.table("drive_export_jobs")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(max(1, min(100, int(limite))))
+            .execute()
+        )
+        return resp.data or []
+
+    async def _executar_exportacao_job(self, job_id: str) -> None:
+        from app.db.supabase_client import get_supabase_admin
+        import httpx
+
+        db = get_supabase_admin()
+
+        try:
+            job_resp = db.table("drive_export_jobs").select("*").eq("id", job_id).limit(1).execute()
+            if not job_resp.data:
+                return
+            job = job_resp.data[0]
+            user_id = str(job.get("user_id") or "")
+            filtros = dict(job.get("filtros") or {})
+            empresa_ids = [str(item) for item in (job.get("empresa_ids") or []) if str(item)]
+            if not user_id or not empresa_ids:
+                await self._atualizar_job_exportacao(
+                    job_id,
+                    {
+                        "status": "erro",
+                        "mensagem": "Job invalido sem usuario/empresas.",
+                        "finalizado_em": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                return
+
+            config = await self.obter_configuracao_ativa(user_id)
+            if not config:
+                await self._atualizar_job_exportacao(
+                    job_id,
+                    {
+                        "status": "erro",
+                        "mensagem": "Google Drive nao conectado.",
+                        "finalizado_em": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                return
+
+            root_info = await self.garantir_pasta_raiz_exportacao(user_id=user_id, config=config)
+            token = root_info["access_token"]
+            sync_result = await self.sincronizar_pastas_clientes(
+                user_id=user_id,
+                empresa_ids=empresa_ids,
+                config=config,
+                access_token=token,
+            )
+
+            mapeamentos = {
+                str(item["empresa_id"]): item
+                for item in (sync_result.get("mapeamentos") or [])
+                if item.get("empresa_id")
+            }
+
+            await self._atualizar_job_exportacao(
+                job_id,
+                {
+                    "status": "processando",
+                    "iniciado_em": datetime.now(timezone.utc).isoformat(),
+                    "mensagem": "Iniciando upload dos XMLs para Google Drive...",
+                    "progresso_percentual": 0,
+                },
+            )
+
+            totais = {
+                "processadas": 0,
+                "exportadas": 0,
+                "duplicadas": 0,
+                "erros": 0,
+            }
+            total_notas = int(job.get("total_notas") or 0)
+            sobrescrever = bool(filtros.get("sobrescrever_arquivos", False))
+            organizar_por_mes = bool(filtros.get("organizar_por_mes", True))
+            separar_por_operacao = bool(filtros.get("separar_por_operacao", True))
+
+            headers = {"Authorization": f"Bearer {token}"}
+            month_folder_cache: Dict[str, str] = {}
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                for empresa_id in empresa_ids:
+                    pasta_empresa = mapeamentos.get(empresa_id)
+                    if not pasta_empresa:
+                        totais["erros"] += 1
+                        continue
+
+                    empresa_folder_id = str(pasta_empresa.get("pasta_empresa_id") or "")
+                    if not empresa_folder_id:
+                        totais["erros"] += 1
+                        continue
+
+                    offset = 0
+                    page_size = 200
+
+                    while True:
+                        query = (
+                            db.table("notas_fiscais")
+                            .select(
+                                "id, chave_acesso, numero_nf, tipo_nf, tipo_operacao, data_emissao, "
+                                "xml_completo, xml_resumo"
+                            )
+                            .eq("empresa_id", empresa_id)
+                        )
+                        query = self._aplicar_filtros_exportacao_notas(query, filtros)
+                        query = query.order("data_emissao", desc=True).range(offset, offset + page_size - 1)
+                        notas_page = query.execute().data or []
+                        if not notas_page:
+                            break
+
+                        for nota in notas_page:
+                            totais["processadas"] += 1
+                            mes_ref = self._normalizar_mes_referencia(nota.get("data_emissao"))
+                            arquivo_nome = self._montar_nome_arquivo_xml(nota, mes_ref)
+
+                            parent_folder_id = empresa_folder_id
+                            if organizar_por_mes:
+                                mes_cache_key = f"{empresa_id}:{mes_ref}"
+                                if mes_cache_key not in month_folder_cache:
+                                    month_folder_cache[mes_cache_key] = await self._get_or_create_folder(
+                                        client,
+                                        headers,
+                                        mes_ref,
+                                        empresa_folder_id,
+                                    )
+                                parent_folder_id = month_folder_cache[mes_cache_key]
+
+                            if separar_por_operacao:
+                                op_nome = "Prestadas" if str(nota.get("tipo_operacao") or "entrada") == "saida" else "Tomadas"
+                                op_cache_key = f"{empresa_id}:{mes_ref}:{op_nome}"
+                                if op_cache_key not in month_folder_cache:
+                                    month_folder_cache[op_cache_key] = await self._get_or_create_folder(
+                                        client,
+                                        headers,
+                                        op_nome,
+                                        parent_folder_id,
+                                    )
+                                parent_folder_id = month_folder_cache[op_cache_key]
+
+                            xml_text = str(nota.get("xml_completo") or nota.get("xml_resumo") or "").strip()
+                            if not xml_text:
+                                totais["erros"] += 1
+                                await self._registrar_item_exportacao(
+                                    job_id=job_id,
+                                    user_id=user_id,
+                                    empresa_id=empresa_id,
+                                    nota=nota,
+                                    status_item="erro",
+                                    mensagem="Nota sem XML completo/resumo para exportacao.",
+                                    arquivo_nome=arquivo_nome,
+                                    pasta_destino_id=parent_folder_id,
+                                )
+                                continue
+
+                            existente_id = await self._obter_arquivo_por_nome_em_pasta(
+                                client,
+                                headers,
+                                arquivo_nome,
+                                parent_folder_id,
+                            )
+                            if existente_id and not sobrescrever:
+                                totais["duplicadas"] += 1
+                                await self._registrar_item_exportacao(
+                                    job_id=job_id,
+                                    user_id=user_id,
+                                    empresa_id=empresa_id,
+                                    nota=nota,
+                                    status_item="duplicada",
+                                    mensagem="Arquivo ja existente no Drive.",
+                                    arquivo_nome=arquivo_nome,
+                                    pasta_destino_id=parent_folder_id,
+                                    drive_file_id=existente_id,
+                                )
+                                continue
+
+                            if existente_id and sobrescrever:
+                                try:
+                                    await client.delete(
+                                        f"https://www.googleapis.com/drive/v3/files/{existente_id}",
+                                        headers=headers,
+                                    )
+                                except Exception:
+                                    logger.debug("Falha ao remover arquivo existente para sobrescrita.", exc_info=True)
+
+                            try:
+                                file_id = await self._upload_file(
+                                    client,
+                                    headers,
+                                    arquivo_nome,
+                                    xml_text.encode("utf-8"),
+                                    "application/xml",
+                                    parent_folder_id,
+                                )
+                                totais["exportadas"] += 1
+                                await self._registrar_item_exportacao(
+                                    job_id=job_id,
+                                    user_id=user_id,
+                                    empresa_id=empresa_id,
+                                    nota=nota,
+                                    status_item="exportada",
+                                    arquivo_nome=arquivo_nome,
+                                    pasta_destino_id=parent_folder_id,
+                                    drive_file_id=file_id,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                totais["erros"] += 1
+                                await self._registrar_item_exportacao(
+                                    job_id=job_id,
+                                    user_id=user_id,
+                                    empresa_id=empresa_id,
+                                    nota=nota,
+                                    status_item="erro",
+                                    mensagem=f"Falha upload: {exc}",
+                                    arquivo_nome=arquivo_nome,
+                                    pasta_destino_id=parent_folder_id,
+                                )
+
+                            if total_notas > 0:
+                                progresso = round((totais["processadas"] / total_notas) * 100, 2)
+                            else:
+                                progresso = 0
+
+                            if totais["processadas"] % 15 == 0:
+                                await self._atualizar_job_exportacao(
+                                    job_id,
+                                    {
+                                        "notas_processadas": totais["processadas"],
+                                        "notas_exportadas": totais["exportadas"],
+                                        "notas_duplicadas": totais["duplicadas"],
+                                        "notas_erro": totais["erros"],
+                                        "progresso_percentual": progresso,
+                                        "mensagem": f"Exportando XMLs... {totais['processadas']} processadas",
+                                    },
+                                )
+
+                        offset += len(notas_page)
+
+            status_final = "concluido"
+            if totais["erros"] > 0:
+                status_final = "concluido_com_erros" if totais["exportadas"] > 0 else "erro"
+
+            progresso_final = 100 if total_notas > 0 else (100 if totais["processadas"] > 0 else 0)
+            await self._atualizar_job_exportacao(
+                job_id,
+                {
+                    "status": status_final,
+                    "notas_processadas": totais["processadas"],
+                    "notas_exportadas": totais["exportadas"],
+                    "notas_duplicadas": totais["duplicadas"],
+                    "notas_erro": totais["erros"],
+                    "progresso_percentual": progresso_final,
+                    "mensagem": (
+                        f"Exportacao finalizada: {totais['exportadas']} exportadas, "
+                        f"{totais['duplicadas']} duplicadas, {totais['erros']} erros."
+                    ),
+                    "finalizado_em": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Erro geral no job de exportacao Google Drive job_id=%s", job_id)
+            await self._atualizar_job_exportacao(
+                job_id,
+                {
+                    "status": "erro",
+                    "mensagem": f"Erro geral na exportacao: {exc}",
+                    "finalizado_em": datetime.now(timezone.utc).isoformat(),
+                },
+            )
 
     async def sincronizar(
         self, config_id: str, user_id: str
@@ -804,8 +1590,6 @@ class GoogleDriveService:
         self, filename: str, xml_content: bytes, erro: str
     ):
         """Salva XMLs com erro para debug."""
-        import os
-
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             os.makedirs("logs/xml_erros", exist_ok=True)
@@ -960,3 +1744,4 @@ class GoogleDriveService:
 
 # Singleton
 google_drive_service = GoogleDriveService()
+

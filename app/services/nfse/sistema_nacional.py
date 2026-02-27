@@ -658,7 +658,7 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             or "0"
         )
 
-        chave_acesso = self._extrair_chave_acesso_nfse(inf_nfse, item_dfe)
+        chave_acesso = self._extrair_chave_acesso_nfse(inf_nfse, item_dfe, xml_doc=xml_doc)
         numero_nf = self._find_first_text(inf_nfse, ["nNFSe", "numero", "Numero", "nDPS"]) or ""
         serie = self._find_first_text(inf_nfse, ["serie", "Serie"]) or ""
 
@@ -729,10 +729,23 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             return "Cancelada"
         return "Autorizada"
 
-    def _extrair_chave_acesso_nfse(self, inf_nfse: ET.Element, item_dfe: Dict[str, Any]) -> str:
+    def _extrair_chave_acesso_nfse(
+        self,
+        inf_nfse: ET.Element,
+        item_dfe: Dict[str, Any],
+        xml_doc: str = "",
+    ) -> str:
         chave = str(item_dfe.get("ChaveAcesso") or "").strip()
-        if chave and len(re.sub(r"\D", "", chave)) >= 44:
-            return chave
+        match_chave = re.search(r"(\d{50})", chave)
+        if match_chave:
+            return match_chave.group(1)
+
+        # Alguns lotes usam camelCase/variações.
+        for field in ("chaveAcesso", "chave_acesso", "IdNfse", "idNfse"):
+            valor = str(item_dfe.get(field) or "").strip()
+            match_valor = re.search(r"(\d{50})", valor)
+            if match_valor:
+                return match_valor.group(1)
 
         ident = str((inf_nfse.attrib or {}).get("Id") or "").strip()
         if ident:
@@ -742,6 +755,21 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             if ident.startswith("NFS"):
                 return ident[3:]
             return ident
+
+        # Tags comuns de chave no layout nacional.
+        for tag_name in ("chNFSe", "chNfse", "chaveAcesso", "ChaveAcesso"):
+            valor = self._find_first_text(inf_nfse, [tag_name]) or ""
+            match_tag = re.search(r"(\d{50})", valor)
+            if match_tag:
+                return match_tag.group(1)
+
+        # Fallback defensivo: procura qualquer chave de 50 digitos no trecho XML da nota.
+        xml_fragmento = ET.tostring(inf_nfse, encoding="unicode")
+        if xml_doc:
+            xml_fragmento = f"{xml_fragmento}\n{xml_doc}"
+        match_xml = re.search(r"(\d{50})", xml_fragmento)
+        if match_xml:
+            return match_xml.group(1)
 
         return ""
 
@@ -786,6 +814,7 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
             return True
 
         bloqueios = (
+            "sped.fazenda.gov.br",
             "w3.org",
             "etsi.org",
             "xmlsoap.org",
