@@ -83,6 +83,32 @@ Correcao:
 Status:
 - corrigido.
 
+---
+
+### Erro 5 - Endpoint `/drive/configuracoes` retornando 500 em schema legado
+
+Arquivo:
+- `app/services/google_drive_service.py`
+
+Sintoma:
+- chamada autenticada a `GET /api/v1/drive/configuracoes` falhando com 500.
+
+Causa:
+- query selecionava colunas novas (`pasta_raiz_export_id`, `pasta_raiz_export_nome`)
+  inexistentes em algumas bases que ainda nao aplicaram migration correspondente.
+
+Correcao:
+- fallback de compatibilidade em `listar_configuracoes`:
+  - tenta query com schema novo;
+  - em erro `42703` (coluna inexistente), refaz com schema legado;
+  - injeta campos ausentes como `null` para manter contrato da API.
+
+Teste de regressao:
+- `tests/test_google_drive_service_schema_compat.py`
+
+Status:
+- corrigido.
+
 ## 3. Testes criados/adicionados
 
 Novos arquivos:
@@ -107,6 +133,9 @@ Novos arquivos:
   - auth URL
   - inicio/status de exportacao em massa
   - sincronizacao de pastas de clientes no Drive
+
+- `tests/test_google_drive_service_schema_compat.py`
+  - compatibilidade de `listar_configuracoes` com schema legado de `configuracoes_drive`
 
 Ajustes de suporte:
 - `tests/conftest.py` com fake client/query Supabase para testes de endpoint.

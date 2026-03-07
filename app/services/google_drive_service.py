@@ -223,20 +223,47 @@ class GoogleDriveService:
         self, user_id: str
     ) -> List[Dict[str, Any]]:
         from app.db.supabase_client import get_supabase_admin
+        from postgrest.exceptions import APIError
 
         db = get_supabase_admin()
-        result = (
-            db.table("configuracoes_drive")
-            .select(
-                "id, user_id, empresa_id, provedor, pasta_id, "
-                "pasta_nome, pasta_raiz_export_id, pasta_raiz_export_nome, "
-                "ultima_sincronizacao, total_importadas, ativo, created_at, updated_at"
-            )
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .execute()
+        select_new = (
+            "id, user_id, empresa_id, provedor, pasta_id, "
+            "pasta_nome, pasta_raiz_export_id, pasta_raiz_export_nome, "
+            "ultima_sincronizacao, total_importadas, ativo, created_at, updated_at"
         )
-        return result.data or []
+        select_legacy = (
+            "id, user_id, empresa_id, provedor, pasta_id, "
+            "pasta_nome, ultima_sincronizacao, total_importadas, ativo, created_at, updated_at"
+        )
+
+        try:
+            result = (
+                db.table("configuracoes_drive")
+                .select(select_new)
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            return result.data or []
+        except APIError as exc:
+            message = str(exc)
+            if "pasta_raiz_export_id" not in message and "pasta_raiz_export_nome" not in message:
+                raise
+
+            # Compatibilidade com bases antigas onde as colunas de pasta raiz ainda
+            # nao foram migradas. Mantem contrato de resposta preenchendo null.
+            result = (
+                db.table("configuracoes_drive")
+                .select(select_legacy)
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            rows = result.data or []
+            for row in rows:
+                row.setdefault("pasta_raiz_export_id", None)
+                row.setdefault("pasta_raiz_export_nome", None)
+            return rows
 
     async def remover_configuracao(self, config_id: str, user_id: str) -> bool:
         from app.db.supabase_client import get_supabase_admin
