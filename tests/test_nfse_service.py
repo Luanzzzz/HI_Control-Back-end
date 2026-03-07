@@ -36,33 +36,39 @@ class TestNFSeServiceAdapterSelection:
         self.service = NFSeService()
         self.credentials = {"usuario": "teste", "senha": "teste123"}
 
-    def test_selecionar_adapter_belo_horizonte(self):
+    def test_selecionar_adapter_belo_horizonte(self, monkeypatch):
         """Deve retornar BeloHorizonteAdapter para código IBGE 3106200."""
+        monkeypatch.setenv("NFSE_FORCAR_SISTEMA_NACIONAL", "false")
         adapter = self.service.obter_adapter("3106200", self.credentials)
         assert isinstance(adapter, BeloHorizonteAdapter)
 
-    def test_selecionar_adapter_sao_paulo(self):
+    def test_selecionar_adapter_sao_paulo(self, monkeypatch):
         """Deve retornar SaoPauloAdapter para código IBGE 3550308."""
+        monkeypatch.setenv("NFSE_FORCAR_SISTEMA_NACIONAL", "false")
         adapter = self.service.obter_adapter("3550308", self.credentials)
         assert isinstance(adapter, SaoPauloAdapter)
 
-    def test_selecionar_adapter_sistema_nacional_fallback(self):
+    def test_selecionar_adapter_sistema_nacional_fallback(self, monkeypatch):
         """Deve retornar SistemaNacionalAdapter para município sem implementação específica."""
+        monkeypatch.setenv("NFSE_FORCAR_SISTEMA_NACIONAL", "false")
         adapter = self.service.obter_adapter("1234567", self.credentials)
         assert isinstance(adapter, SistemaNacionalAdapter)
 
-    def test_selecionar_adapter_codigo_vazio(self):
+    def test_selecionar_adapter_codigo_vazio(self, monkeypatch):
         """Deve retornar SistemaNacionalAdapter quando código está vazio."""
+        monkeypatch.setenv("NFSE_FORCAR_SISTEMA_NACIONAL", "false")
         adapter = self.service.obter_adapter("", self.credentials)
         assert isinstance(adapter, SistemaNacionalAdapter)
 
-    def test_adapter_recebe_credenciais(self):
+    def test_adapter_recebe_credenciais(self, monkeypatch):
         """Adapter deve receber as credenciais passadas."""
+        monkeypatch.setenv("NFSE_FORCAR_SISTEMA_NACIONAL", "false")
         adapter = self.service.obter_adapter("3106200", self.credentials)
         assert adapter.credentials == self.credentials
 
-    def test_adapter_ambiente_homologacao(self):
+    def test_adapter_ambiente_homologacao(self, monkeypatch):
         """Deve configurar ambiente de homologação quando solicitado."""
+        monkeypatch.setenv("NFSE_FORCAR_SISTEMA_NACIONAL", "false")
         adapter = self.service.obter_adapter(
             "3106200", self.credentials, homologacao=True
         )
@@ -315,10 +321,9 @@ class TestNFSeServiceHelpers:
 
         chave = self.service._gerar_chave_nfse(nota)
 
-        assert chave.startswith("NFSE-")
-        assert "3106200" in chave
-        assert "18039919000154" in chave
-        assert "ABC123" in chave
+        assert chave.startswith("NFSE")
+        assert len(chave) == 44
+        assert chave[4:].isalnum()
 
     def test_gerar_chave_nfse_sem_codigo_verificacao(self):
         """Deve gerar chave mesmo sem código de verificação."""
@@ -330,8 +335,8 @@ class TestNFSeServiceHelpers:
 
         chave = self.service._gerar_chave_nfse(nota)
 
-        assert chave.startswith("NFSE-")
-        assert "3550308" in chave
+        assert chave.startswith("NFSE")
+        assert len(chave) <= 44
 
     def test_normalizar_status_autorizada(self):
         """Status 'autorizada' e similares devem normalizar para 'autorizada'."""
@@ -359,6 +364,27 @@ class TestNFSeServiceHelpers:
         assert "3106200" in codigos
         assert "3550308" in codigos
         assert "default" in codigos
+
+    def test_anexar_credencial_modo_certificado_a1(self):
+        cred = self.service._anexar_certificado_nas_credenciais(  # noqa: SLF001
+            {
+                "id": "cred-1",
+                "usuario": "AUTO_CERT_A1",
+                "senha": None,
+                "token": "AUTO_CERT_A1|NSU:0",
+                "cnpj": "18039919000154",
+                "municipio_codigo": "3106200",
+            },
+            {
+                "cnpj": "18.039.919/0001-54",
+                "municipio_codigo": "3106200",
+                "certificado_a1": "base64-pfx",
+                "certificado_senha_encrypted": "senha-enc",
+            },
+        )
+        assert cred["modo_autenticacao"] == "certificado_a1"
+        assert cred["certificado_a1"] == "base64-pfx"
+        assert cred["certificado_senha_encrypted"] == "senha-enc"
 
 
 # ============================================

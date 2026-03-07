@@ -1059,6 +1059,10 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
 
         for nota_raw in lista_notas:
             try:
+                if not isinstance(nota_raw, dict):
+                    self.log_warning("Nota ignorada por payload invalido (nao-dict).")
+                    continue
+
                 prestador = nota_raw.get("prestador") or {}
                 if isinstance(prestador, str):
                     prestador = {}
@@ -1179,8 +1183,11 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
                 notas.append(nota)
 
             except Exception as exc:  # noqa: BLE001
+                numero_nota = "?"
+                if isinstance(nota_raw, dict):
+                    numero_nota = nota_raw.get("numero", "?")
                 self.log_warning(
-                    f"Erro ao processar nota {nota_raw.get('numero', '?')}: {exc}"
+                    f"Erro ao processar nota {numero_nota}: {exc}"
                 )
                 continue
 
