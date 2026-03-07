@@ -1,355 +1,200 @@
-# Hi-Control Backend API
+# HI-Control Back-end
 
-API REST em Python/FastAPI para o sistema de gestão contábil Hi-Control.
+API FastAPI para gestao contabil/fiscal com foco em captura de notas, emissao fiscal e automacoes para escritorio contabil.
 
-## 🚀 Tecnologias
+## Visao geral
 
-- **FastAPI** - Framework web assíncrono moderno
-- **SQLAlchemy** - ORM para Python
-- **Alembic** - Migrações de banco de dados
-- **Pydantic** - Validação de dados
-- **JWT** - Autenticação com JSON Web Tokens
-- **SQLite** - Banco de dados (desenvolvimento)
+Este backend centraliza:
 
-## 📋 Pré-requisitos
+- autenticacao e controle de plano
+- cadastro de empresas/clientes do contador
+- captura automatica de notas fiscais (SEFAZ + NFS-e)
+- dashboard financeiro por empresa
+- download de XML/PDF por nota
+- importacao/exportacao de XML por Email e Google Drive
+- emissao fiscal (NFe, NFCe, CTe, NFSe)
+- worker de sincronizacao periodica
 
-- Python 3.10+
-- pip (gerenciador de pacotes Python)
+## Stack atual
 
-## 🔧 Instalação
+- Python 3.12
+- FastAPI
+- Supabase (PostgreSQL via REST)
+- APScheduler (jobs recorrentes)
+- PyNFE (quando disponivel no runtime)
+- lxml / signxml / cryptography
 
-### 1. Criar ambiente virtual
+## Estrutura principal
 
-```bash
-cd backend
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# Linux/Mac
-source venv/bin/activate
+```text
+app/
+  api/v1/endpoints/      # rotas da API
+  services/              # regras de negocio
+  services/nfse/         # adapters NFS-e (nacional + municipais)
+  worker/                # worker de sincronizacao SEFAZ
+  core/                  # config e seguranca
+  db/                    # cliente Supabase e repositorios
+database/
+  migrations/            # migrations SQL (001..015)
+tests/
+  unitarios e integracao
 ```
 
-### 2. Instalar dependências
+## Modulos funcionais mapeados
+
+### 1) Autenticacao e perfil
+
+- `POST /api/v1/auth/login`
+- `POST /api/v1/auth/logout`
+- `GET /api/v1/auth/me`
+- `GET/PUT /api/v1/perfil/`
+- endpoints de perfil do contador em `perfil_contador.py`
+
+### 2) Empresas (clientes do contador)
+
+- CRUD de empresas em `app/api/v1/endpoints/empresas.py`
+- preview de certificado antes de salvar empresa
+- reprocessamento de municipio da empresa
+
+### 3) Certificados A1
+
+- upload, consulta e renovacao em `certificados.py`
+- senha de certificado criptografada
+- suporte a fallback de decrypt legado para compatibilidade
+
+### 4) Buscador de notas e dashboard
+
+Endpoints em `dashboard_endpoints.py`:
+
+- `GET /api/v1/empresas/{empresa_id}/dashboard`
+- `GET /api/v1/empresas/{empresa_id}/notas`
+- `GET /api/v1/empresas/{empresa_id}/notas/{nota_id}`
+- `GET /api/v1/empresas/{empresa_id}/notas/{nota_id}/xml`
+- `GET /api/v1/empresas/{empresa_id}/notas/{nota_id}/pdf`
+- `GET /api/v1/empresas/{empresa_id}/notas/{nota_id}/portal-oficial`
+
+Funcionalidades:
+
+- filtros por tipo/status/retencao/busca/data
+- paginacao
+- resumo financeiro mensal e historico 12 meses
+- tentativa de PDF oficial (portal fiscal) com fallback controlado
+
+### 5) Captura automatica de notas
+
+#### SEFAZ Sync
+
+`sync_endpoints.py`:
+
+- status de sync por empresa
+- forcar sincronizacao (somente plano admin)
+- historico de sincronizacao
+- configuracao global e configuracao por empresa
+
+`captura_sefaz_service.py`:
+
+- distribuicao DFe
+- parse de modelos (55, 65, 57 e correlatos)
+- controle de cursor NSU
+- atualizacao de progresso de captura
+
+#### NFS-e
+
+`nfse_service.py` + adapters em `app/services/nfse/`:
+
+- suporte ao Sistema Nacional
+- adapters municipais (BH, SP, RJ, Curitiba, Porto Alegre, Fortaleza, Manaus)
+- auto-credencial por certificado quando aplicavel
+
+### 6) Google Drive (importacao + exportacao em massa)
+
+`drive_import_endpoints.py` + `google_drive_service.py`:
+
+- OAuth
+- sincronizacao de pastas por cliente
+- importacao de XML
+- exportacao em massa de XML para Drive (jobs com progresso)
+
+### 7) Emissao fiscal
+
+- NFe: `emissao_nfe.py`
+- NFCe: `emissao_nfce.py`
+- CTe: `emissao_cte.py`
+- NFSe: `emissao_nfse.py`
+- suporte de emissao (CFOP/NCM/produtos/validacoes): `suporte_emissao.py`
+
+## Rotas e docs
+
+Com a API local em execucao:
+
+- Swagger: `http://localhost:8000/api/v1/docs`
+- ReDoc: `http://localhost:8000/api/v1/redoc`
+- OpenAPI JSON: `http://localhost:8000/api/v1/openapi.json`
+
+## Variaveis de ambiente (essenciais)
+
+Exemplos no `.env.example`.
+
+Campos criticos:
+
+- `SECRET_KEY`
+- `SUPABASE_URL`
+- `SUPABASE_KEY`
+- `SUPABASE_SERVICE_KEY`
+- `CERTIFICATE_ENCRYPTION_KEY`
+- `SEFAZ_AMBIENTE` (`producao` ou `homologacao`)
+
+Google Drive:
+
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REDIRECT_URI`
+
+## Execucao local
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 3. Configurar variáveis de ambiente
-
-```bash
-cp .env.example .env
-```
-
-Edite o arquivo `.env` e configure:
-- `SECRET_KEY`: Gere uma chave segura com `openssl rand -hex 32`
-- Outras variáveis conforme necessário
-
-### 4. Inicializar banco de dados
-
-```bash
-# Criar migration inicial
-alembic revision --autogenerate -m "Initial migration"
-
-# Aplicar migrations
-alembic upgrade head
-```
-
-### 5. Popular banco com dados de teste
-
-```python
-# Execute o script Python
-python -c "
-import asyncio
-from app.db.session import AsyncSessionLocal
-from app.db.init_db import init_db
-from app.db.base import Base
-from app.db.session import engine
-
-async def main():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with AsyncSessionLocal() as session:
-        await init_db(session)
-
-    print('✅ Banco de dados inicializado com sucesso!')
-
-asyncio.run(main())
-"
-```
-
-## 🏃 Executar
-
-### Modo desenvolvimento (com hot reload)
-
-```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-### Modo produção
+## Worker e scheduler
+
+No startup (fora de ambiente serverless):
+
+- inicia scheduler de tarefas
+- inicia worker de sincronizacao SEFAZ
+
+Em ambiente serverless (ex. Vercel), o backend pula worker/scheduler no lifespan.
+
+## Testes
+
+### Suite padrao (unitaria/regressao)
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+pytest -q
 ```
 
-## 📚 Documentação da API
+Configuracao em `pytest.ini`:
 
-Após iniciar o servidor, acesse:
+- executa apenas `tests/`
+- ignora `@pytest.mark.integration` por padrao
 
-- **Swagger UI**: http://localhost:8000/api/docs
-- **ReDoc**: http://localhost:8000/api/redoc
-- **OpenAPI JSON**: http://localhost:8000/api/openapi.json
-
-## 🔐 Autenticação
-
-### Credenciais de Teste
-
-| Email | Senha | Plano |
-|-------|-------|-------|
-| admin@hicontrol.com | admin123 | Premium |
-| premium@hicontrol.com | premium123 | Premium |
-| basico@hicontrol.com | basico123 | Básico |
-
-### Obter Token de Acesso
+### Suite de integracao (opt-in)
 
 ```bash
-curl -X POST "http://localhost:8000/api/v1/auth/login" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=admin@hicontrol.com&password=admin123"
+pytest -m integration -v
 ```
 
-Resposta:
-```json
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "token_type": "bearer"
-}
-```
+Use para cenarios que dependem de servicos externos (SEFAZ, PyNFE real, etc.).
 
-### Usar Token em Requisições
+## Observacoes de qualidade
 
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas" \
-  -H "Authorization: Bearer {seu_access_token}"
-```
+- o projeto possui arquivos legados de diagnostico na raiz; eles nao fazem parte da suite padrao de testes
+- para manter a coleta de testes estavel, use sempre `pytest` com `pytest.ini` versionado
+- para features com dependencia externa, mantenha testes unitarios com mocks + integracao opt-in
 
-## 🛣️ Rotas Principais
+## Documentacao complementar
 
-### Autenticação (`/api/v1/auth`)
+- `docs/MAPEAMENTO_FUNCIONALIDADES.md`
+- `docs/RELATORIO_REVISAO_TESTES_2026-03-07.md`
 
-- `POST /login` - Login com email e senha
-- `POST /logout` - Logout (invalidar token)
-- `GET /me` - Dados do usuário autenticado
-
-### Notas Fiscais (`/api/v1/notas`)
-
-- `GET /` - Buscar notas com filtros
-  - Query params:
-    - `search_term`: Busca geral
-    - `tipo_nf`: NFE, NFCE, NFSE, CTE
-    - `situacao`: Autorizada, Cancelada, etc
-    - `data_inicio`, `data_fim`: Filtro por período
-    - `skip`, `limit`: Paginação
-
-### Exemplos de Uso
-
-**Buscar todas as notas:**
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas" \
-  -H "Authorization: Bearer {token}"
-```
-
-**Buscar NF-e autorizadas:**
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas?tipo_nf=NFE&situacao=Autorizada" \
-  -H "Authorization: Bearer {token}"
-```
-
-**Buscar por termo:**
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas?search_term=Tech" \
-  -H "Authorization: Bearer {token}"
-```
-
-## 📁 Estrutura de Diretórios
-
-```
-backend/
-├── app/
-│   ├── api/
-│   │   └── v1/
-│   │       ├── endpoints/       # Rotas da API
-│   │       │   ├── auth.py
-│   │       │   └── notas.py
-│   │       └── router.py
-│   ├── core/                    # Configurações e segurança
-│   │   ├── config.py
-│   │   └── security.py
-│   ├── db/                      # Banco de dados
-│   │   ├── base.py
-│   │   ├── session.py
-│   │   └── init_db.py
-│   ├── models/                  # Modelos SQLAlchemy
-│   │   ├── user.py
-│   │   └── nota_fiscal.py
-│   ├── schemas/                 # Schemas Pydantic
-│   │   ├── auth.py
-│   │   ├── user.py
-│   │   └── nota_fiscal.py
-│   ├── services/                # Lógica de negócio
-│   │   ├── auth_service.py
-│   │   ├── user_service.py
-│   │   └── nota_service.py
-│   ├── main.py                  # Entry point
-│   └── dependencies.py          # Dependências compartilhadas
-├── alembic/                     # Migrações
-├── tests/                       # Testes
-├── requirements.txt
-└── .env
-```
-
-## 🧪 Testes
-
-```bash
-# Instalar dependências de desenvolvimento
-pip install -r requirements-dev.txt
-
-# Executar testes
-pytest tests/ -v
-
-# Com cobertura
-pytest tests/ -v --cov=app --cov-report=html
-```
-
-## 🔄 Migrações do Banco de Dados
-
-### Criar nova migration
-
-```bash
-alembic revision --autogenerate -m "Descrição da mudança"
-```
-
-### Aplicar migrations
-
-```bash
-alembic upgrade head
-```
-
-### Reverter última migration
-
-```bash
-alembic downgrade -1
-```
-
-### Ver histórico
-
-```bash
-alembic history
-```
-
-## 🔒 Segurança
-
-### Boas Práticas Implementadas
-
-- ✅ Senhas hasheadas com bcrypt
-- ✅ Autenticação JWT com tokens de curta duração
-- ✅ CORS configurado para domínios específicos
-- ✅ Validações rigorosas de dados fiscais (CNPJ, Chave de Acesso)
-- ✅ Type hints em todo o código
-
-### Melhorias Futuras
-
-- [ ] Rate limiting (limitação de requisições)
-- [ ] Blacklist de tokens (logout real)
-- [ ] Auditoria de acesso
-- [ ] HTTPS obrigatório em produção
-- [ ] Certificado digital para assinatura de XMLs
-
-## 📊 Validações Implementadas
-
-### CNPJ
-- Formato: `XX.XXX.XXX/XXXX-XX`
-- Validação de estrutura com regex
-
-### Chave de Acesso NF-e
-- Exatamente 44 dígitos numéricos
-- Sem formatação (apenas números)
-
-### Valores Monetários
-- Tipo `Decimal` (precisão fiscal)
-- Máximo 2 casas decimais
-- Não-negativos
-
-## 🚀 Deploy em Produção
-
-### Preparação
-
-1. Alterar `DATABASE_URL` para PostgreSQL
-2. Gerar `SECRET_KEY` segura
-3. Configurar CORS para domínios específicos
-4. Desabilitar `DEBUG=False`
-
-### Docker (opcional)
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-### Variáveis de Ambiente de Produção
-
-```env
-SECRET_KEY=<chave_gerada_com_openssl>
-DATABASE_URL=postgresql+asyncpg://user:password@host:5432/hicontrol
-DEBUG=False
-CORS_ORIGINS=https://hi-control.vercel.app
-ALLOWED_HOSTS=api.hicontrol.com
-```
-
-## 🆘 Troubleshooting
-
-### Erro: "No module named 'app'"
-
-Execute sempre do diretório `backend/`:
-```bash
-cd backend
-python -m uvicorn app.main:app --reload
-```
-
-### Erro: "SECRET_KEY not found"
-
-Certifique-se de ter um arquivo `.env` com `SECRET_KEY` configurada.
-
-### Erro de conexão com banco de dados
-
-Verifique se as migrations foram aplicadas:
-```bash
-alembic upgrade head
-```
-
-## 📞 Suporte
-
-Para dúvidas ou problemas:
-1. Consulte a documentação da API em `/api/docs`
-2. Verifique os logs do servidor
-3. Abra uma issue no repositório
-
-## 📝 Licença
-
-Este projeto é parte do sistema Hi-Control - Todos os direitos reservados.
-
----
-
-**Desenvolvido com ❤️ para escritórios de contabilidade brasileiros**
