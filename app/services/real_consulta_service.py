@@ -280,8 +280,9 @@ class RealConsultaService:
                 situacao = 'denegada'
                 situacao_codigo = '2'
 
-        # Determinar tipo base
-        tipo_base = 'nfe' if modelo == '55' else 'nfce'
+        # Determinar tipo base (deve corresponder ao Literal em NotaFiscalCreate)
+        tipo_base_map = {'55': 'NFe', '65': 'NFCe', '57': 'CTe'}
+        tipo_base = tipo_base_map.get(modelo, 'NFe')
         tipo_operacao = 'entrada' if tipo_nf == '0' else 'saida'
 
         # Criar NotaFiscalCreate
@@ -291,7 +292,7 @@ class RealConsultaService:
             numero_nf=numero_nf,
             serie=serie,
             modelo=modelo,
-            tipo_nf=tipo_base.upper(),
+            tipo_nf=tipo_base,
             tipo_operacao=tipo_operacao,
             data_emissao=data_emissao,
             cnpj_emitente=cnpj_emitente,
