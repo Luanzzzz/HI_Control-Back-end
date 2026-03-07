@@ -78,34 +78,34 @@ def map_nfe_buscada_to_nota_fiscal(
 def extrair_numero_da_chave(chave: str) -> str:
     """
     Extrai número da NF da chave de acesso.
-    
-    Posições 25-33 (9 dígitos).
+
+    Posições 28-36 (9 dígitos) - padrão SEFAZ.
     Remove zeros à esquerda para formato legível.
-    
+
     Args:
         chave: Chave de acesso de 44 dígitos
-    
+
     Returns:
         Número da NF como string
     """
-    numero_raw = chave[25:34]  # Posições 25-33 (9 caracteres)
+    numero_raw = chave[27:36]  # Posições 28-36 (9 caracteres) - padrão SEFAZ
     return str(int(numero_raw))  # Remove zeros à esquerda
 
 
 def extrair_serie_da_chave(chave: str) -> str:
     """
     Extrai série da NF da chave de acesso.
-    
-    Posições 22-24 (3 dígitos).
+
+    Posições 25-27 (3 dígitos) - padrão SEFAZ.
     Remove zeros à esquerda.
-    
+
     Args:
         chave: Chave de acesso de 44 dígitos
-    
+
     Returns:
         Série da NF como string
     """
-    serie_raw = chave[22:25]  # Posições 22-24 (3 caracteres)
+    serie_raw = chave[24:27]  # Posições 25-27 (3 caracteres) - padrão SEFAZ
     return str(int(serie_raw))  # Remove zeros à esquerda
 
 
@@ -163,7 +163,7 @@ def extrair_modelo_da_chave(chave: str) -> str:
     if not chave or len(chave) != 44:
         raise ValueError(f"Chave de acesso inválida (deve ter 44 dígitos): {chave}")
 
-    modelo_raw = chave[20:22]
+    modelo_raw = chave[22:24]  # Posições 23-24 - padrão SEFAZ
 
     if not modelo_raw.isdigit():
         raise ValueError(f"Modelo inválido na chave: {modelo_raw}")
