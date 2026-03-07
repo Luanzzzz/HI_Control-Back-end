@@ -1175,7 +1175,10 @@ async def listar_notas_empresa(
 
         # 3. Aplicar filtros
         if tipo_nf:
-            query = query.eq("tipo_nf", tipo_nf.upper())
+            # Normalizar tipo_nf: aceitar "NFE", "nfe", "NFe" → "NFe"
+            tipo_map = {"NFE": "NFe", "NFCE": "NFCe", "CTE": "CTe", "NFSE": "NFSe"}
+            tipo_nf_norm = tipo_map.get(tipo_nf.upper(), tipo_nf)
+            query = query.eq("tipo_nf", tipo_nf_norm)
 
         if situacao:
             query = query.eq("situacao", situacao.lower())
