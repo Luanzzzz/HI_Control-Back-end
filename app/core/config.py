@@ -10,7 +10,7 @@ from functools import lru_cache
 class Settings(BaseSettings):
     """
     Configurações centralizadas da aplicação Hi-Control.
-    Utiliza Pydantic Settings para validação e carregamento de variáveis de ambiente.
+    Usa Pydantic Settings para validação e carregamento de variáveis.
     """
 
     # API
@@ -21,7 +21,9 @@ class Settings(BaseSettings):
     # Supabase
     SUPABASE_URL: str = Field(..., description="URL do projeto Supabase")
     SUPABASE_KEY: str = Field(..., description="Anon key para cliente")
-    SUPABASE_SERVICE_KEY: str = Field(..., description="Service role key para operações admin")
+    SUPABASE_SERVICE_KEY: str = Field(
+        ..., description="Service role key para operações admin"
+    )
 
     # JWT
     SECRET_KEY: str = Field(..., description="Chave secreta para JWT")
@@ -41,6 +43,15 @@ class Settings(BaseSettings):
     # CORS Regex (Permitir qualquer subdomínio vercel.app)
     CORS_ORIGIN_REGEX: str = r"https://.*\.vercel\.app"
 
+    # NFS-e (APIs Municipais)
+    NFSE_AMBIENTE: str = "producao"  # "producao" ou "homologacao"
+    NFSE_TIMEOUT: int = 60  # Timeout em segundos para APIs municipais
+
+    # Google OAuth (para Google Drive)
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_REDIRECT_URI: Optional[str] = None
+
     # PostgreSQL (futuro - sistema híbrido)
     POSTGRES_URL: Optional[str] = None
     POSTGRES_USER: Optional[str] = None
@@ -56,7 +67,7 @@ class Settings(BaseSettings):
                 import json
                 try:
                     return json.loads(v)
-                except:
+                except (ValueError, TypeError):
                     pass
             return [origin.strip() for origin in v.split(",")]
         return v
@@ -73,9 +84,17 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """
     Retorna instância singleton das configurações.
-    O decorator @lru_cache garante que as settings sejam carregadas apenas uma vez.
+    @lru_cache garante que as settings sejam carregadas apenas uma vez.
     """
-    return Settings()
+    s = Settings()
+    if not s.GOOGLE_CLIENT_ID or not s.GOOGLE_REDIRECT_URI:
+        import warnings
+        warnings.warn(
+            "Google OAuth não configurado. Drive retornará 503.",
+            UserWarning,
+            stacklevel=1,
+        )
+    return s
 
 
 settings = get_settings()

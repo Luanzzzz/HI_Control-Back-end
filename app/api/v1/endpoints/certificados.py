@@ -177,14 +177,14 @@ async def upload_certificado(
         cert_criptografado = resultado["cert_criptografado"]
         info = resultado["info"]
 
-        # 3. Armazenar na empresa
+        # 3. Armazenar na empresa (inclui senha criptografada para emissão automática)
+        senha_encrypted = certificado_service.criptografar_senha(request.senha)
         db.table("empresas").update({
             "certificado_a1": cert_criptografado,
             "certificado_validade": info["data_fim"].isoformat(),
             "certificado_titular": info["titular"],
             "certificado_emissor": info["emissor"],
-            # Nota: senha não é armazenada por questões de segurança
-            # TODO: Implementar gestão segura de senha (cache, vault, etc)
+            "certificado_senha_encrypted": senha_encrypted,
         }).eq("id", empresa_id).execute()
 
         logger.info(

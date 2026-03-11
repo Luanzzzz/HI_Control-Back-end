@@ -36,6 +36,8 @@ except ImportError:
 from app.core.sefaz_config import (
     AMBIENTE_PADRAO,
     SEFAZ_ENDPOINTS_HOMOLOGACAO,
+    SEFAZ_ENDPOINTS_PRODUCAO,
+    DISTRIBUICAO_DFE_ENDPOINTS,
     TIMEOUT_SEFAZ,
     RETRY_ATTEMPTS,
     RETRY_BACKOFF,
@@ -43,6 +45,8 @@ from app.core.sefaz_config import (
     SEFAZ_STATUS_CODES,
     _query_cache,
     obter_mensagem_sefaz,
+    obter_endpoints_por_ambiente,
+    obter_endpoint_distribuicao,
 )
 from app.services.certificado_service import certificado_service
 from app.models.nfe_completa import (
@@ -842,31 +846,44 @@ class SefazService:
 
     def _obter_url_sefaz(self, uf: str, operacao: str) -> str:
         """
-        Obtém URL do webservice SEFAZ.
+        Obtem URL do webservice SEFAZ conforme o ambiente configurado.
 
         Args:
             uf: Sigla do estado
-            operacao: autorizacao, consulta, cancelamento, inutilizacao
+            operacao: autorizacao, consulta, cancelamento, inutilizacao, distribuicao
 
         Returns:
             URL do webservice
 
         Raises:
-            SefazException: Se UF/operação inválida
+            SefazException: Se UF/operacao invalida
         """
-        if uf not in SEFAZ_ENDPOINTS_HOMOLOGACAO:
+        from app.core.sefaz_config import (
+            obter_endpoints_por_ambiente,
+            obter_endpoint_distribuicao,
+            AMBIENTE_PADRAO,
+        )
+
+        # DistribuicaoDFe e centralizado (Ambiente Nacional), nao por UF
+        if operacao == "distribuicao":
+            return obter_endpoint_distribuicao(AMBIENTE_PADRAO)
+
+        endpoints_map = obter_endpoints_por_ambiente(AMBIENTE_PADRAO)
+
+        if uf not in endpoints_map:
             raise SefazException(
                 "999",
-                f"UF não suportada: {uf}",
+                f"UF nao suportada: {uf}",
                 "uf"
             )
 
-        endpoints = SEFAZ_ENDPOINTS_HOMOLOGACAO[uf]
+        endpoints = endpoints_map[uf]
 
         if operacao not in endpoints:
             raise SefazException(
                 "999",
-                f"Operação não suportada: {operacao}",
+                f"Operacao nao suportada: {operacao}. "
+                f"Operacoes validas: {', '.join(endpoints.keys())}",
                 "operacao"
             )
 
@@ -907,7 +924,7 @@ class SefazService:
         # TODO: Inserir no banco de dados na tabela sefaz_log
 
     # ============================================
-    # BUSCA DE NOTAS (BANCO DE DADOS)
+    # BUSCA DE NOTAS (BANCO DE DADOS LOCAL)
     # ============================================
 
     def buscar_notas_por_cnpj(
@@ -917,18 +934,20 @@ class SefazService:
         nsu_inicial: Optional[int] = None,
     ):
         """
-        Busca notas fiscais cadastradas no banco de dados para um CNPJ/Empresa.
+        Busca notas fiscais cadastradas no BANCO DE DADOS LOCAL para um CNPJ/Empresa.
 
-        IMPORTANTE: Este metodo consulta o BANCO DE DADOS LOCAL, nao o SEFAZ.
+        IMPORTANTE: Este metodo consulta APENAS o banco de dados local (Supabase).
+        Ele NAO faz chamadas ao SEFAZ e NAO chama _obter_url_sefaz().
 
-        Para obter novas notas:
-        1. Importe XMLs via endpoint /importar-xml
-        2. Use /consultar-chave para verificar notas especificas no SEFAZ
+        Para popular o banco com notas reais:
+        1. Importe XMLs via endpoint POST /nfe/importar-xml
+        2. Importe lote via endpoint POST /nfe/importar-lote
+        3. Consulte nota especifica via GET /nfe/consultar-chave/{chave}
 
         Args:
             cnpj: CNPJ para consultar (14 digitos sem formatacao)
             empresa_id: UUID da empresa no banco
-            nsu_inicial: NSU para paginacao (offset)
+            nsu_inicial: Offset para paginacao
 
         Returns:
             DistribuicaoResponseModel com lista de notas do banco
@@ -941,10 +960,13 @@ class SefazService:
         from datetime import datetime
         from app.db.supabase_client import supabase_admin
 
-        logger.info(f"Buscando notas no banco de dados para empresa: {empresa_id}")
+        logger.info(
+            f"[BUSCA LOCAL] Buscando notas no banco de dados | "
+            f"Empresa: {empresa_id} | CNPJ: {cnpj}"
+        )
 
         try:
-            # 1. Consultar banco de dados
+            # 1. Consultar banco de dados (APENAS banco local, sem SEFAZ)
             offset = nsu_inicial if nsu_inicial else 0
 
             resultado = supabase_admin.table("notas_fiscais")\
@@ -955,12 +977,15 @@ class SefazService:
                 .execute()
 
             # 2. Contar total de notas
-            count_result = supabase_admin.table("notas_fiscais")\
-                .select("id", count="exact")\
-                .eq("empresa_id", empresa_id)\
-                .execute()
-
-            total_notas = count_result.count if hasattr(count_result, 'count') else len(resultado.data or [])
+            total_notas = 0
+            try:
+                count_result = supabase_admin.table("notas_fiscais")\
+                    .select("id", count="exact")\
+                    .eq("empresa_id", empresa_id)\
+                    .execute()
+                total_notas = count_result.count if hasattr(count_result, 'count') and count_result.count is not None else len(resultado.data or [])
+            except Exception:
+                total_notas = len(resultado.data or [])
 
             # 3. Converter para NFeBuscadaMetadata
             notas_encontradas = []
@@ -982,13 +1007,24 @@ class SefazService:
                         else:
                             data_emissao = datetime.now()
 
+                        # Validar chave_acesso (deve ter 44 digitos)
+                        chave_acesso = row.get("chave_acesso", "")
+                        if not chave_acesso or len(chave_acesso) != 44 or not chave_acesso.isdigit():
+                            logger.warning(f"Nota com chave invalida ignorada: {chave_acesso[:20]}...")
+                            continue
+
+                        # Normalizar cnpj_emitente (remover formatacao)
+                        cnpj_emit = (row.get("cnpj_emitente") or "").replace(".", "").replace("/", "").replace("-", "")
+                        if len(cnpj_emit) != 14:
+                            cnpj_emit = cnpj_emit.ljust(14, "0")
+
                         nfe_metadata = NFeBuscadaMetadata(
-                            chave_acesso=row.get("chave_acesso", ""),
+                            chave_acesso=chave_acesso,
                             nsu=row.get("nsu", 0) or 0,
                             data_emissao=data_emissao,
                             tipo_operacao=tipo_operacao_codigo,
                             valor_total=Decimal(str(row.get("valor_total", 0))),
-                            cnpj_emitente=row.get("cnpj_emitente", ""),
+                            cnpj_emitente=cnpj_emit,
                             nome_emitente=row.get("nome_emitente", ""),
                             cnpj_destinatario=row.get("cnpj_destinatario"),
                             cpf_destinatario=row.get("cpf_destinatario"),
@@ -1002,7 +1038,7 @@ class SefazService:
                         notas_encontradas.append(nfe_metadata)
 
                     except Exception as e:
-                        logger.error(f"Erro ao converter nota do banco: {e}")
+                        logger.warning(f"Nota ignorada por erro de conversao: {e}")
                         continue
 
             # 4. Calcular NSUs para paginacao
@@ -1015,7 +1051,10 @@ class SefazService:
                 motivo = f"Encontradas {len(notas_encontradas)} notas no banco de dados"
             else:
                 status_codigo = "137"  # Nenhum documento
-                motivo = "Nenhuma nota encontrada no banco de dados. Importe XMLs via /importar-xml"
+                motivo = (
+                    "Nenhuma nota encontrada no banco de dados. "
+                    "Importe XMLs usando /importar-xml ou /importar-lote"
+                )
 
             response = DistribuicaoResponseModel(
                 status_codigo=status_codigo,
@@ -1026,13 +1065,26 @@ class SefazService:
                 total_notas=len(notas_encontradas)
             )
 
-            logger.info(f"Busca no banco concluida: {len(notas_encontradas)} notas encontradas")
+            logger.info(
+                f"[BUSCA LOCAL] Concluida: {len(notas_encontradas)} notas encontradas "
+                f"(total no banco: {total_notas})"
+            )
 
             return response
 
         except Exception as e:
-            logger.error(f"Erro ao buscar notas no banco: {e}", exc_info=True)
-            raise SefazException("999", f"Erro ao consultar banco de dados: {str(e)}", None)
+            logger.error(f"[BUSCA LOCAL] Erro ao consultar banco: {e}", exc_info=True)
+            # IMPORTANTE: NAO lancar SefazException aqui.
+            # Retornar resposta vazia em vez de erro 502.
+            from app.models.nfe_busca import DistribuicaoResponseModel
+            return DistribuicaoResponseModel(
+                status_codigo="137",
+                motivo=f"Erro ao consultar banco de dados: {str(e)}. Tente novamente.",
+                notas_encontradas=[],
+                ultimo_nsu=0,
+                max_nsu=0,
+                total_notas=0
+            )
 
 
     # ============================================
@@ -1051,7 +1103,7 @@ class SefazService:
         Gerencia ciclo de vida do Job (processing -> completed/failed).
 
         IMPORTANTE: Esta busca consulta o BANCO DE DADOS local.
-        Para novas notas, use /importar-xml.
+        Para novas notas, use /importar-xml ou /importar-lote.
         """
         from app.db.supabase_client import supabase_admin
 
@@ -1064,7 +1116,7 @@ class SefazService:
                 "updated_at": datetime.now().isoformat()
             }).eq("id", job_id).execute()
 
-            # 2. Executar busca no banco de dados
+            # 2. Executar busca no banco de dados (nunca lanca SefazException)
             response = self.buscar_notas_por_cnpj(
                 cnpj=cnpj,
                 empresa_id=empresa_id,
@@ -1073,7 +1125,7 @@ class SefazService:
 
             # 3. Atualizar status para COMPLETED
             result_payload = {
-                "success": response.sucesso,
+                "success": response.status_codigo == "138",
                 "total_notas": response.total_notas,
                 "ultimo_nsu": response.ultimo_nsu,
                 "max_nsu": response.max_nsu,
@@ -1091,16 +1143,19 @@ class SefazService:
                 "updated_at": datetime.now().isoformat()
             }).eq("id", job_id).execute()
 
-            logger.info(f"[JOB] Job {job_id} concluido com sucesso - {response.total_notas} notas")
+            logger.info(f"[JOB] Job {job_id} concluido - {response.total_notas} notas")
 
         except Exception as e:
             logger.error(f"[JOB] Job {job_id} falhou: {e}", exc_info=True)
 
-            supabase_admin.table("background_jobs").update({
-                "status": "failed",
-                "error": str(e),
-                "updated_at": datetime.now().isoformat()
-            }).eq("id", job_id).execute()
+            try:
+                supabase_admin.table("background_jobs").update({
+                    "status": "failed",
+                    "error": str(e),
+                    "updated_at": datetime.now().isoformat()
+                }).eq("id", job_id).execute()
+            except Exception as db_err:
+                logger.error(f"[JOB] Erro ao atualizar status do job: {db_err}")
 
 
 # ============================================

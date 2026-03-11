@@ -305,11 +305,11 @@ class CertificadoService:
         Note:
             Em produção, senha deve vir de cache seguro ou solicitada ao usuário
         """
-        # Descriptografar
+        # Descriptografar certificado
         cert_bytes = self.descriptografar_certificado(cert_base64_db)
 
-        # Para uso, assumir senha em variável de ambiente ou cache
-        # TODO: Implementar gestão segura de senha em produção
+        # Senha agora é armazenada criptografada em certificado_senha_encrypted
+        # e descriptografada via descriptografar_senha() nos endpoints de emissão
 
         return cert_bytes, None
 
@@ -366,6 +366,41 @@ class CertificadoService:
     # ============================================
     # UTILITÁRIOS
     # ============================================
+
+    def criptografar_senha(self, senha: str) -> str:
+        """
+        Criptografa a senha do certificado para armazenamento seguro.
+
+        Args:
+            senha: Senha em texto plano
+
+        Returns:
+            Senha criptografada com Fernet
+        """
+        if self._fernet:
+            return self._fernet.encrypt(senha.encode()).decode()
+        logger.warning("Fernet não disponível, armazenando senha em base64")
+        return base64.b64encode(senha.encode()).decode()
+
+    def descriptografar_senha(self, senha_encrypted: str) -> str:
+        """
+        Descriptografa senha armazenada do certificado.
+
+        Args:
+            senha_encrypted: Senha criptografada
+
+        Returns:
+            Senha em texto plano
+        """
+        if not senha_encrypted:
+            raise CertificadoError("Senha do certificado não configurada")
+        if self._fernet:
+            try:
+                return self._fernet.decrypt(senha_encrypted.encode()).decode()
+            except Exception:
+                # Pode ser base64 simples (fallback)
+                return base64.b64decode(senha_encrypted).decode()
+        return base64.b64decode(senha_encrypted).decode()
 
     @staticmethod
     def gerar_chave_fernet() -> str:

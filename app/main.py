@@ -75,10 +75,23 @@ async def startup_event():
     except Exception as e:
         logger.error(f"❌ Erro ao conectar com Supabase: {e}")
 
+    # Iniciar scheduler de sincronização automática
+    try:
+        from app.services.scheduler_service import scheduler_service
+        scheduler_service.start()
+    except Exception as e:
+        logger.warning(f"Scheduler não iniciado: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Executado ao desligar a aplicação"""
+    # Parar scheduler
+    try:
+        from app.services.scheduler_service import scheduler_service
+        scheduler_service.stop()
+    except Exception:
+        pass
     logger.info("👋 Encerrando Hi-Control API")
 
 

@@ -57,6 +57,8 @@ class EmpresaBase(BaseModel):
     bairro: Optional[str] = Field(None, max_length=100)
     cidade: Optional[str] = Field(None, max_length=100)
     estado: Optional[str] = Field(None, max_length=2)
+    municipio_codigo: Optional[str] = Field(None, min_length=7, max_length=7)
+    municipio_nome: Optional[str] = Field(None, max_length=100)
 
     # Contato
     email: Optional[str] = None

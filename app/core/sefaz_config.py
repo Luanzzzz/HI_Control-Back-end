@@ -1,19 +1,22 @@
 """
 Configuração de endpoints SEFAZ para todos os 27 estados brasileiros.
-Ambiente: HOMOLOGAÇÃO (conforme decisão do usuário).
+Suporta ambientes de HOMOLOGAÇÃO e PRODUÇÃO.
 
 Referências:
 - Manual de Integração Contribuinte v7.0
 - Portal Nacional da NF-e: https://www.nfe.fazenda.gov.br/
+- NT 2014.002 - DistribuicaoDFe (Ambiente Nacional)
 """
+import os
 from typing import Dict, Literal
 
 # ============================================
 # CONFIGURAÇÕES GERAIS
 # ============================================
 
-# Ambiente padrão (homologação conforme decisão do usuário)
-AMBIENTE_PADRAO: Literal["homologacao"] = "homologacao"
+# Ambiente padrão: controlado por variável de ambiente SEFAZ_AMBIENTE
+# Valores válidos: "producao" ou "homologacao"
+AMBIENTE_PADRAO: str = os.getenv("SEFAZ_AMBIENTE", "producao")
 
 # Timeouts e retry
 TIMEOUT_SEFAZ = 30  # segundos (validado como adequado na auditoria)
@@ -338,31 +341,335 @@ SEFAZ_ENDPOINTS_HOMOLOGACAO: Dict[str, Dict[str, str]] = {
 }
 
 # ============================================
+# ENDPOINTS NFeDistribuicaoDFe - AMBIENTE NACIONAL (AN)
+# ============================================
+# DistribuicaoDFe é um serviço CENTRALIZADO do Ambiente Nacional.
+# Não depende da UF - existe uma unica URL por ambiente.
+# REQUER certificado digital A1 (contrario ao que muitos acreditam).
+# Referência: NT 2014.002
+
+DISTRIBUICAO_DFE_ENDPOINTS = {
+    "homologacao": "https://hom1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
+    "producao": "https://www1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
+}
+
+# ============================================
+# ENDPOINTS SEFAZ PRODUÇÃO - NF-e 4.0
+# ============================================
+
+SEFAZ_ENDPOINTS_PRODUCAO: Dict[str, Dict[str, str]] = {
+    # Acre - Usa SVRS
+    "AC": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Alagoas - Usa SVRS
+    "AL": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Amazonas - Sefaz proprio
+    "AM": {
+        "autorizacao": "https://nfe.sefaz.am.gov.br/services2/services/NfeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.sefaz.am.gov.br/services2/services/NfeRetAutorizacao4",
+        "consulta": "https://nfe.sefaz.am.gov.br/services2/services/NfeConsulta4",
+        "status_servico": "https://nfe.sefaz.am.gov.br/services2/services/NfeStatusServico4",
+        "cancelamento": "https://nfe.sefaz.am.gov.br/services2/services/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.sefaz.am.gov.br/services2/services/NfeInutilizacao4",
+    },
+    # Amapa - Usa SVRS
+    "AP": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Bahia - Sefaz proprio
+    "BA": {
+        "autorizacao": "https://nfe.sefaz.ba.gov.br/webservices/NFeAutorizacao4/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.sefaz.ba.gov.br/webservices/NFeRetAutorizacao4/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.sefaz.ba.gov.br/webservices/NFeConsulta4/NFeConsulta4.asmx",
+        "status_servico": "https://nfe.sefaz.ba.gov.br/webservices/NFeStatusServico4/NFeStatusServico4.asmx",
+        "cancelamento": "https://nfe.sefaz.ba.gov.br/webservices/RecepcaoEvento4/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.sefaz.ba.gov.br/webservices/NFeInutilizacao4/NFeInutilizacao4.asmx",
+    },
+    # Ceara - Sefaz proprio
+    "CE": {
+        "autorizacao": "https://nfe.sefaz.ce.gov.br/nfe4/services/NFeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.sefaz.ce.gov.br/nfe4/services/NFeRetAutorizacao4",
+        "consulta": "https://nfe.sefaz.ce.gov.br/nfe4/services/NFeConsulta4",
+        "status_servico": "https://nfe.sefaz.ce.gov.br/nfe4/services/NFeStatusServico4",
+        "cancelamento": "https://nfe.sefaz.ce.gov.br/nfe4/services/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.sefaz.ce.gov.br/nfe4/services/NFeInutilizacao4",
+    },
+    # Distrito Federal - Usa SVRS
+    "DF": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Espirito Santo - Usa SVRS
+    "ES": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Goias - Sefaz proprio
+    "GO": {
+        "autorizacao": "https://nfe.sefaz.go.gov.br/nfe/services/NFeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.sefaz.go.gov.br/nfe/services/NFeRetAutorizacao4",
+        "consulta": "https://nfe.sefaz.go.gov.br/nfe/services/NFeConsulta4",
+        "status_servico": "https://nfe.sefaz.go.gov.br/nfe/services/NFeStatusServico4",
+        "cancelamento": "https://nfe.sefaz.go.gov.br/nfe/services/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.sefaz.go.gov.br/nfe/services/NFeInutilizacao4",
+    },
+    # Maranhao - Usa SVAN
+    "MA": {
+        "autorizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeAutorizacao4/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeRetAutorizacao4/NFeRetAutorizacao4.asmx",
+        "consulta": "https://www.sefazvirtual.fazenda.gov.br/NFeConsulta4/NFeConsulta4.asmx",
+        "status_servico": "https://www.sefazvirtual.fazenda.gov.br/NFeStatusServico4/NFeStatusServico4.asmx",
+        "cancelamento": "https://www.sefazvirtual.fazenda.gov.br/RecepcaoEvento4/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeInutilizacao4/NFeInutilizacao4.asmx",
+    },
+    # Minas Gerais - Sefaz proprio
+    "MG": {
+        "autorizacao": "https://nfe.fazenda.mg.gov.br/nfe2/services/NFeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.fazenda.mg.gov.br/nfe2/services/NFeRetAutorizacao4",
+        "consulta": "https://nfe.fazenda.mg.gov.br/nfe2/services/NFeConsulta4",
+        "status_servico": "https://nfe.fazenda.mg.gov.br/nfe2/services/NFeStatusServico4",
+        "cancelamento": "https://nfe.fazenda.mg.gov.br/nfe2/services/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.fazenda.mg.gov.br/nfe2/services/NFeInutilizacao4",
+    },
+    # Mato Grosso do Sul - Sefaz proprio
+    "MS": {
+        "autorizacao": "https://nfe.sefaz.ms.gov.br/ws/NFeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.sefaz.ms.gov.br/ws/NFeRetAutorizacao4",
+        "consulta": "https://nfe.sefaz.ms.gov.br/ws/NFeConsulta4",
+        "status_servico": "https://nfe.sefaz.ms.gov.br/ws/NFeStatusServico4",
+        "cancelamento": "https://nfe.sefaz.ms.gov.br/ws/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.sefaz.ms.gov.br/ws/NFeInutilizacao4",
+    },
+    # Mato Grosso - Sefaz proprio
+    "MT": {
+        "autorizacao": "https://nfe.sefaz.mt.gov.br/nfews/v2/services/NfeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.sefaz.mt.gov.br/nfews/v2/services/NfeRetAutorizacao4",
+        "consulta": "https://nfe.sefaz.mt.gov.br/nfews/v2/services/NfeConsulta4",
+        "status_servico": "https://nfe.sefaz.mt.gov.br/nfews/v2/services/NfeStatusServico4",
+        "cancelamento": "https://nfe.sefaz.mt.gov.br/nfews/v2/services/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.sefaz.mt.gov.br/nfews/v2/services/NfeInutilizacao4",
+    },
+    # Para - Usa SVAN
+    "PA": {
+        "autorizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeAutorizacao4/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeRetAutorizacao4/NFeRetAutorizacao4.asmx",
+        "consulta": "https://www.sefazvirtual.fazenda.gov.br/NFeConsulta4/NFeConsulta4.asmx",
+        "status_servico": "https://www.sefazvirtual.fazenda.gov.br/NFeStatusServico4/NFeStatusServico4.asmx",
+        "cancelamento": "https://www.sefazvirtual.fazenda.gov.br/RecepcaoEvento4/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeInutilizacao4/NFeInutilizacao4.asmx",
+    },
+    # Paraiba - Usa SVRS
+    "PB": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Pernambuco - Sefaz proprio
+    "PE": {
+        "autorizacao": "https://nfe.sefaz.pe.gov.br/nfe-service/services/NFeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.sefaz.pe.gov.br/nfe-service/services/NFeRetAutorizacao4",
+        "consulta": "https://nfe.sefaz.pe.gov.br/nfe-service/services/NFeConsulta4",
+        "status_servico": "https://nfe.sefaz.pe.gov.br/nfe-service/services/NFeStatusServico4",
+        "cancelamento": "https://nfe.sefaz.pe.gov.br/nfe-service/services/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.sefaz.pe.gov.br/nfe-service/services/NFeInutilizacao4",
+    },
+    # Piaui - Usa SVAN
+    "PI": {
+        "autorizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeAutorizacao4/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeRetAutorizacao4/NFeRetAutorizacao4.asmx",
+        "consulta": "https://www.sefazvirtual.fazenda.gov.br/NFeConsulta4/NFeConsulta4.asmx",
+        "status_servico": "https://www.sefazvirtual.fazenda.gov.br/NFeStatusServico4/NFeStatusServico4.asmx",
+        "cancelamento": "https://www.sefazvirtual.fazenda.gov.br/RecepcaoEvento4/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://www.sefazvirtual.fazenda.gov.br/NFeInutilizacao4/NFeInutilizacao4.asmx",
+    },
+    # Parana - Sefaz proprio
+    "PR": {
+        "autorizacao": "https://nfe.sefa.pr.gov.br/nfe/NFeAutorizacao4",
+        "retorno_autorizacao": "https://nfe.sefa.pr.gov.br/nfe/NFeRetAutorizacao4",
+        "consulta": "https://nfe.sefa.pr.gov.br/nfe/NFeConsulta4",
+        "status_servico": "https://nfe.sefa.pr.gov.br/nfe/NFeStatusServico4",
+        "cancelamento": "https://nfe.sefa.pr.gov.br/nfe/RecepcaoEvento4",
+        "inutilizacao": "https://nfe.sefa.pr.gov.br/nfe/NFeInutilizacao4",
+    },
+    # Rio de Janeiro - Usa SVRS
+    "RJ": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Rio Grande do Norte - Usa SVRS
+    "RN": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Rondonia - Usa SVRS
+    "RO": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Roraima - Usa SVRS
+    "RR": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Rio Grande do Sul - Sefaz proprio
+    "RS": {
+        "autorizacao": "https://nfe.sefazrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.sefazrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.sefazrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.sefazrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.sefazrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.sefazrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Santa Catarina - Usa SVRS
+    "SC": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Sergipe - Usa SVRS
+    "SE": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+    # Sao Paulo - Sefaz proprio
+    "SP": {
+        "autorizacao": "https://nfe.fazenda.sp.gov.br/ws/nfeautorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.fazenda.sp.gov.br/ws/nferetautorizacao4.asmx",
+        "consulta": "https://nfe.fazenda.sp.gov.br/ws/nfeconsulta4.asmx",
+        "status_servico": "https://nfe.fazenda.sp.gov.br/ws/nfestatusservico4.asmx",
+        "cancelamento": "https://nfe.fazenda.sp.gov.br/ws/recepcaoevento4.asmx",
+        "inutilizacao": "https://nfe.fazenda.sp.gov.br/ws/nfeinutilizacao4.asmx",
+    },
+    # Tocantins - Usa SVRS
+    "TO": {
+        "autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
+        "retorno_autorizacao": "https://nfe.svrs.rs.gov.br/ws/NfeRetAutorizacao/NFeRetAutorizacao4.asmx",
+        "consulta": "https://nfe.svrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
+        "status_servico": "https://nfe.svrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
+        "cancelamento": "https://nfe.svrs.rs.gov.br/ws/RecepcaoEvento/RecepcaoEvento4.asmx",
+        "inutilizacao": "https://nfe.svrs.rs.gov.br/ws/NfeInutilizacao/NfeInutilizacao4.asmx",
+    },
+}
+
+# ============================================
 # FUNÇÕES AUXILIARES
 # ============================================
 
-def obter_endpoint_sefaz(uf: str, operacao: str) -> str:
+
+def obter_endpoints_por_ambiente(ambiente: str = None) -> Dict[str, Dict[str, str]]:
     """
-    Retorna o endpoint SEFAZ para a operação especificada.
+    Retorna o dicionario de endpoints conforme o ambiente.
+
+    Args:
+        ambiente: "producao" ou "homologacao". Se None, usa AMBIENTE_PADRAO.
+
+    Returns:
+        Dict com endpoints por UF
+    """
+    amb = ambiente or AMBIENTE_PADRAO
+    if amb == "producao":
+        return SEFAZ_ENDPOINTS_PRODUCAO
+    return SEFAZ_ENDPOINTS_HOMOLOGACAO
+
+
+def obter_endpoint_distribuicao(ambiente: str = None) -> str:
+    """
+    Retorna o endpoint do servico NFeDistribuicaoDFe (Ambiente Nacional).
+
+    Args:
+        ambiente: "producao" ou "homologacao". Se None, usa AMBIENTE_PADRAO.
+
+    Returns:
+        URL do endpoint DistribuicaoDFe
+    """
+    amb = ambiente or AMBIENTE_PADRAO
+    return DISTRIBUICAO_DFE_ENDPOINTS.get(amb, DISTRIBUICAO_DFE_ENDPOINTS["producao"])
+
+
+def obter_endpoint_sefaz(uf: str, operacao: str, ambiente: str = None) -> str:
+    """
+    Retorna o endpoint SEFAZ para a operacao especificada.
+
+    Para operacao "distribuicao", use obter_endpoint_distribuicao() em vez
+    deste metodo, pois DistribuicaoDFe e um servico do Ambiente Nacional.
 
     Args:
         uf: Sigla do estado (ex: "SP", "RJ")
-        operacao: Tipo de operação ("autorizacao", "consulta", etc)
+        operacao: Tipo de operacao ("autorizacao", "consulta", etc)
+        ambiente: "producao" ou "homologacao". Se None, usa AMBIENTE_PADRAO.
 
     Returns:
         URL do endpoint SEFAZ
 
     Raises:
-        ValueError: Se UF ou operação inválida
+        ValueError: Se UF ou operacao invalida
     """
-    if uf not in SEFAZ_ENDPOINTS_HOMOLOGACAO:
-        raise ValueError(f"UF inválida: {uf}. Deve ser uma das 27 UF brasileiras.")
+    # DistribuicaoDFe e centralizado (Ambiente Nacional), nao por UF
+    if operacao == "distribuicao":
+        return obter_endpoint_distribuicao(ambiente)
 
-    endpoints = SEFAZ_ENDPOINTS_HOMOLOGACAO[uf]
+    endpoints_map = obter_endpoints_por_ambiente(ambiente)
+
+    if uf not in endpoints_map:
+        raise ValueError(f"UF invalida: {uf}. Deve ser uma das 27 UF brasileiras.")
+
+    endpoints = endpoints_map[uf]
 
     if operacao not in endpoints:
         raise ValueError(
-            f"Operação inválida: {operacao}. "
+            f"Operacao invalida: {operacao}. "
             f"Deve ser uma de: {', '.join(endpoints.keys())}"
         )
 

@@ -148,14 +148,18 @@ async def autorizar_nfe(
                 f"Certificado próximo da expiração: {cert_status['alerta']}"
             )
 
-        # 3. Descriptografar certificado
+        # 3. Descriptografar certificado e obter senha
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
 
-        # TODO: Obter senha do certificado de forma segura
-        # Em produção, senha deve vir de cache ou ser solicitada ao usuário
-        senha_cert = "senha_placeholder"
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 4. Enviar para SEFAZ
         logger.info(
@@ -318,7 +322,13 @@ async def consultar_nfe(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_cert = "senha_placeholder"  # TODO: Gestão segura de senha
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 3. Consultar SEFAZ
         logger.info(f"Consultando NF-e: {chave_acesso}")
@@ -449,7 +459,13 @@ async def cancelar_nfe(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_cert = "senha_placeholder"
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
 
         # 5. Cancelar na SEFAZ
         logger.info(f"Cancelando NF-e {chave_acesso}: {motivo}")
@@ -681,3 +697,121 @@ async def _atualizar_situacao_nfe(
         update_data["protocolo_cancelamento"] = protocolo
 
     db.table("notas_fiscais").update(update_data).eq("id", nota_id).execute()
+
+
+# ============================================
+# DANFE (PDF)
+# ============================================
+
+@router.get(
+    "/{chave_acesso}/danfe",
+    summary="Gerar/Download DANFE (PDF)",
+)
+async def gerar_danfe(
+    chave_acesso: str = Path(..., pattern=r"^\d{44}$"),
+    usuario: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """
+    Gera DANFE em PDF a partir da chave de acesso.
+
+    Se a nota já tiver pdf_url, redireciona. Caso contrário, gera o PDF
+    a partir do XML armazenado.
+    """
+    try:
+        nota = await _buscar_nfe_por_chave(db, chave_acesso, usuario["id"])
+        if not nota:
+            raise HTTPException(status_code=404, detail="NF-e não encontrada")
+
+        xml_content = nota.get("xml_completo") or nota.get("xml_resumo")
+        if not xml_content:
+            raise HTTPException(
+                status_code=400,
+                detail="XML da NF-e não disponível para geração do DANFE"
+            )
+
+        from app.services.danfe_service import danfe_service
+
+        modelo = nota.get("modelo", "55")
+        if modelo == "65":
+            pdf_bytes = danfe_service.gerar_danfce(xml_content)
+            filename = f"DANFCE_{chave_acesso}.pdf"
+        else:
+            pdf_bytes = danfe_service.gerar_danfe(xml_content)
+            filename = f"DANFE_{chave_acesso}.pdf"
+
+        import io
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao gerar DANFE: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar DANFE: {str(e)}")
+
+
+# ============================================
+# INUTILIZAÇÃO DE NUMERAÇÃO
+# ============================================
+
+@router.post(
+    "/inutilizar",
+    response_model=SefazResponseModel,
+    dependencies=[require_modules("emissor_notas")],
+    summary="Inutilizar numeração de NF-e",
+)
+async def inutilizar_numeracao(
+    empresa_id: str = Body(..., embed=True),
+    serie: str = Body(..., embed=True),
+    numero_inicio: int = Body(..., embed=True, ge=1),
+    numero_fim: int = Body(..., embed=True, ge=1),
+    justificativa: str = Body(..., embed=True, min_length=15, max_length=255),
+    usuario: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """
+    Inutiliza faixa de numeração de NF-e na SEFAZ.
+
+    Use quando houver quebra de sequência numérica.
+    A inutilização é irreversível.
+    """
+    user_id = usuario["id"]
+
+    try:
+        empresa = await _validar_empresa_usuario(db, empresa_id, user_id)
+
+        cert_bytes = certificado_service.descriptografar_certificado(
+            empresa["certificado_a1"]
+        )
+        senha_encrypted = empresa.get("certificado_senha_encrypted")
+        if not senha_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="Senha do certificado não configurada. Faça o reupload do certificado."
+            )
+        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+        sefaz_response = sefaz_service.inutilizar_numeracao(
+            empresa_cnpj=empresa["cnpj"],
+            empresa_uf=empresa["uf"],
+            serie=serie,
+            numero_inicio=numero_inicio,
+            numero_fim=numero_fim,
+            justificativa=justificativa,
+            cert_bytes=cert_bytes,
+            senha_cert=senha_cert,
+        )
+
+        return sefaz_response
+
+    except HTTPException:
+        raise
+    except SefazException as e:
+        raise HTTPException(status_code=502, detail={"message": str(e)})
+    except Exception as e:
+        logger.error(f"Erro ao inutilizar: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
