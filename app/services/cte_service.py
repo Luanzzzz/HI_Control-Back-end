@@ -232,6 +232,15 @@ class CTeService:
         Returns:
             Resultado da autorização
         """
+        # ============================================
+        # PROTEÇÃO: Verificar permissão de emissão
+        # ============================================
+        from app.utils.emission_guard import verificar_permissao_emissao
+        verificar_permissao_emissao(
+            empresa_id=empresa.get("id", empresa.get("cnpj", "unknown")),
+            tipo_documento="CTe"
+        )
+
         import httpx
         from app.core.cte_sefaz_config import obter_endpoints_cte
 

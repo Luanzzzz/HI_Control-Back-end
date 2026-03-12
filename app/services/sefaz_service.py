@@ -117,6 +117,7 @@ class SefazService:
         empresa_ie: str,
         empresa_razao_social: str,
         empresa_uf: str,
+        empresa_id: Optional[str] = None,
     ) -> SefazResponseModel:
         """
         Autoriza NF-e junto à SEFAZ.
@@ -129,13 +130,22 @@ class SefazService:
             empresa_ie: Inscrição Estadual
             empresa_razao_social: Razão social
             empresa_uf: UF do emitente
+            empresa_id: UUID da empresa (para auditoria e proteção)
 
         Returns:
             SefazResponseModel com resultado da autorização
 
         Raises:
             SefazException: Em caso de erro
+            EmissionBlockedError: Se emissão em produção bloqueada
         """
+        # PROTEÇÃO: Verificar permissão de emissão em produção
+        from app.utils.emission_guard import verificar_permissao_emissao
+        verificar_permissao_emissao(
+            empresa_id=empresa_id or empresa_cnpj,
+            tipo_documento="NFe"
+        )
+
         logger.info(
             f"Autorizando NF-e {nfe_data.numero_nf} série {nfe_data.serie} "
             f"para empresa {empresa_cnpj}"

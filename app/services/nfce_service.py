@@ -134,6 +134,15 @@ class NFCeService:
         Returns:
             Resultado da autorização
         """
+        # ============================================
+        # PROTEÇÃO: Verificar permissão de emissão
+        # ============================================
+        from app.utils.emission_guard import verificar_permissao_emissao
+        verificar_permissao_emissao(
+            empresa_id=empresa.get("id", empresa.get("cnpj", "unknown")),
+            tipo_documento="NFCe"
+        )
+
         from app.services.sefaz_service import sefaz_service
 
         # Validar CSC

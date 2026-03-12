@@ -55,7 +55,17 @@ class EmissaoNFSeService:
 
         Returns:
             Resultado da emissão
+
+        Raises:
+            EmissionBlockedError: Se emissão em produção bloqueada
         """
+        # PROTEÇÃO: Verificar permissão de emissão em produção
+        from app.utils.emission_guard import verificar_permissao_emissao
+        verificar_permissao_emissao(
+            empresa_id=empresa_id,
+            tipo_documento="NFSe"
+        )
+
         db = get_supabase_admin()
 
         try:
