@@ -162,6 +162,9 @@ class SefazService:
                 empresa_uf,
             )
 
+            # 2.5. VALIDAR XML CONTRA XSD ANTES DE ASSINAR
+            self._validar_xml_antes_assinatura(xml_nfe, nfe_data.modelo)
+
             # 3. Assinar XML com certificado
             xml_assinado = self._assinar_xml(xml_nfe, cert_bytes, senha_cert)
 
@@ -585,6 +588,95 @@ class SefazService:
 </inutNFe>"""
 
     # ============================================
+    # MÉTODOS AUXILIARES - VALIDAÇÃO XSD
+    # ============================================
+
+    def _validar_xml_antes_assinatura(self, xml_string: str, modelo: str) -> None:
+        """
+        Valida XML contra schema XSD ANTES de assinar e enviar ao SEFAZ.
+
+        Isso evita erros genéricos do SEFAZ (cStat 225) e permite correção
+        antecipada de problemas de estrutura do XML.
+
+        Args:
+            xml_string: XML a ser validado
+            modelo: Modelo do documento ("55"=NF-e, "65"=NFC-e, "57"=CT-e)
+
+        Raises:
+            SefazValidationError: Se validação XSD falhar
+        """
+        try:
+            from app.utils.xml_validator import validar_xml_contra_xsd
+            from app.core.config import settings
+
+            # Obter ambiente (para permitir bypass em desenvolvimento)
+            ambiente = getattr(settings, 'ENVIRONMENT', 'production')
+
+            logger.info(f"🔍 Validando XML modelo {modelo} contra XSD...")
+
+            # Validar XML
+            valido, erros = validar_xml_contra_xsd(
+                xml_string=xml_string,
+                tipo_documento=modelo,
+                ambiente=ambiente
+            )
+
+            if not valido:
+                # Formatar erros para o usuário
+                erros_formatados = "\n".join(f"  {i+1}. {erro}" for i, erro in enumerate(erros[:10]))
+                if len(erros) > 10:
+                    erros_formatados += f"\n  ... e mais {len(erros) - 10} erro(s)"
+
+                mensagem_erro = (
+                    f"XML inválido segundo schema XSD oficial (modelo {modelo}):\n"
+                    f"{erros_formatados}\n\n"
+                    f"Corrija os erros acima antes de emitir a nota fiscal."
+                )
+
+                logger.error(f"❌ Validação XSD falhou:\n{erros_formatados}")
+
+                # Retornar erro 422 (Unprocessable Entity) com detalhes
+                raise SefazValidationError(
+                    "422",
+                    mensagem_erro,
+                    campo_erro="xml_estrutura"
+                )
+
+            logger.info(f"✅ Validação XSD bem-sucedida (modelo {modelo})")
+
+        except SefazValidationError:
+            # Re-raise validação XSD (já formatada)
+            raise
+
+        except FileNotFoundError as e:
+            # Schema XSD não encontrado
+            logger.error(f"Schema XSD não encontrado: {e}")
+
+            # Em produção, bloquear emissão
+            if ambiente == "production":
+                raise SefazException(
+                    "999",
+                    f"Schema XSD não configurado. Contate o administrador do sistema.",
+                    campo_erro="configuracao_xsd"
+                )
+
+            # Em desenvolvimento, apenas warning
+            logger.warning(
+                "⚠️ DESENVOLVIMENTO: Validação XSD pulada (schema ausente). "
+                "Configure schemas em backend/app/schemas/xsd/"
+            )
+
+        except Exception as e:
+            # Erro inesperado na validação
+            logger.error(f"Erro ao validar XML contra XSD: {e}", exc_info=True)
+
+            # Não bloquear emissão por erro de validação (failsafe)
+            logger.warning(
+                f"⚠️ Validação XSD falhou com erro inesperado: {e}. "
+                f"Prosseguindo com emissão (failsafe)."
+            )
+
+    # ============================================
     # MÉTODOS AUXILIARES - ASSINATURA E ENVIO
     # ============================================
 
@@ -958,6 +1050,8 @@ class SefazService:
         )
         from decimal import Decimal
         from datetime import datetime
+        # SEGURANÇA: Usa supabase_admin mas query é filtrada por empresa_id
+        # para prevenir vazamento entre tenants.
         from app.db.supabase_client import supabase_admin
 
         logger.info(
