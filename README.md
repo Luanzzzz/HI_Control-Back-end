@@ -1,355 +1,356 @@
 # Hi-Control Backend API
 
-API REST em Python/FastAPI para o sistema de gestão contábil Hi-Control.
+API REST em Python/FastAPI para o sistema de gestão contábil Hi-Control — plataforma para escritórios de contabilidade brasileiros.
 
-## 🚀 Tecnologias
+## Tecnologias
 
-- **FastAPI** - Framework web assíncrono moderno
-- **SQLAlchemy** - ORM para Python
-- **Alembic** - Migrações de banco de dados
-- **Pydantic** - Validação de dados
-- **JWT** - Autenticação com JSON Web Tokens
-- **SQLite** - Banco de dados (desenvolvimento)
+- **Python 3.12** — Linguagem principal
+- **FastAPI** — Framework web assíncrono
+- **Supabase (PostgreSQL)** — Banco de dados com Row Level Security
+- **Pydantic v2** — Validação de dados
+- **JWT (python-jose)** — Autenticação via tokens
+- **bcrypt** — Hash de senhas
+- **lxml** — Parsing de XMLs NF-e
+- **cryptography (PKCS12)** — Certificados digitais A1
 
-## 📋 Pré-requisitos
+## Pré-requisitos
 
-- Python 3.10+
-- pip (gerenciador de pacotes Python)
+- Python 3.12+
+- Conta Supabase configurada
 
-## 🔧 Instalação
-
-### 1. Criar ambiente virtual
+## Instalação
 
 ```bash
 cd backend
 python -m venv venv
+venv\Scripts\activate   # Windows
+# ou
+source venv/bin/activate  # Linux/Mac
 
-# Windows
-venv\Scripts\activate
-
-# Linux/Mac
-source venv/bin/activate
-```
-
-### 2. Instalar dependências
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 3. Configurar variáveis de ambiente
+## Configuração
 
-```bash
-cp .env.example .env
+Crie um arquivo `.env` em `backend/` com:
+
+```env
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...        # anon key
+SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...  # service_role key
+SECRET_KEY=<gere com: openssl rand -hex 32>
+
+# Opcional - certificado A1 para comunicação SEFAZ
+CERTIFICATE_A1_FILE=path/to/certificado.pfx
+CERTIFICATE_PASSWORD=senha_do_certificado
+CERTIFICATE_ENCRYPTION_KEY=<chave Fernet para criptografar cert no banco>
+
+# Opcional - nunca usar true em produção
+USE_MOCK_SEFAZ=false
 ```
 
-Edite o arquivo `.env` e configure:
-- `SECRET_KEY`: Gere uma chave segura com `openssl rand -hex 32`
-- Outras variáveis conforme necessário
-
-### 4. Inicializar banco de dados
+## Executar
 
 ```bash
-# Criar migration inicial
-alembic revision --autogenerate -m "Initial migration"
-
-# Aplicar migrations
-alembic upgrade head
-```
-
-### 5. Popular banco com dados de teste
-
-```python
-# Execute o script Python
-python -c "
-import asyncio
-from app.db.session import AsyncSessionLocal
-from app.db.init_db import init_db
-from app.db.base import Base
-from app.db.session import engine
-
-async def main():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with AsyncSessionLocal() as session:
-        await init_db(session)
-
-    print('✅ Banco de dados inicializado com sucesso!')
-
-asyncio.run(main())
-"
-```
-
-## 🏃 Executar
-
-### Modo desenvolvimento (com hot reload)
-
-```bash
+# Desenvolvimento (hot reload)
 uvicorn app.main:app --reload --port 8000
-```
 
-### Modo produção
-
-```bash
+# Produção
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-## 📚 Documentação da API
+## Documentação Interativa
 
-Após iniciar o servidor, acesse:
+- **Swagger UI:** http://localhost:8000/api/v1/docs
+- **ReDoc:** http://localhost:8000/api/v1/redoc
 
-- **Swagger UI**: http://localhost:8000/api/docs
-- **ReDoc**: http://localhost:8000/api/redoc
-- **OpenAPI JSON**: http://localhost:8000/api/openapi.json
+---
 
-## 🔐 Autenticação
-
-### Credenciais de Teste
-
-| Email | Senha | Plano |
-|-------|-------|-------|
-| admin@hicontrol.com | admin123 | Premium |
-| premium@hicontrol.com | premium123 | Premium |
-| basico@hicontrol.com | basico123 | Básico |
-
-### Obter Token de Acesso
-
-```bash
-curl -X POST "http://localhost:8000/api/v1/auth/login" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=admin@hicontrol.com&password=admin123"
-```
-
-Resposta:
-```json
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "token_type": "bearer"
-}
-```
-
-### Usar Token em Requisições
-
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas" \
-  -H "Authorization: Bearer {seu_access_token}"
-```
-
-## 🛣️ Rotas Principais
+## Mapeamento de Funcionalidades
 
 ### Autenticação (`/api/v1/auth`)
 
-- `POST /login` - Login com email e senha
-- `POST /logout` - Logout (invalidar token)
-- `GET /me` - Dados do usuário autenticado
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| POST | `/auth/login` | Login — retorna access_token e refresh_token |
+| POST | `/auth/logout` | Logout do usuário |
+| GET | `/auth/me` | Dados do usuário autenticado |
 
-### Notas Fiscais (`/api/v1/notas`)
+Autenticação usa JWT com:
+- **Access token:** expiração configurável (padrão 30min)
+- **Refresh token:** expiração longa (padrão 7 dias)
+- **bcrypt** para hash de senhas
 
-- `GET /` - Buscar notas com filtros
-  - Query params:
-    - `search_term`: Busca geral
-    - `tipo_nf`: NFE, NFCE, NFSE, CTE
-    - `situacao`: Autorizada, Cancelada, etc
-    - `data_inicio`, `data_fim`: Filtro por período
-    - `skip`, `limit`: Paginação
+### Certificados Digitais (`/api/v1/certificados`)
 
-### Exemplos de Uso
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| POST | `/certificados/empresas/{id}/certificado` | Upload de certificado A1 (.pfx) |
+| GET | `/certificados/empresas/{id}/certificado/status` | Status/validade do certificado |
 
-**Buscar todas as notas:**
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas" \
-  -H "Authorization: Bearer {token}"
-```
+O sistema suporta estratégia híbrida: tenta o certificado da empresa, se não existir usa o do contador.
+Certificados são armazenados criptografados com Fernet (ou base64 se sem chave configurada).
 
-**Buscar NF-e autorizadas:**
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas?tipo_nf=NFE&situacao=Autorizada" \
-  -H "Authorization: Bearer {token}"
-```
+### Busca e Importação de Notas Fiscais (`/api/v1/nfe`)
 
-**Buscar por termo:**
-```bash
-curl -X GET "http://localhost:8000/api/v1/notas?search_term=Tech" \
-  -H "Authorization: Bearer {token}"
-```
+#### Busca no banco de dados local
 
-## 📁 Estrutura de Diretórios
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| POST | `/nfe/buscar` | Busca notas com filtros (CNPJ, período, tipo, situação) |
+| POST | `/nfe/buscar/iniciar` | Inicia busca assíncrona em background |
+| GET | `/nfe/buscar/stats/{cnpj}` | Estatísticas de busca por CNPJ |
+| GET | `/nfe/buscar/status/{job_id}` | Status de busca assíncrona |
+| GET | `/nfe/empresas/{id}/notas` | Lista notas da empresa (paginado) |
+| POST | `/nfe/empresas/{id}/notas/buscar` | Busca avançada com filtros |
+| GET | `/nfe/empresas/{id}/notas/historico` | Histórico de consultas |
+
+#### Importação de XML
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| POST | `/nfe/importar-xml` | Importar XML individual de NF-e ou NFC-e |
+| POST | `/nfe/importar-lote` | Importar lote de XMLs via arquivo ZIP (máx 100 XMLs, 50MB) |
+
+**Para obter XMLs:** Use o Portal Nacional NF-e (https://www.nfe.fazenda.gov.br) e importe via esses endpoints.
+
+#### Download de XML
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| GET | `/nfe/notas/{chave_acesso}/xml` | Download XML da nota pelo hash de 44 dígitos |
+
+#### Consulta SEFAZ
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| GET | `/nfe/consultar-chave/{chave_acesso}` | Consulta status da nota no SEFAZ (requer certificado) |
+| GET | `/nfe/empresas/{id}/certificado/status` | Status do certificado da empresa |
+
+### Emissão de NF-e (`/api/v1/nfe`)
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| POST | `/nfe/autorizar` | Autorizar NF-e junto à SEFAZ |
+| POST | `/nfe/consultar/{chave}` | Consultar protocolo da NF-e |
+| POST | `/nfe/cancelar/{chave}` | Cancelar NF-e (dentro de 24h) |
+
+**Nota:** Requer PyNFE e OpenSSL compatível. Atualmente indisponível por incompatibilidade com OpenSSL recente.
+
+### Notas Fiscais — Leitura Rápida (`/api/v1/notas`)
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| GET | `/notas/buscar` | Busca notas com search_term, tipo_nf, situacao, período |
+| GET | `/notas/` | Lista todas as notas da empresa |
+| GET | `/notas/{chave}` | Detalhes de uma nota específica |
+| GET | `/notas/{chave}/xml` | Download XML da nota |
+| GET | `/notas/estatisticas/resumo` | Resumo estatístico (totais, valores, tipos) |
+
+### Empresas (`/api/v1/empresas`)
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| GET | `/empresas` | Listar empresas do usuário |
+| POST | `/empresas` | Criar nova empresa |
+| GET | `/empresas/{id}` | Detalhes da empresa |
+| PUT | `/empresas/{id}` | Atualizar empresa |
+| DELETE | `/empresas/{id}` | Remover empresa |
+| GET | `/empresas/check-cnpj/{cnpj}` | Verificar CNPJ disponível |
+
+### Perfil do Usuário (`/api/v1/perfil`)
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| GET | `/perfil/` | Dados do perfil |
+| PUT | `/perfil/` | Atualizar perfil |
+
+### Perfil Contador (`/api/v1/perfil-contador`)
+
+| Método | Endpoint | Descrição |
+|--------|---------|-----------|
+| GET | `/perfil-contador` | Dados do contador |
+| PUT | `/perfil-contador` | Atualizar dados |
+| POST | `/perfil-contador/logo` | Upload do logo |
+| POST | `/perfil-contador/certificado` | Upload do certificado A1 |
+| GET | `/perfil-contador/certificado/status` | Status do certificado |
+
+---
+
+## Arquitetura
+
+### Estrutura de Diretórios
 
 ```
 backend/
 ├── app/
-│   ├── api/
-│   │   └── v1/
-│   │       ├── endpoints/       # Rotas da API
-│   │       │   ├── auth.py
-│   │       │   └── notas.py
-│   │       └── router.py
-│   ├── core/                    # Configurações e segurança
-│   │   ├── config.py
-│   │   └── security.py
-│   ├── db/                      # Banco de dados
-│   │   ├── base.py
-│   │   ├── session.py
-│   │   └── init_db.py
-│   ├── models/                  # Modelos SQLAlchemy
-│   │   ├── user.py
-│   │   └── nota_fiscal.py
-│   ├── schemas/                 # Schemas Pydantic
-│   │   ├── auth.py
-│   │   ├── user.py
-│   │   └── nota_fiscal.py
-│   ├── services/                # Lógica de negócio
-│   │   ├── auth_service.py
-│   │   ├── user_service.py
-│   │   └── nota_service.py
-│   ├── main.py                  # Entry point
-│   └── dependencies.py          # Dependências compartilhadas
-├── alembic/                     # Migrações
-├── tests/                       # Testes
+│   ├── api/v1/
+│   │   ├── endpoints/
+│   │   │   ├── auth.py              # Autenticação JWT
+│   │   │   ├── buscar_notas.py      # Busca, importação, download de NF-e
+│   │   │   ├── certificados.py      # Gestão de certificados A1
+│   │   │   ├── debug.py             # Diagnóstico (só fora de produção)
+│   │   │   ├── emissao_nfe.py       # Emissão NF-e (PyNFE)
+│   │   │   ├── empresas.py          # CRUD de empresas
+│   │   │   ├── notas.py             # Leitura de notas (acesso rápido)
+│   │   │   ├── perfil.py            # Perfil do usuário
+│   │   │   └── perfil_contador.py   # Perfil do contador
+│   │   └── router.py                # Agrega todos os routers
+│   ├── adapters/
+│   │   └── pynfe_adapter.py         # Adapter PyNFE (lazy loading)
+│   ├── core/
+│   │   ├── config.py                # Settings com Pydantic BaseSettings
+│   │   ├── security.py              # JWT, bcrypt
+│   │   └── sefaz_config.py          # URLs SEFAZ por UF, cache in-memory
+│   ├── db/
+│   │   └── supabase_client.py       # Clientes Supabase (anon + admin)
+│   ├── models/
+│   │   ├── nfe_busca.py             # NFeBuscadaMetadata, DistribuicaoResponseModel
+│   │   ├── nfe_completa.py          # NotaFiscalCompletaCreate, SefazResponseModel
+│   │   └── nota_fiscal.py           # NotaFiscalCreate, NotaFiscalResponse
+│   ├── services/
+│   │   ├── busca_nf_service.py      # Busca no banco local (real, sem mock)
+│   │   ├── certificado_service.py   # Validação e criptografia de certificados
+│   │   ├── nfe_mapper.py            # Mapeamento NFeBuscadaMetadata → NotaFiscalCreate
+│   │   ├── plan_validation.py       # Limites por plano (Básico/Premium/Enterprise)
+│   │   ├── real_consulta_service.py # Parsing de XML NF-e/NFC-e
+│   │   └── sefaz_service.py         # Comunicação SEFAZ (autorização, consulta, cancelamento)
+│   ├── utils/
+│   │   └── validators.py            # validar_cnpj, validar_chave_nfe, validar_periodo
+│   ├── dependencies.py              # Injeção de dependências FastAPI
+│   └── main.py                      # Entry point, CORS, startup/shutdown
+├── docs/
+│   └── ERROS_E_CORRECOES.md         # Relatório de bugs e correções
+├── tests/
+│   ├── conftest.py                  # Fixtures globais + variáveis de ambiente mock
+│   ├── integration/
+│   │   └── test_pynfe_integration.py
+│   └── unit/
+│       ├── test_busca_nf_service.py
+│       ├── test_certificado_service.py
+│       ├── test_models.py
+│       ├── test_nfe_mapper.py
+│       ├── test_plan_validation.py
+│       ├── test_real_consulta_service.py
+│       ├── test_security.py
+│       ├── test_sefaz_config.py
+│       ├── test_sefaz_service.py
+│       └── test_validators.py
+├── pytest.ini
 ├── requirements.txt
-└── .env
+└── requirements-dev.txt
 ```
 
-## 🧪 Testes
+### Fluxo de Dados — Notas Fiscais
 
-```bash
-# Instalar dependências de desenvolvimento
-pip install -r requirements-dev.txt
+```
+Usuário → Importar XML → real_consulta_service.importar_xml()
+                       → NotaFiscalCreate (Pydantic)
+                       → Supabase (tabela notas_fiscais)
 
-# Executar testes
-pytest tests/ -v
+Usuário → Buscar notas → busca_nf_service.buscar_notas()
+                       → Supabase (query com filtros)
+                       → List[NotaFiscalResponse]
 
-# Com cobertura
-pytest tests/ -v --cov=app --cov-report=html
+Usuário → Download XML → busca_nf_service.baixar_xml()
+                       → Supabase (xml_completo ou xml_resumo)
+                       → bytes (XML)
 ```
 
-## 🔄 Migrações do Banco de Dados
+### Endpoints SEFAZ Configurados
 
-### Criar nova migration
+Todos os 27 estados brasileiros em ambiente **homologação**:
+- Consulta de NF-e por chave (`consulta`)
+- Autorização (`autorizacao`)
+- Cancelamento (`cancelamento`)
+- Inutilização (`inutilizacao`)
+- Status do serviço (`status_servico`)
 
-```bash
-alembic revision --autogenerate -m "Descrição da mudança"
+**Não configurado:** DistribuicaoDFe (motivo: retorna erro 999 "Operação não suportada").
+
+### Estrutura da Chave de Acesso NF-e (44 dígitos)
+
 ```
-
-### Aplicar migrations
-
-```bash
-alembic upgrade head
+Posição  Conteúdo
+[0:2]    Código UF (ex: 35 = SP)
+[2:8]    AAMM — Ano e Mês de emissão (6 dígitos)
+[8:22]   CNPJ do emitente (14 dígitos)
+[22:24]  Modelo: 55=NF-e, 65=NFC-e, 57=CT-e
+[24:27]  Série (3 dígitos)
+[27:36]  Número da NF (9 dígitos)
+[36:43]  Código numérico randômico (7 dígitos)
+[43]     Dígito verificador módulo 11
 ```
-
-### Reverter última migration
-
-```bash
-alembic downgrade -1
-```
-
-### Ver histórico
-
-```bash
-alembic history
-```
-
-## 🔒 Segurança
-
-### Boas Práticas Implementadas
-
-- ✅ Senhas hasheadas com bcrypt
-- ✅ Autenticação JWT com tokens de curta duração
-- ✅ CORS configurado para domínios específicos
-- ✅ Validações rigorosas de dados fiscais (CNPJ, Chave de Acesso)
-- ✅ Type hints em todo o código
-
-### Melhorias Futuras
-
-- [ ] Rate limiting (limitação de requisições)
-- [ ] Blacklist de tokens (logout real)
-- [ ] Auditoria de acesso
-- [ ] HTTPS obrigatório em produção
-- [ ] Certificado digital para assinatura de XMLs
-
-## 📊 Validações Implementadas
-
-### CNPJ
-- Formato: `XX.XXX.XXX/XXXX-XX`
-- Validação de estrutura com regex
-
-### Chave de Acesso NF-e
-- Exatamente 44 dígitos numéricos
-- Sem formatação (apenas números)
-
-### Valores Monetários
-- Tipo `Decimal` (precisão fiscal)
-- Máximo 2 casas decimais
-- Não-negativos
-
-## 🚀 Deploy em Produção
-
-### Preparação
-
-1. Alterar `DATABASE_URL` para PostgreSQL
-2. Gerar `SECRET_KEY` segura
-3. Configurar CORS para domínios específicos
-4. Desabilitar `DEBUG=False`
-
-### Docker (opcional)
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-### Variáveis de Ambiente de Produção
-
-```env
-SECRET_KEY=<chave_gerada_com_openssl>
-DATABASE_URL=postgresql+asyncpg://user:password@host:5432/hicontrol
-DEBUG=False
-CORS_ORIGINS=https://hi-control.vercel.app
-ALLOWED_HOSTS=api.hicontrol.com
-```
-
-## 🆘 Troubleshooting
-
-### Erro: "No module named 'app'"
-
-Execute sempre do diretório `backend/`:
-```bash
-cd backend
-python -m uvicorn app.main:app --reload
-```
-
-### Erro: "SECRET_KEY not found"
-
-Certifique-se de ter um arquivo `.env` com `SECRET_KEY` configurada.
-
-### Erro de conexão com banco de dados
-
-Verifique se as migrations foram aplicadas:
-```bash
-alembic upgrade head
-```
-
-## 📞 Suporte
-
-Para dúvidas ou problemas:
-1. Consulte a documentação da API em `/api/docs`
-2. Verifique os logs do servidor
-3. Abra uma issue no repositório
-
-## 📝 Licença
-
-Este projeto é parte do sistema Hi-Control - Todos os direitos reservados.
 
 ---
 
-**Desenvolvido com ❤️ para escritórios de contabilidade brasileiros**
+## Testes
+
+```bash
+# Executar todos os testes
+pytest tests/ -v
+
+# Apenas testes unitários
+pytest tests/unit/ -v
+
+# Com relatório de cobertura
+pytest tests/unit/ --cov=app --cov-report=html
+```
+
+**Resultado atual:** 224 passed, 6 skipped (PyNFE indisponível)
+
+---
+
+## Planos de Acesso
+
+| Plano | Empresas | Notas/mês | Histórico |
+|-------|---------|-----------|-----------|
+| Básico | 1 | 100 | 30 dias |
+| Premium | 5 | 1000 | 180 dias |
+| Enterprise | Ilimitado | Ilimitado | 1825 dias |
+
+**DEV MODE:** Em desenvolvimento, todos os limites são substituídos por Enterprise.
+
+---
+
+## Segurança
+
+- Senhas hasheadas com bcrypt (salt automático)
+- Tokens JWT com expiração curta (access) e longa (refresh)
+- Certificados A1 armazenados criptografados com Fernet
+- CORS configurado com lista de origens permitidas
+- RLS bypass via Supabase service_role apenas no backend
+- Validação completa de CNPJ (dígitos verificadores) e Chave NF-e (módulo 11)
+
+---
+
+## Variáveis de Ambiente
+
+| Variável | Obrigatória | Descrição |
+|----------|------------|-----------|
+| `SUPABASE_URL` | Sim | URL do projeto Supabase |
+| `SUPABASE_KEY` | Sim | Chave anon (acesso público) |
+| `SUPABASE_SERVICE_KEY` | Sim | Chave service_role (bypass RLS) |
+| `SECRET_KEY` | Sim | Chave para assinar JWT |
+| `CERTIFICATE_A1_FILE` | Não | Caminho do .pfx padrão |
+| `CERTIFICATE_PASSWORD` | Não | Senha do certificado .pfx |
+| `CERTIFICATE_ENCRYPTION_KEY` | Não | Chave Fernet para criptografar cert no banco |
+| `USE_MOCK_SEFAZ` | Não | `false` em produção (sempre) |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | Não | Default: 30 |
+| `REFRESH_TOKEN_EXPIRE_DAYS` | Não | Default: 7 |
+
+---
+
+## Limitações Conhecidas
+
+1. **Emissão NF-e indisponível** — PyNFE tem incompatibilidade com OpenSSL recente (`verify` removido). Importação de XML e consulta SEFAZ funcionam normalmente.
+
+2. **CT-e sem importação XML** — `importar_xml()` rejeita arquivos CT-e. Suporte planejado para versão futura.
+
+3. **Sem exportação Google Drive** — Funcionalidade não implementada. Para exportar XMLs, use o download individual ou lote ZIP.
+
+4. **DistribuicaoDFe indisponível** — O WebService SEFAZ para distribuição automática não está habilitado. Use o Portal Nacional NF-e para download em lote.
+
+---
+
+Desenvolvido para escritórios de contabilidade brasileiros.

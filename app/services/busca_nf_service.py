@@ -54,7 +54,7 @@ class BuscaNotaFiscalService:
         """
         if not validar_chave_nfe(chave):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail="Chave de acesso invalida. Deve conter 44 digitos numericos validos."
             )
         return True

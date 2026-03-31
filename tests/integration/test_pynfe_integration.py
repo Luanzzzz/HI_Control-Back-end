@@ -28,10 +28,19 @@ from app.models.nfe_completa import (
     ICMSItem,
     PISItem,
     COFINSItem,
-    ImpostosItem,
 )
 from app.services.sefaz_service import sefaz_service
-from app.adapters.pynfe_adapter import pynfe_adapter
+from app.adapters.pynfe_adapter import PyNFeAdapter
+
+# Instância do adapter para testes
+pynfe_adapter = PyNFeAdapter()
+
+# Skip todos os testes do adapter se PyNFE não estiver disponível
+pynfe_disponivel = PyNFeAdapter.is_available()
+pynfe_skip = pytest.mark.skipif(
+    not pynfe_disponivel,
+    reason="PyNFE não disponível (dependência OpenSSL incompatível ou não instalado)"
+)
 
 
 @pytest.fixture
@@ -41,12 +50,10 @@ def destinatario_homologacao():
     """
     return DestinatarioNFe(
         cpf="12345678909",
-        razao_social="NF-E EMITIDA EM AMBIENTE DE HOMOLOGACAO - SEM VALOR FISCAL",
-        indicador_inscricao_estadual="9",  # Não contribuinte
-        endereco_logradouro="Rua Teste Homologacao",
-        endereco_numero="123",
-        endereco_bairro="Centro",
-        codigo_municipio="3550308",  # São Paulo
+        nome="NF-E EMITIDA EM AMBIENTE DE HOMOLOGACAO - SEM VALOR FISCAL",
+        logradouro="Rua Teste Homologacao",
+        numero="123",
+        bairro="Centro",
         municipio="Sao Paulo",
         uf="SP",
         cep="01310100",
@@ -58,7 +65,16 @@ def item_homologacao():
     """
     Item de NF-e válido para homologação.
     """
-    impostos = ImpostosItem(
+    return ItemNFeBase(
+        numero_item=1,
+        codigo_produto="PROD001",
+        descricao="NOTA FISCAL EMITIDA EM AMBIENTE DE HOMOLOGACAO - SEM VALOR FISCAL",
+        ncm="12345678",
+        cfop="5102",  # Venda de mercadoria
+        unidade_comercial="UN",
+        quantidade_comercial=Decimal("1.0000"),
+        valor_unitario_comercial=Decimal("100.00"),
+        valor_total_bruto=Decimal("100.00"),
         icms=ICMSItem(
             origem="0",  # Nacional
             cst="00",  # Tributada integralmente
@@ -81,19 +97,6 @@ def item_homologacao():
         ),
     )
 
-    return ItemNFeBase(
-        numero_item=1,
-        codigo_produto="PROD001",
-        descricao="NOTA FISCAL EMITIDA EM AMBIENTE DE HOMOLOGACAO - SEM VALOR FISCAL",
-        ncm="12345678",
-        cfop="5102",  # Venda de mercadoria
-        unidade_comercial="UN",
-        quantidade_comercial=Decimal("1.0000"),
-        valor_unitario_comercial=Decimal("100.00"),
-        valor_total_bruto=Decimal("100.00"),
-        impostos=impostos,
-    )
-
 
 @pytest.fixture
 def nfe_completa_homologacao(destinatario_homologacao, item_homologacao):
@@ -105,7 +108,9 @@ def nfe_completa_homologacao(destinatario_homologacao, item_homologacao):
         numero_nf="1",
         serie="1",
         modelo="55",  # NF-e
+        tipo_operacao="1",  # Saída
         ambiente="2",  # Homologação
+        data_emissao=datetime.now(),
         destinatario=destinatario_homologacao,
         itens=[item_homologacao],
         transporte=TransporteNFe(modalidade_frete=9),  # Sem frete
@@ -116,6 +121,7 @@ def nfe_completa_homologacao(destinatario_homologacao, item_homologacao):
 class TestPyNFeAdapter:
     """Testes do adapter PyNFE"""
 
+    @pynfe_skip
     def test_to_pynfe_emitente(self):
         """Testa conversão de empresa para Emitente"""
         empresa_dados = {
@@ -131,6 +137,7 @@ class TestPyNFeAdapter:
         assert emitente.cnpj == '12345678000190'
         assert emitente.razao_social == 'Empresa Teste Ltda'
 
+    @pynfe_skip
     def test_to_pynfe_cliente(self, destinatario_homologacao):
         """Testa conversão de destinatário para Cliente"""
         cliente = pynfe_adapter.to_pynfe_cliente(destinatario_homologacao)
@@ -139,6 +146,7 @@ class TestPyNFeAdapter:
         assert cliente.numero_documento == '12345678909'
         assert cliente.tipo_documento == 'CPF'
 
+    @pynfe_skip
     def test_to_pynfe_produto(self, item_homologacao):
         """Testa conversão de item para Produto"""
         produto = pynfe_adapter.to_pynfe_produto(item_homologacao)
@@ -200,6 +208,7 @@ class TestSefazServiceIntegration:
 class TestXmlGeneration:
     """Testes de geração de XML"""
 
+    @pynfe_skip
     def test_gerar_xml_nfe_estrutura(self, nfe_completa_homologacao):
         """
         Testa se XML gerado tem estrutura válida.

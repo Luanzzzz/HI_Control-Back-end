@@ -474,8 +474,7 @@ class NotaFiscalCompletaResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 # ============================================
 # ERROS SEFAZ
@@ -493,12 +492,12 @@ class SefazResponseModel(BaseModel):
     """Resposta padronizada da SEFAZ"""
 
     # Status
-    codigo: str = Field(..., description="100=Autorizado, 101=Cancelado, etc")
-    descricao: str = Field(..., description="Mensagem SEFAZ")
+    status_codigo: str = Field(..., description="100=Autorizado, 101=Cancelado, etc")
+    status_descricao: str = Field("", description="Mensagem SEFAZ")
 
     # Protocolo (se autorizado)
     protocolo: Optional[str] = None
-    chave_acesso: Optional[ChaveNFe] = None
+    chave_acesso: Optional[str] = None
     data_recebimento: Optional[datetime] = None
 
     # XML retorno
@@ -507,9 +506,9 @@ class SefazResponseModel(BaseModel):
     # Rejeições (se houver)
     rejeicoes: List[SefazRejeicao] = Field(default_factory=list)
 
-    # Ambiente
-    ambiente: TipoAmbiente
-    uf: str = Field(..., pattern=r'^[A-Z]{2}$')
+    # Ambiente e UF (opcionais)
+    ambiente: Optional[str] = None
+    uf: Optional[str] = None
 
     # Metadata
     tempo_resposta_ms: Optional[int] = Field(None, description="Tempo de resposta em ms")
@@ -517,7 +516,7 @@ class SefazResponseModel(BaseModel):
     @property
     def autorizado(self) -> bool:
         """Verifica se foi autorizado"""
-        return self.codigo == "100"
+        return self.status_codigo == "100"
 
     @property
     def rejeitado(self) -> bool:
@@ -527,7 +526,7 @@ class SefazResponseModel(BaseModel):
     @property
     def em_processamento(self) -> bool:
         """Verifica se está em processamento"""
-        return self.codigo == "105"
+        return self.status_codigo == "105"
 
 # ============================================
 # FIM DOS MODELOS
