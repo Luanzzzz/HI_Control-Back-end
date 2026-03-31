@@ -5,10 +5,10 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import Client
 from app.db.supabase_client import supabase_client, supabase_admin
-from app.core.config import settings
-from jose import JWTError, jwt
-from typing import Optional
+from app.core.token_blacklist import token_blacklist
 import logging
+
+from app.core.security import decode_token
 
 logger = logging.getLogger(__name__)
 
@@ -55,29 +55,34 @@ async def get_current_user(
     )
 
     try:
-        # Decodificar JWT
         token = credentials.credentials
-        payload = jwt.decode(
-            token,
-            settings.SECRET_KEY,
-            algorithms=[settings.ALGORITHM]
-        )
+        payload = decode_token(token, expected_type="access")
 
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
 
+        # Verificar se token está na blacklist (revogado)
+        jti: str = payload.get("jti")
+        if jti and token_blacklist.is_blacklisted(jti):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token revogado",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         # Buscar usuário no Supabase
         response = db.table("usuarios")\
             .select("*")\
             .eq("id", user_id)\
-            .single()\
+            .limit(1)\
             .execute()
 
-        if not response.data:
+        usuarios = response.data or []
+        if not usuarios:
             raise credentials_exception
 
-        usuario = response.data
+        usuario = usuarios[0]
 
         # Verificar se usuário está ativo
         if not usuario.get("ativo"):
@@ -88,10 +93,10 @@ async def get_current_user(
 
         return usuario
 
-    except JWTError:
-        raise credentials_exception
-    except Exception as e:
-        logger.error(f"Erro ao validar token: {e}")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("Erro ao validar token")
         raise credentials_exception
 
 
@@ -111,20 +116,40 @@ async def verificar_acesso_modulo(
     Raises:
         HTTPException 403: Se usuário não tem acesso ao módulo
     """
-    # 🚧 BYPASS para desenvolvimento: permite acesso a todos os módulos
-    # Em produção, DEVE ter DISABLE_MODULE_CHECK=false ou não definido
+    # 🔒 VALIDAÇÃO DE BYPASS COM SEGURANÇA EM PRODUÇÃO
     import os
-    # Bypass em ambiente de desenvolvimento (ENVIRONMENT != "production") OU se DISABLE_MODULE_CHECK=true
-    env = os.getenv("ENVIRONMENT", "development")  # Default to development se não definido
-    if (env != "production" or
-        os.getenv("DISABLE_MODULE_CHECK", "false").lower() == "true"):
+    env = os.getenv("ENVIRONMENT", "development")
+
+    # =========================================================================
+    # PROTEÇÃO CRÍTICA: Em produção, NUNCA permite bypass
+    # =========================================================================
+    if env == "production":
+        disable_check = os.getenv("DISABLE_MODULE_CHECK", "false").lower() == "true"
+        if disable_check:
+            raise RuntimeError(
+                "\n\n" + "=" * 80 + "\n"
+                "🔴 SECURITY ERROR: DISABLE_MODULE_CHECK não pode ser true em produção.\n"
+                "=" * 80 + "\n"
+                "AÇÃO OBRIGATÓRIA: Configure DISABLE_MODULE_CHECK=false ou remova a variável.\n"
+                "Esta proteção evita que usuários FREE acessem módulos PREMIUM.\n"
+                "=" * 80 + "\n\n"
+            )
+
+    # =========================================================================
+    # BYPASS permitido apenas em desenvolvimento/staging/homologação
+    # =========================================================================
+    if env in ["development", "staging", "homologacao"] and os.getenv("DISABLE_MODULE_CHECK") == "true":
         logger.warning(
-            f"🔓 [DEV MODE] MÓDULO '{modulo}' - Verificação DESABILITADA. "
-            f"Usuário {usuario.get('email')} tem acesso IRRESTRITO. "
-            f"Ambiente: {env} | "
-            f"DISABLE_MODULE_CHECK: {os.getenv('DISABLE_MODULE_CHECK', 'false')} | "
-            f"⚠️ ATENÇÃO: Isso NÃO deve estar ativo em produção!"
+            f"⚠️ BYPASS DE MÓDULO ATIVO em ambiente '{env}' — NÃO usar em produção | "
+            f"Módulo: {modulo} | Usuário: {usuario.get('email')}"
         )
+        return True
+
+    # =========================================================================
+    # ADMIN tem acesso irrestrito a todos os módulos (em qualquer ambiente)
+    # =========================================================================
+    if usuario.get("is_admin"):
+        logger.info(f"✅ Acesso admin concedido ao módulo '{modulo}' | Usuário: {usuario.get('email')}")
         return True
 
     try:

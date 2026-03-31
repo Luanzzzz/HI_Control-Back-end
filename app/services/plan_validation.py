@@ -41,13 +41,14 @@ class PlanLimits:
     }
 
 
-async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
+async def obter_plano_usuario(usuario_id: str, db: Client, is_admin: bool = False) -> Dict[str, Any]:
     """
     Busca plano ativo do usuário com seus limites.
 
     Args:
         usuario_id: UUID do usuário
         db: Cliente Supabase
+        is_admin: Se True, retorna plano enterprise sem verificar assinatura
 
     Returns:
         Dict com 'nome', 'limites', 'assinatura_id', 'modulos'
@@ -55,14 +56,28 @@ async def obter_plano_usuario(usuario_id: str, db: Client) -> Dict[str, Any]:
     Raises:
         HTTPException 403: Se nenhuma assinatura ativa encontrada
     """
-    # BYPASS PARA DESENVOLVIMENTO - Retornar plano Enterprise fictício
-    # Em produção, DEVE ter ENVIRONMENT=production para desabilitar este bypass
+    # Admin tem acesso enterprise sem necessidade de assinatura ativa
+    if is_admin:
+        return {
+            "nome": "enterprise",
+            "limites": PlanLimits.ENTERPRISE,
+            "assinatura_id": f"admin-{usuario_id[:8]}",
+            "modulos": [
+                "buscador_notas", "emissor_notas", "dashboard",
+                "clientes", "certificados", "configuracoes",
+                "tarefas", "whatsapp",
+            ]
+        }
+
+    # BYPASS opcional apenas para desenvolvimento local controlado.
+    # Nunca deve ficar implícito por ambiente.
     import os
     env = os.getenv("ENVIRONMENT", "development")
-    if env != "production":
+    allow_dev_bypass = os.getenv("ALLOW_DEV_PLAN_BYPASS", "false").lower() == "true"
+    if env != "production" and allow_dev_bypass:
         logger.warning(
             f"[DEV MODE] Bypass de assinatura ativo (usuario={usuario_id[:8]}...). "
-            f"Ambiente: {env}. Defina ENVIRONMENT=production para desabilitar."
+            f"Ambiente: {env}. Desabilite ALLOW_DEV_PLAN_BYPASS para voltar a validar assinaturas."
         )
         return {
             "nome": "enterprise",

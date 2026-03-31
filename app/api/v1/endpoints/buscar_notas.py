@@ -9,7 +9,7 @@ Fase 2 (futuro): DistribuicaoDFe para busca automatica no SEFAZ
 """
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
 from supabase import Client
-from typing import Optional
+from typing import Optional, Dict
 import logging
 
 from app.models.nfe_busca import (
@@ -138,7 +138,9 @@ async def buscar_notas_fiscais(
         await verificar_acesso_modulo("buscador_notas", current_user, db)
 
         # 2. Obter plano do usuario
-        plano_info = await obter_plano_usuario(current_user["id"], db)
+        plano_info = await obter_plano_usuario(
+            current_user["id"], db, is_admin=bool(current_user.get("is_admin"))
+        )
 
         logger.info(
             f"[PLANO] {plano_info['nome'].upper()} | "
@@ -153,8 +155,9 @@ async def buscar_notas_fiscais(
         cnpj_normalizado = request.cnpj.replace(".", "").replace("/", "").replace("-", "")
 
         empresa_response = db.table("empresas")\
-            .select("id, razao_social")\
+            .select("id, razao_social, usuario_id")\
             .eq("usuario_id", current_user["id"])\
+            .eq("ativa", True)\
             .or_(f"cnpj.eq.{request.cnpj},cnpj.eq.{cnpj_normalizado}")\
             .execute()
 
@@ -169,6 +172,17 @@ async def buscar_notas_fiscais(
 
         empresa = empresa_response.data[0]
         empresa_id = empresa["id"]
+
+        # Validacao multi-tenancy: assegurar que empresa pertence ao usuario
+        if empresa.get("usuario_id") != current_user["id"]:
+            logger.warning(
+                f"[SECURITY] Tentativa de acesso não autorizado a empresa {empresa_id} "
+                f"por usuario {current_user['id']}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Acesso negado a esta empresa"
+            )
 
         logger.info(f"[EMPRESA] {empresa.get('razao_social')} | ID: {empresa_id}")
 
@@ -307,10 +321,32 @@ async def obter_estatisticas_cnpj(
                 detail="CNPJ inválido. Deve conter 14 dígitos."
             )
         
-        # Buscar todas as notas do CNPJ
+        empresas_response = db.table("empresas")\
+            .select("id, cnpj")\
+            .eq("usuario_id", usuario["id"])\
+            .eq("ativa", True)\
+            .execute()
+
+        empresas = empresas_response.data or []
+
+        empresa = next(
+            (
+                item for item in empresas
+                if re.sub(r"[^0-9]", "", str(item.get("cnpj", ""))) == cnpj_limpo
+            ),
+            None
+        )
+
+        if not empresa:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Empresa não encontrada"
+            )
+
+        # Buscar todas as notas da empresa do usuário
         response = db.table("notas_fiscais")\
             .select("*")\
-            .eq("emitente_cnpj", cnpj_limpo)\
+            .eq("empresa_id", empresa["id"])\
             .execute()
         
         notas = response.data or []
@@ -322,7 +358,7 @@ async def obter_estatisticas_cnpj(
         # Notas por tipo
         notas_por_tipo: Dict[str, int] = {}
         for nota in notas:
-            tipo = nota.get("tipo", "Desconhecido")
+            tipo = nota.get("tipo_nf") or nota.get("tipo") or "Desconhecido"
             notas_por_tipo[tipo] = notas_por_tipo.get(tipo, 0) + 1
         
         # Última nota (mais recente)
@@ -380,10 +416,12 @@ async def iniciar_busca_background(
 
         # 1. Verificar acesso ao módulo
         await verificar_acesso_modulo("buscador_notas", current_user, db)
-        
+
         # 2. Obter plano do usuário
-        plano_info = await obter_plano_usuario(current_user["id"], db)
-        
+        plano_info = await obter_plano_usuario(
+            current_user["id"], db, is_admin=bool(current_user.get("is_admin"))
+        )
+
         # 3. Validar limites
         await validar_limite_historico(plano_info, request.nsu_inicial)
         await validar_limite_consultas_dia(current_user["id"], plano_info, db)
@@ -394,15 +432,28 @@ async def iniciar_busca_background(
         cnpj_formatado = f"{cnpj_normalizado[:2]}.{cnpj_normalizado[2:5]}.{cnpj_normalizado[5:8]}/{cnpj_normalizado[8:12]}-{cnpj_normalizado[12:]}"
 
         empresa_response = db.table("empresas")\
-            .select("id")\
+            .select("id, usuario_id")\
             .eq("usuario_id", current_user["id"])\
+            .eq("ativa", True)\
             .or_(f"cnpj.eq.{request.cnpj},cnpj.eq.{cnpj_normalizado},cnpj.eq.{cnpj_formatado}")\
             .execute()
         
         if not empresa_response.data:
             raise HTTPException(404, "Empresa não encontrada")
-            
-        empresa_id = empresa_response.data[0]["id"]
+
+        empresa = empresa_response.data[0]
+        empresa_id = empresa["id"]
+
+        # Validacao multi-tenancy: assegurar que empresa pertence ao usuario
+        if empresa.get("usuario_id") != current_user["id"]:
+            logger.warning(
+                f"[SECURITY] Tentativa de acesso não autorizado a empresa {empresa_id} "
+                f"por usuario {current_user['id']}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Acesso negado a esta empresa"
+            )
         
         # 5. Criar Job (PENDING)
         from datetime import datetime
