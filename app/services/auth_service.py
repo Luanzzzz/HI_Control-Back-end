@@ -4,9 +4,19 @@ Serviço de autenticação
 from typing import Optional
 from supabase import Client
 import logging
+import secrets
+import asyncio
 
-from app.core.security import verify_password, create_access_token, create_refresh_token
+from fastapi import HTTPException
+
+from app.core.security import (
+    verify_password,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+)
 from app.schemas.auth import TokenResponse
+from app.services.user_service import get_user_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -24,43 +34,43 @@ async def authenticate_user(db: Client, email: str, password: str) -> Optional[d
         Dados do usuário autenticado ou None se credenciais inválidas
     """
     try:
-        logger.info(f"[AUTH] Tentando autenticar: {email}")
+        logger.info("[AUTH] Tentando autenticar usuário")
 
         # Buscar usuário por email
         response = db.table("usuarios")\
             .select("*")\
             .eq("email", email)\
-            .single()\
+            .limit(1)\
             .execute()
 
-        if not response.data:
-            logger.warning(f"[AUTH] Usuario nao encontrado: {email}")
+        usuarios = response.data or []
+        if not usuarios:
+            logger.warning("[AUTH] Falha na autenticacao")
+            # Mitigação de timing attack: pausa aleatória (50-200ms) para simular verificação de senha
+            await asyncio.sleep(secrets.randbelow(150) / 1000 + 0.05)
             return None
 
-        user = response.data
-        logger.info(f"[AUTH] Usuario encontrado: {user.get('email')}, ativo: {user.get('ativo')}")
+        user = usuarios[0]
 
         # Verificar senha
         hashed = user.get("hashed_password")
-        logger.info(f"[AUTH] Hash do banco: {hashed[:30] if hashed else 'VAZIO'}...")
 
         password_valid = verify_password(password, hashed)
-        logger.info(f"[AUTH] Senha valida: {password_valid}")
 
         if not password_valid:
-            logger.warning(f"[AUTH] Senha invalida para: {email}")
+            logger.warning("[AUTH] Falha na autenticacao")
             return None
 
         # Verificar se usuário está ativo
         if not user.get("ativo"):
-            logger.warning(f"[AUTH] Usuario inativo: {email}")
+            logger.warning("[AUTH] Falha na autenticacao")
             return None
 
-        logger.info(f"[AUTH] Autenticacao bem sucedida: {email}")
+        logger.info("[AUTH] Autenticacao bem sucedida")
         return user
 
-    except Exception as e:
-        logger.error(f"[AUTH] Erro na autenticacao: {str(e)}")
+    except Exception:
+        logger.warning("[AUTH] Erro na autenticacao")
         return None
 
 
@@ -75,8 +85,7 @@ def create_tokens_for_user(user: dict) -> TokenResponse:
         Tokens de acesso e refresh
     """
     token_data = {
-        "sub": user["id"],
-        "email": user["email"]
+        "sub": user["id"]
     }
 
     access_token = create_access_token(token_data)
@@ -87,3 +96,33 @@ def create_tokens_for_user(user: dict) -> TokenResponse:
         refresh_token=refresh_token,
         token_type="bearer"
     )
+
+
+async def refresh_tokens_for_user(db: Client, refresh_token: str) -> Optional[TokenResponse]:
+    """
+    Renova tokens a partir de um refresh token válido.
+
+    Args:
+        db: Cliente Supabase
+        refresh_token: JWT de atualização
+
+    Returns:
+        Nova dupla de tokens ou None se inválido
+    """
+    try:
+        payload = decode_token(refresh_token, expected_type="refresh")
+        user_id = payload.get("sub")
+
+        if not user_id:
+            return None
+
+        user = await get_user_by_id(db, user_id)
+        if not user or not user.get("ativo"):
+            return None
+
+        return create_tokens_for_user(user)
+    except HTTPException:
+        return None
+    except Exception:
+        logger.warning("[AUTH] Erro ao renovar tokens")
+        return None

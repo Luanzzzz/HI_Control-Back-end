@@ -52,11 +52,7 @@ class BaseNacionalAdapter:
     """
     
     SISTEMA_NOME = "Sistema Nacional"
-    
-    # URLs oficiais
-    URL_PRODUCAO = "https://sefin.nfse.gov.br/sefinnacional"
-    URL_HOMOLOGACAO = "https://sefin.producaorestrita.nfse.gov.br/sefinnacional"
-    
+
     def __init__(self, credentials: Dict[str, str], homologacao: bool = False):
         """
         Args:
@@ -65,8 +61,16 @@ class BaseNacionalAdapter:
         """
         self.credentials = credentials
         self.homologacao = homologacao
-        self.base_url = self.URL_HOMOLOGACAO if homologacao else self.URL_PRODUCAO
+        self.base_url = self._obter_url_base(homologacao)
         self.token: Optional[str] = None
+
+    def _obter_url_base(self, homologacao: bool = False) -> str:
+        """Obtém URL base do SEFIN a partir do config do bot."""
+        from bot.config import config
+        return (
+            config.NFSE_SEFIN_URL_HOMOLOGACAO if homologacao
+            else config.NFSE_SEFIN_URL_PRODUCAO
+        )
     
     def limpar_cnpj(self, cnpj: str) -> str:
         """Remove formatação do CNPJ."""

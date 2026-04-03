@@ -59,7 +59,7 @@ async def buscar_notas_fiscais(
                 if params.tipo_nf and params.tipo_nf != "TODAS":
                     q = q.eq("tipo_nf", params.tipo_nf)
                 if params.situacao:
-                    q.eq("situacao", params.situacao)
+                    q = q.eq("situacao", params.situacao)
                 if params.cnpj_emitente:
                     q = q.eq("cnpj_emitente", params.cnpj_emitente)
                 if params.data_inicio:

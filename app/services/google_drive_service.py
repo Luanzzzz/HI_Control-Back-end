@@ -38,16 +38,22 @@ class GoogleDriveService:
             except Exception as e:
                 logger.error(f"Erro ao inicializar Fernet para Drive: {e}")
 
-    def encrypt(self, value: str) -> str:
+    def _require_fernet(self, operation: str) -> Fernet:
         if not self._fernet:
-            return value
-        return self._fernet.encrypt(value.encode()).decode()
+            raise RuntimeError(
+                "CERTIFICATE_ENCRYPTION_KEY inválida ou ausente. "
+                f"Não foi possível {operation}."
+            )
+        return self._fernet
+
+    def encrypt(self, value: str) -> str:
+        fernet = self._require_fernet("criptografar credenciais do Google Drive")
+        return fernet.encrypt(value.encode()).decode()
 
     def decrypt(self, value: str) -> str:
-        if not self._fernet:
-            return value
+        fernet = self._require_fernet("descriptografar credenciais do Google Drive")
         try:
-            return self._fernet.decrypt(value.encode()).decode()
+            return fernet.decrypt(value.encode()).decode()
         except Exception:
             return value
 

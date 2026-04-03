@@ -84,13 +84,22 @@ async def verificar_cnpj(
     usuario: dict = Depends(get_current_user),
     db: Client = Depends(get_admin_db)
 ):
-    """Verifica se empresa com CNPJ já existe para o usuário"""
+    """
+    Verifica se empresa com CNPJ já existe para o usuário autenticado.
+
+    **Requer autenticação**
+
+    Returns:
+        - 200: {"exists": True, ...} se empresa pertence ao usuário
+        - 200: {"exists": False} se não existe (ou não pertence ao usuário)
+        - 404: Se CNPJ é inválido ou não encontrado
+    """
     # Normalizar CNPJ para formato armazenado (XX.XXX.XXX/XXXX-XX)
     cnpj_digits = re.sub(r'\D', '', cnpj)
     if len(cnpj_digits) != 14:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="CNPJ deve conter 14 dígitos"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="CNPJ não encontrado"
         )
 
     cnpj_formatado = f"{cnpj_digits[:2]}.{cnpj_digits[2:5]}.{cnpj_digits[5:8]}/{cnpj_digits[8:12]}-{cnpj_digits[12:]}"
@@ -115,13 +124,19 @@ async def verificar_cnpj(
                 }
             }
 
-        return {"exists": False}
+        # Retornar 404 para CNPJ não encontrado (não revelando se existe para outro usuário)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="CNPJ não encontrado"
+        )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Erro ao verificar CNPJ: {type(e).__name__} - {str(e)}")
+        logger.error(f"Erro ao verificar CNPJ", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail="Erro ao verificar CNPJ"
+            detail="Erro ao verificar CNPJ. Contate o suporte."
         )
 
 

@@ -40,16 +40,21 @@ class BotConfig:
         return True
     
     # ============================================
-    # BASE NACIONAL NFS-e
+    # BASE NACIONAL NFS-e (URLs centralizadas - SEFIN)
     # ============================================
-    BASE_NACIONAL_URL_PRODUCAO: str = os.getenv(
-        "BASE_NACIONAL_URL",
-        "https://sefin.nfse.gov.br/sefinnacional"
+    NFSE_SEFIN_URL_PRODUCAO: str = os.getenv(
+        "NFSE_SEFIN_URL_PRODUCAO",
+        "https://sefin.nfse.gov.br/SefinNacional"
     )
-    BASE_NACIONAL_URL_HOMOLOGACAO: str = os.getenv(
-        "BASE_NACIONAL_URL_HOMOLOGACAO",
-        "https://sefin.producaorestrita.nfse.gov.br/sefinnacional"
+    NFSE_SEFIN_URL_HOMOLOGACAO: str = os.getenv(
+        "NFSE_SEFIN_URL_HOMOLOGACAO",
+        "https://sefin.producaorestrita.nfse.gov.br/SefinNacional"
     )
+
+    # URLs legadas (manter compatibilidade)
+    BASE_NACIONAL_URL_PRODUCAO: str = NFSE_SEFIN_URL_PRODUCAO
+    BASE_NACIONAL_URL_HOMOLOGACAO: str = NFSE_SEFIN_URL_HOMOLOGACAO
+
     BASE_NACIONAL_TIMEOUT: int = int(os.getenv("BASE_NACIONAL_TIMEOUT", "60"))
     BASE_NACIONAL_HOMOLOGACAO: bool = os.getenv("BASE_NACIONAL_HOMOLOGACAO", "false").lower() == "true"
     

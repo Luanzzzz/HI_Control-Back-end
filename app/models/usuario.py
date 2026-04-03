@@ -36,3 +36,5 @@ class UsuarioComPlano(UsuarioResponse):
     plano_nome: Optional[str] = None
     plano_ativo: bool = False
     modulos_disponiveis: List[str] = Field(default_factory=list)
+    is_admin: Optional[bool] = None
+    role: Optional[str] = None

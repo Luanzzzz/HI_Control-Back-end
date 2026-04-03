@@ -45,6 +45,19 @@ class NotasDriveListResponse(BaseModel):
     message: Optional[str] = None
 
 
+async def _obter_empresa_autorizada(db, empresa_id: str, user_id: str):
+    """Valida que a empresa pertence ao usuário autenticado."""
+    empresa_check = db.table("empresas")\
+        .select("id, razao_social")\
+        .eq("id", empresa_id)\
+        .eq("usuario_id", user_id)\
+        .eq("ativa", True)\
+        .maybe_single()\
+        .execute()
+
+    return empresa_check.data
+
+
 @router.get(
     "/drive/{empresa_id}",
     response_model=NotasDriveListResponse,
@@ -66,15 +79,7 @@ async def buscar_notas_drive(
     db = get_supabase_admin()
 
     # 1. Verificar se empresa pertence ao usuário
-    empresa_check = db.table("empresas")\
-        .select("id, razao_social")\
-        .eq("id", empresa_id)\
-        .eq("usuario_id", user_id)\
-        .eq("ativa", True)\
-        .maybe_single()\
-        .execute()
-
-    if not empresa_check.data:
+    if not await _obter_empresa_autorizada(db, empresa_id, user_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Empresa não encontrada"
@@ -146,7 +151,14 @@ async def forcar_sincronizacao_drive(
     user_id = usuario.get("id")
     db = get_supabase_admin()
 
-    # Buscar config_id
+    # 1. Verificar se empresa pertence ao usuário
+    if not await _obter_empresa_autorizada(db, empresa_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Empresa não encontrada"
+        )
+
+    # 2. Buscar config_id
     drive_config = db.table("configuracoes_drive")\
         .select("id")\
         .eq("empresa_id", empresa_id)\

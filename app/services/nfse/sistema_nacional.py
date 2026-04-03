@@ -47,13 +47,14 @@ class SistemaNacionalAdapter(BaseNFSeAdapter):
 
     SISTEMA_NOME = "Sistema Nacional"
 
-    # URLs oficiais do Sistema Nacional de NFS-e
-    URL_PRODUCAO = "https://sefin.nfse.gov.br/sefinnacional"
-    URL_HOMOLOGACAO = "https://sefin.producaorestrita.nfse.gov.br/sefinnacional"
-
     def __init__(self, credentials: Dict[str, str], homologacao: bool = False):
         super().__init__(credentials)
-        self.base_url = self.URL_HOMOLOGACAO if homologacao else self.URL_PRODUCAO
+        # Usar URLs centralizadas de config.py
+        from app.core.config import settings
+        self.base_url = (
+            settings.NFSE_SEFIN_URL_HOMOLOGACAO if homologacao
+            else settings.NFSE_SEFIN_URL_PRODUCAO
+        )
         self.homologacao = homologacao
 
     async def autenticar(self) -> str:

@@ -13,6 +13,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from fastapi import HTTPException, status
 import logging
+import re
 
 from app.models.nota_fiscal import (
     NotaFiscalResponse,
@@ -26,8 +27,27 @@ from app.utils.validators import (
     validar_periodo_busca,
     extrair_info_chave_nfe
 )
+from app.db.supabase_client import supabase_admin
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitizar_termo_busca(termo: str) -> str:
+    """
+    Remove caracteres perigosos do termo de busca.
+    Previne SQL injection e PostgREST injection.
+
+    Args:
+        termo: Termo de busca fornecido pelo usuario
+
+    Returns:
+        Termo sanitizado (max 100 caracteres)
+    """
+    # Remove caracteres de controle e especiais para PostgREST
+    # Permite apenas: letras, numeros, espacos, pontos, hifens e barras
+    termo_sanitizado = re.sub(r'[^\w\s\.\-\/\d]', '', termo, flags=re.UNICODE)
+    # Limita tamanho maximo para evitar DoS
+    return termo_sanitizado[:100]
 
 
 class BuscaNotaFiscalService:
@@ -60,9 +80,43 @@ class BuscaNotaFiscalService:
         return True
 
     @staticmethod
+    async def _resolver_empresa_ids(
+        empresa_id: Optional[str] = None,
+        usuario_id: Optional[str] = None
+    ) -> List[str]:
+        """
+        Resolve o escopo de empresas permitido para a consulta.
+
+        Se `usuario_id` vier preenchido, a consulta fica restrita às empresas
+        ativas do usuário. Quando `empresa_id` também é informado, a empresa
+        precisa pertencer ao mesmo usuário.
+        """
+        if empresa_id and usuario_id:
+            resposta = supabase_admin.table("empresas")\
+                .select("id")\
+                .eq("id", empresa_id)\
+                .eq("usuario_id", usuario_id)\
+                .eq("ativa", True)\
+                .execute()
+            return [row["id"] for row in (resposta.data or [])]
+
+        if empresa_id:
+            return [empresa_id]
+
+        if usuario_id:
+            resposta = supabase_admin.table("empresas")\
+                .select("id")\
+                .eq("usuario_id", usuario_id)\
+                .eq("ativa", True)\
+                .execute()
+            return [row["id"] for row in (resposta.data or [])]
+
+        return []
+
+    @staticmethod
     async def buscar_notas(
         filtros: BuscaNotaFilter,
-        empresa_id: str,
+        empresa_id: Optional[str] = None,
         usuario_id: Optional[str] = None
     ) -> List[NotaFiscalResponse]:
         """
@@ -99,15 +153,26 @@ class BuscaNotaFiscalService:
         if filtros.chave_acesso:
             await BuscaNotaFiscalService.validar_chave_acesso(filtros.chave_acesso)
 
-        logger.info(f"Buscando notas no banco - Empresa: {empresa_id}, Usuario: {usuario_id}")
+        empresa_ids = await BuscaNotaFiscalService._resolver_empresa_ids(
+            empresa_id=empresa_id,
+            usuario_id=usuario_id
+        )
+
+        if not empresa_ids:
+            logger.info("Nenhuma empresa acessível encontrada para a consulta")
+            return []
+
+        logger.info(
+            "Buscando notas no banco - Empresas: %s, Usuario: %s",
+            empresa_ids,
+            usuario_id,
+        )
 
         try:
-            from app.db.supabase_client import supabase_admin
-
             # Query base
             query = supabase_admin.table("notas_fiscais")\
                 .select("*")\
-                .eq("empresa_id", empresa_id)\
+                .in_("empresa_id", empresa_ids)\
                 .order("data_emissao", desc=True)
 
             # Aplicar filtros
@@ -141,7 +206,7 @@ class BuscaNotaFiscalService:
             result = query.execute()
 
             if not result.data:
-                logger.info(f"Nenhuma nota encontrada para empresa {empresa_id}")
+                logger.info("Nenhuma nota encontrada para o escopo informado")
                 return []
 
             # Converter para NotaFiscalResponse
@@ -169,7 +234,7 @@ class BuscaNotaFiscalService:
     @staticmethod
     async def buscar_notas_params(
         params: NotaFiscalSearchParams,
-        empresa_id: str,
+        empresa_id: Optional[str] = None,
         usuario_id: Optional[str] = None
     ) -> List[NotaFiscalResponse]:
         """
@@ -183,15 +248,26 @@ class BuscaNotaFiscalService:
         Returns:
             Lista de notas fiscais
         """
-        logger.info(f"Buscando notas (params) - Empresa: {empresa_id}, Usuario: {usuario_id}")
+        empresa_ids = await BuscaNotaFiscalService._resolver_empresa_ids(
+            empresa_id=empresa_id,
+            usuario_id=usuario_id
+        )
+
+        if not empresa_ids:
+            logger.info("Nenhuma empresa acessível encontrada para a consulta")
+            return []
+
+        logger.info(
+            "Buscando notas (params) - Empresas: %s, Usuario: %s",
+            empresa_ids,
+            usuario_id,
+        )
 
         try:
-            from app.db.supabase_client import supabase_admin
-
             # Query base
             query = supabase_admin.table("notas_fiscais")\
                 .select("*")\
-                .eq("empresa_id", empresa_id)\
+                .in_("empresa_id", empresa_ids)\
                 .order("data_emissao", desc=True)
 
             # Filtro por tipo
@@ -217,7 +293,8 @@ class BuscaNotaFiscalService:
 
             # Busca por termo geral (usar or_ do Supabase)
             if params.search_term:
-                termo = params.search_term
+                # Sanitizar termo de busca para prevenir injection
+                termo = _sanitizar_termo_busca(params.search_term)
                 query = query.or_(
                     f"numero_nf.ilike.%{termo}%,"
                     f"nome_emitente.ilike.%{termo}%,"
@@ -257,7 +334,11 @@ class BuscaNotaFiscalService:
             )
 
     @staticmethod
-    async def obter_detalhes_nota(chave: str, empresa_id: str) -> NotaFiscalDetalhada:
+    async def obter_detalhes_nota(
+        chave: str,
+        empresa_id: Optional[str] = None,
+        usuario_id: Optional[str] = None
+    ) -> NotaFiscalDetalhada:
         """
         Obtem detalhes completos de uma nota fiscal pela chave de acesso
 
@@ -275,15 +356,29 @@ class BuscaNotaFiscalService:
         # Validar chave
         await BuscaNotaFiscalService.validar_chave_acesso(chave)
 
-        logger.info(f"Buscando detalhes da nota: {chave}")
+        empresa_ids = await BuscaNotaFiscalService._resolver_empresa_ids(
+            empresa_id=empresa_id,
+            usuario_id=usuario_id
+        )
+
+        if not empresa_ids:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Nota fiscal com chave {chave} nao encontrada"
+            )
+
+        logger.info(
+            "Buscando detalhes da nota: %s | Empresas: %s | Usuario: %s",
+            chave,
+            empresa_ids,
+            usuario_id,
+        )
 
         try:
-            from app.db.supabase_client import supabase_admin
-
             result = supabase_admin.table("notas_fiscais")\
                 .select("*")\
                 .eq("chave_acesso", chave)\
-                .eq("empresa_id", empresa_id)\
+                .in_("empresa_id", empresa_ids)\
                 .limit(1)\
                 .execute()
 
@@ -330,7 +425,11 @@ class BuscaNotaFiscalService:
             )
 
     @staticmethod
-    async def baixar_xml(chave: str, empresa_id: str) -> bytes:
+    async def baixar_xml(
+        chave: str,
+        empresa_id: Optional[str] = None,
+        usuario_id: Optional[str] = None
+    ) -> bytes:
         """
         Baixa XML da nota fiscal
 
@@ -348,16 +447,30 @@ class BuscaNotaFiscalService:
         # Validar chave
         await BuscaNotaFiscalService.validar_chave_acesso(chave)
 
-        logger.info(f"Buscando XML da nota: {chave}")
+        empresa_ids = await BuscaNotaFiscalService._resolver_empresa_ids(
+            empresa_id=empresa_id,
+            usuario_id=usuario_id
+        )
+
+        if not empresa_ids:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Nota fiscal com chave {chave} nao encontrada"
+            )
+
+        logger.info(
+            "Buscando XML da nota: %s | Empresas: %s | Usuario: %s",
+            chave,
+            empresa_ids,
+            usuario_id,
+        )
 
         try:
-            from app.db.supabase_client import supabase_admin
-
             # Buscar nota com XML
             result = supabase_admin.table("notas_fiscais")\
                 .select("xml_resumo, xml_completo, chave_acesso, nome_emitente")\
                 .eq("chave_acesso", chave)\
-                .eq("empresa_id", empresa_id)\
+                .in_("empresa_id", empresa_ids)\
                 .limit(1)\
                 .execute()
 

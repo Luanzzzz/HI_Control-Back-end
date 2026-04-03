@@ -53,6 +53,19 @@ class CertificadoService:
     Serviço singleton para gerenciamento de certificados digitais.
 
     Implementa criptografia Fernet conforme decisão do usuário.
+
+    SEGURANÇA (CRÍTICO):
+    =====================
+    A SENHA do certificado digital NÃO deve ser persistida no banco de dados.
+    - Certificado (.pfx) é criptografado com Fernet e armazenado no banco
+    - Senha deve ser fornecida APENAS quando necessário para operações de assinatura
+    - Cada requisição de emissão (NF-e, NFC-e, CT-e) DEVE incluir a senha no request body
+    - Nunca recupere a senha do campo 'certificado_senha_encrypted' do banco
+
+    Impacto de Segurança:
+    - Se o banco for comprometido, a chave Fernet vaza = todas as senhas expostas
+    - Solução: Exigir que o usuário forneça a senha a cada operação
+    - Trade-off: Melhor segurança vs maior atrito UX (usuário digita senha 1x por emissão)
     """
 
     _instance = None
@@ -80,8 +93,17 @@ class CertificadoService:
         else:
             logger.warning(
                 "CERTIFICATE_ENCRYPTION_KEY não configurada. "
-                "Certificados serão armazenados apenas em base64 (menos seguro)."
+                "Operações com segredos de certificados ficarão indisponíveis."
             )
+
+    def _require_fernet(self, operation: str) -> Fernet:
+        """Exige Fernet configurado para qualquer operação sensível."""
+        if not self._fernet:
+            raise CertificadoError(
+                "CERTIFICATE_ENCRYPTION_KEY inválida ou ausente. "
+                f"Não foi possível {operation}."
+            )
+        return self._fernet
 
     # ============================================
     # VALIDAÇÃO E EXTRAÇÃO
@@ -197,15 +219,9 @@ class CertificadoService:
             CertificadoError: Se criptografia falhar
         """
         try:
-            if self._fernet:
-                # Criptografar com Fernet
-                encrypted = self._fernet.encrypt(cert_bytes)
-                # Converter para base64 para armazenar no banco
-                return base64.b64encode(encrypted).decode('utf-8')
-            else:
-                # Fallback: apenas base64 (menos seguro)
-                logger.warning("Certificado armazenado sem criptografia Fernet")
-                return base64.b64encode(cert_bytes).decode('utf-8')
+            fernet = self._require_fernet("criptografar o certificado")
+            encrypted = fernet.encrypt(cert_bytes)
+            return base64.b64encode(encrypted).decode('utf-8')
 
         except Exception as e:
             raise CertificadoError(f"Erro ao criptografar certificado: {e}")
@@ -227,20 +243,14 @@ class CertificadoService:
             # Decodificar base64
             encrypted_bytes = base64.b64decode(cert_base64)
 
-            if self._fernet:
-                # Descriptografar com Fernet
-                try:
-                    cert_bytes = self._fernet.decrypt(encrypted_bytes)
-                    return cert_bytes
-                except Exception as e:
-                    # Pode ser certificado antigo sem Fernet, tentar direto
-                    logger.warning(
-                        f"Falha ao descriptografar com Fernet, "
-                        f"tentando base64 direto: {e}"
-                    )
-                    return encrypted_bytes
-            else:
-                # Sem Fernet, retornar direto
+            fernet = self._require_fernet("descriptografar o certificado")
+            try:
+                return fernet.decrypt(encrypted_bytes)
+            except Exception as e:
+                # Compatibilidade com registros antigos salvos sem Fernet.
+                logger.warning(
+                    f"Falha ao descriptografar com Fernet, usando fallback legado: {e}"
+                )
                 return encrypted_bytes
 
         except Exception as e:
@@ -364,12 +374,90 @@ class CertificadoService:
             }
 
     # ============================================
+    # CONVERSÃO PFX → PEM PARA mTLS
+    # ============================================
+
+    def pfx_para_pem(self, pfx_bytes: bytes, senha: str) -> Tuple[bytes, bytes]:
+        """
+        Converte certificado .pfx (PKCS12) para par (cert.pem, key.pem).
+
+        Necessário para uso com httpx/requests em conexões mTLS,
+        pois essas bibliotecas exigem certificado e chave em formato PEM separados.
+
+        Args:
+            pfx_bytes: Bytes do arquivo .pfx/.p12
+            senha: Senha do certificado
+
+        Returns:
+            Tupla (cert_pem_bytes, key_pem_bytes)
+            - cert_pem_bytes: Certificado + cadeia em formato PEM
+            - key_pem_bytes: Chave privada em formato PEM (sem criptografia)
+
+        Raises:
+            SenhaIncorretaError: Se senha incorreta
+            CertificadoInvalidoError: Se certificado inválido
+        """
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PrivateFormat, NoEncryption
+        )
+
+        try:
+            # Carregar certificado e chave do PFX
+            private_key, certificate, additional_certs = pkcs12.load_key_and_certificates(
+                pfx_bytes, senha.encode()
+            )
+        except ValueError as e:
+            error_msg = str(e).lower()
+            if 'mac' in error_msg or 'password' in error_msg or 'invalid' in error_msg:
+                raise SenhaIncorretaError("Senha do certificado incorreta")
+            else:
+                raise CertificadoInvalidoError(f"Certificado inválido: {e}")
+        except Exception as e:
+            raise CertificadoInvalidoError(f"Erro ao carregar certificado: {e}")
+
+        if certificate is None:
+            raise CertificadoInvalidoError("Certificado não encontrado no arquivo .pfx")
+
+        if private_key is None:
+            raise CertificadoInvalidoError("Chave privada não encontrada no certificado")
+
+        # Converter certificado para PEM
+        cert_pem = certificate.public_bytes(Encoding.PEM)
+
+        # Adicionar certificados intermediários (cadeia completa)
+        if additional_certs:
+            for cert in additional_certs:
+                cert_pem += cert.public_bytes(Encoding.PEM)
+            logger.debug(f"Incluídos {len(additional_certs)} certificados intermediários na cadeia")
+
+        # Converter chave privada para PEM (sem criptografia)
+        # IMPORTANTE: NoEncryption() porque httpx precisa da chave sem senha
+        key_pem = private_key.private_bytes(
+            Encoding.PEM,
+            PrivateFormat.PKCS8,
+            NoEncryption()
+        )
+
+        logger.debug("Certificado convertido de PFX para PEM com sucesso")
+
+        return cert_pem, key_pem
+
+    # ============================================
     # UTILITÁRIOS
     # ============================================
 
+    # SEGURANÇA: Métodos de criptografia de senha removidos (DEPRECATED)
+    # A senha do certificado NÃO deve ser persistida no banco de dados.
+    # Deve ser fornecida pelo usuário a cada operação de emissão.
+    # Os métodos abaixo são mantidos apenas para compatibilidade com código legado.
+    # IMPORTANTE: Remova qualquer referência a criptografar_senha() e descriptografar_senha()
+
     def criptografar_senha(self, senha: str) -> str:
         """
-        Criptografa a senha do certificado para armazenamento seguro.
+        DEPRECATED: Não criptografe senhas de certificado para armazenamento.
+
+        A senha do certificado não deve ser persistida no banco.
+        Este método existe apenas para compatibilidade legada.
 
         Args:
             senha: Senha em texto plano
@@ -377,14 +465,20 @@ class CertificadoService:
         Returns:
             Senha criptografada com Fernet
         """
-        if self._fernet:
-            return self._fernet.encrypt(senha.encode()).decode()
-        logger.warning("Fernet não disponível, armazenando senha em base64")
-        return base64.b64encode(senha.encode()).decode()
+        logger.warning(
+            "DEPRECADO: criptografar_senha() não deve ser usado. "
+            "Senhas de certificado não devem ser armazenadas no banco. "
+            "Forneça a senha a cada operação de emissão."
+        )
+        fernet = self._require_fernet("criptografar a senha do certificado")
+        return fernet.encrypt(senha.encode()).decode()
 
     def descriptografar_senha(self, senha_encrypted: str) -> str:
         """
-        Descriptografa senha armazenada do certificado.
+        DEPRECATED: Não recupere senhas de certificado do banco.
+
+        Este método existe apenas para compatibilidade com código legado.
+        A senha deve vir do request (provided by user), não do banco.
 
         Args:
             senha_encrypted: Senha criptografada
@@ -392,15 +486,19 @@ class CertificadoService:
         Returns:
             Senha em texto plano
         """
+        logger.warning(
+            "DEPRECADO: descriptografar_senha() não deve ser usado. "
+            "Senhas de certificado não devem ser armazenadas no banco. "
+            "Recupere a senha do request do usuário."
+        )
         if not senha_encrypted:
             raise CertificadoError("Senha do certificado não configurada")
-        if self._fernet:
-            try:
-                return self._fernet.decrypt(senha_encrypted.encode()).decode()
-            except Exception:
-                # Pode ser base64 simples (fallback)
-                return base64.b64decode(senha_encrypted).decode()
-        return base64.b64decode(senha_encrypted).decode()
+        fernet = self._require_fernet("descriptografar a senha do certificado")
+        try:
+            return fernet.decrypt(senha_encrypted.encode()).decode()
+        except Exception:
+            # Compatibilidade com registros antigos salvos sem Fernet.
+            return base64.b64decode(senha_encrypted).decode()
 
     @staticmethod
     def gerar_chave_fernet() -> str:

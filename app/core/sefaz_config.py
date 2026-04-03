@@ -16,7 +16,9 @@ from typing import Dict, Literal
 
 # Ambiente padrão: controlado por variável de ambiente SEFAZ_AMBIENTE
 # Valores válidos: "producao" ou "homologacao"
-AMBIENTE_PADRAO: str = os.getenv("SEFAZ_AMBIENTE", "producao")
+# ATENÇÃO: Padrão é homologação. Para produção, defina SEFAZ_AMBIENTE=producao
+# e ALLOW_PRODUCTION_EMISSION=true nas variáveis de ambiente
+AMBIENTE_PADRAO: str = os.getenv("SEFAZ_AMBIENTE", "homologacao")
 
 # Timeouts e retry
 TIMEOUT_SEFAZ = 30  # segundos (validado como adequado na auditoria)

@@ -61,6 +61,15 @@ class CTeNFeVinculada(BaseModel):
 class CTeCreate(BaseModel):
     """Dados para emissão de CT-e."""
     empresa_id: str
+
+    # SEGURANÇA: Senha do certificado A1 não é armazenada no banco.
+    # Deve ser fornecida a cada requisição de emissão.
+    certificado_senha: str = Field(
+        ...,
+        min_length=1,
+        description="Senha do certificado A1 para assinatura digital do CT-e"
+    )
+
     serie: str = Field(default="1", max_length=3)
     numero_ct: Optional[str] = Field(
         None, description="Número do CT-e (auto se vazio)"
@@ -181,13 +190,9 @@ async def autorizar_cte(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_encrypted = empresa.get("certificado_senha_encrypted")
-        if not senha_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Senha do certificado não configurada. Faça o reupload do certificado."
-            )
-        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+        # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
+        senha_cert = cte.certificado_senha
 
         # 3. Auto-incremento
         numero_ct = cte.numero_ct
@@ -274,12 +279,32 @@ async def autorizar_cte(
 # CONSULTA CT-e
 # ============================================
 
-@router.get(
+class CTeConsultaRequest(BaseModel):
+    """Request para consultar CT-e com certificado seguro"""
+    certificado_senha: str = Field(
+        ...,
+        min_length=1,
+        description="Senha do certificado A1"
+    )
+
+
+class CTeEventoRequest(BaseModel):
+    """Request para evento de CT-e com certificado seguro"""
+    certificado_senha: str = Field(
+        ...,
+        min_length=1,
+        description="Senha do certificado A1"
+    )
+    motivo: str = Field(..., min_length=15, max_length=255, description="Motivo da operação")
+
+
+@router.post(
     "/consultar/{chave_acesso}",
     summary="Consultar CT-e por chave de acesso",
 )
 async def consultar_cte(
     chave_acesso: str = Path(..., pattern=r"^\d{44}$"),
+    request: CTeConsultaRequest = Body(...),
     usuario: dict = Depends(get_current_user),
     db: Client = Depends(get_db),
 ):
@@ -304,13 +329,9 @@ async def consultar_cte(
     cert_bytes = certificado_service.descriptografar_certificado(
         emp["certificado_a1"]
     )
-    senha_encrypted = emp.get("certificado_senha_encrypted")
-    if not senha_encrypted:
-        raise HTTPException(
-            status_code=400,
-            detail="Senha do certificado não configurada. Faça o reupload do certificado."
-        )
-    senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+    # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
+    senha_cert = request.certificado_senha
 
     resultado = await cte_service.consultar_cte(
         chave_acesso=chave_acesso,
@@ -332,7 +353,7 @@ async def consultar_cte(
 )
 async def cancelar_cte(
     chave_acesso: str = Path(..., pattern=r"^\d{44}$"),
-    motivo: str = Body(..., embed=True, min_length=15, max_length=255),
+    request: CTeEventoRequest = Body(...),
     usuario: dict = Depends(get_current_user),
     db: Client = Depends(get_db),
 ):
@@ -368,18 +389,14 @@ async def cancelar_cte(
     cert_bytes = certificado_service.descriptografar_certificado(
         emp["certificado_a1"]
     )
-    senha_encrypted = emp.get("certificado_senha_encrypted")
-    if not senha_encrypted:
-        raise HTTPException(
-            status_code=400,
-            detail="Senha do certificado não configurada. Faça o reupload do certificado."
-        )
-    senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+    # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
+    senha_cert = request.certificado_senha
 
     resultado = await cte_service.cancelar_cte(
         chave_acesso=chave_acesso,
         protocolo=cte.get("protocolo", ""),
-        motivo=motivo,
+        motivo=request.motivo,
         cnpj=emp["cnpj"],
         uf=emp["uf"],
         cert_bytes=cert_bytes,

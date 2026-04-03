@@ -134,6 +134,8 @@ async def sincronizar_email(
     A sincronização roda em background e retorna o resumo quando concluída.
     """
     from app.services.email_import_service import email_import_service
+    # SEGURANÇA: Usa supabase_admin para criar/atualizar background_jobs
+    # (sempre filtrado por user_id do token autenticado)
     from app.db.supabase_client import get_supabase_admin
 
     db = get_supabase_admin()
@@ -214,6 +216,8 @@ async def listar_logs_importacao(
     usuario: dict = Depends(get_current_user),
 ):
     """Lista logs de importação de notas (email, drive, manual)."""
+    # SEGURANÇA: Usa supabase_admin mas query é filtrada por user_id
+    # do token autenticado para prevenir vazamento entre tenants.
     from app.db.supabase_client import get_supabase_admin
 
     db = get_supabase_admin()

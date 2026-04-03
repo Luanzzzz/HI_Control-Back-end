@@ -10,6 +10,7 @@ Funcionalidades:
 Requer módulo: emissor_notas
 """
 from typing import Optional
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Path, Body
 from fastapi.responses import StreamingResponse
 from supabase import Client
@@ -32,10 +33,48 @@ from app.services.certificado_service import (
     CertificadoError,
     CertificadoExpiradoError,
 )
+from app.utils.emission_guard import verificar_permissao_emissao, EmissionBlockedError
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/nfe", tags=["NF-e Issuance"])
+
+
+# ============================================
+# SCHEMAS DE SEGURANÇA
+# ============================================
+
+class NFeSenhaRequest(BaseModel):
+    """Request que inclui senha do certificado para operações seguras"""
+    certificado_senha: str = Field(
+        ...,
+        min_length=1,
+        description="Senha do certificado A1"
+    )
+
+
+class NFeCancelamentoRequest(NFeSenhaRequest):
+    """Request para cancelamento de NF-e"""
+    motivo: str = Field(
+        ...,
+        min_length=15,
+        max_length=255,
+        description="Motivo do cancelamento (mín. 15 caracteres)"
+    )
+
+
+class NFeInutilizacaoRequest(NFeSenhaRequest):
+    """Request para inutilização de numeração"""
+    empresa_id: str = Field(..., description="UUID da empresa")
+    serie: str = Field(..., pattern=r'^\d{1,3}$', description="Série (1-999)")
+    numero_inicio: int = Field(..., ge=1, description="Número inicial")
+    numero_fim: int = Field(..., ge=1, description="Número final")
+    justificativa: str = Field(
+        ...,
+        min_length=15,
+        max_length=255,
+        description="Motivo da inutilização (mín. 15 caracteres)"
+    )
 
 
 # ============================================
@@ -121,10 +160,36 @@ async def autorizar_nfe(
     user_id = usuario["id"]
 
     try:
-        # 1. Validar empresa pertence ao usuário
+        # 1. Verificar permissão de emissão em produção
+        verificar_permissao_emissao(
+            empresa_id=nfe_data.empresa_id,
+            tipo_documento="NFe",
+            raise_on_block=True
+        )
+
+        # 2. Validar empresa pertence ao usuário
         empresa = await _validar_empresa_usuario(db, nfe_data.empresa_id, user_id)
 
-        # 2. Validar certificado digital
+        # 2.5. Verificar duplicidade pré-emissão (idempotência)
+        duplicata_existe, nota_existente = await _verificar_duplicidade_nfe(
+            db, nfe_data.empresa_id, nfe_data.numero_nf, nfe_data.serie
+        )
+        if duplicata_existe:
+            logger.warning(
+                f"Tentativa de emitir NF-e duplicada: "
+                f"{nfe_data.numero_nf}/{nfe_data.serie} "
+                f"(chave_acesso={nota_existente.get('chave_acesso')})"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "NF-e com este número e série já foi emitida.",
+                    "chave_acesso": nota_existente.get("chave_acesso"),
+                    "status": nota_existente.get("situacao", "desconhecida"),
+                }
+            )
+
+        # 3. Validar certificado digital
         if not empresa.get("certificado_a1"):
             raise HTTPException(
                 status_code=400,
@@ -148,20 +213,16 @@ async def autorizar_nfe(
                 f"Certificado próximo da expiração: {cert_status['alerta']}"
             )
 
-        # 3. Descriptografar certificado e obter senha
+        # 4. Descriptografar certificado e obter senha
+        # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
 
-        senha_encrypted = empresa.get("certificado_senha_encrypted")
-        if not senha_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Senha do certificado não configurada. Faça o reupload do certificado."
-            )
-        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+        # SEGURANÇA: Senha fornecida no request, não recuperada do banco
+        senha_cert = nfe_data.certificado_senha
 
-        # 4. Enviar para SEFAZ
+        # 5. Enviar para SEFAZ
         logger.info(
             f"Autorizando NF-e {nfe_data.numero_nf}/{nfe_data.serie} "
             f"para empresa {empresa['cnpj']}"
@@ -177,7 +238,7 @@ async def autorizar_nfe(
             empresa_uf=empresa["uf"],
         )
 
-        # 5. Verificar se autorizado
+        # 6. Verificar se autorizado
         if not sefaz_response.autorizado:
             logger.warning(
                 f"NF-e {nfe_data.numero_nf} rejeitada: "
@@ -191,15 +252,42 @@ async def autorizar_nfe(
                 }
             )
 
-        # 6. Salvar no banco de dados
-        nota_id = await _salvar_nfe_banco(
-            db,
-            nfe_data,
-            sefaz_response,
-            user_id,
-        )
+        # 7. Salvar no banco de dados com tratamento crítico para falha
+        try:
+            nota_id = await _salvar_nfe_banco(
+                db,
+                nfe_data,
+                sefaz_response,
+                user_id,
+            )
+        except Exception as e:
+            # SITUAÇÃO CRÍTICA: NF-e foi autorizada pelo SEFAZ mas não conseguimos
+            # salvar no banco local. Logs com todos os dados para recuperação manual.
+            logger.critical(
+                "FALHA CRÍTICA: NF-e autorizada pelo SEFAZ mas não salva no banco. "
+                "Dados para recuperação manual: "
+                f"chave_acesso={sefaz_response.chave_acesso}, "
+                f"protocolo={sefaz_response.protocolo}, "
+                f"empresa_id={nfe_data.empresa_id}, "
+                f"numero_nf={nfe_data.numero_nf}, "
+                f"serie={nfe_data.serie}, "
+                f"erro={str(e)}",
+                exc_info=True
+            )
+            # Retornar 207 Multi-Status: autorizado mas não salvo localmente
+            raise HTTPException(
+                status_code=207,
+                detail={
+                    "message": "NF-e autorizada pelo SEFAZ mas houve falha ao salvar localmente. "
+                              "Entre em contato com suporte com os dados de recuperação.",
+                    "chave_acesso": sefaz_response.chave_acesso,
+                    "protocolo": sefaz_response.protocolo,
+                    "autorizado": True,
+                    "salvo_localmente": False,
+                }
+            )
 
-        # 7. Construir resposta
+        # 8. Construir resposta
         response = NotaFiscalCompletaResponse(
             id=nota_id,
             chave_acesso=sefaz_response.chave_acesso,
@@ -226,6 +314,13 @@ async def autorizar_nfe(
 
     except HTTPException:
         raise
+    except EmissionBlockedError as e:
+        logger.error(f"Emissão bloqueada por segurança: {e}")
+        raise HTTPException(
+            status_code=403,
+            detail="Emissão bloqueada por configuração de segurança. " \
+                   "Verifique as variáveis SEFAZ_AMBIENTE e ALLOW_PRODUCTION_EMISSION."
+        )
     except CertificadoExpiradoError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except CertificadoError as e:
@@ -267,6 +362,7 @@ async def consultar_nfe(
         pattern=r"^\d{44}$",
         description="Chave de acesso de 44 dígitos"
     ),
+    request: NFeSenhaRequest = Body(...),
     usuario: dict = Depends(get_current_user),
     db: Client = Depends(get_db),
 ):
@@ -322,13 +418,9 @@ async def consultar_nfe(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_encrypted = empresa.get("certificado_senha_encrypted")
-        if not senha_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Senha do certificado não configurada. Faça o reupload do certificado."
-            )
-        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+        # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
+        senha_cert = request.certificado_senha
 
         # 3. Consultar SEFAZ
         logger.info(f"Consultando NF-e: {chave_acesso}")
@@ -379,13 +471,7 @@ async def cancelar_nfe(
         pattern=r"^\d{44}$",
         description="Chave de acesso de 44 dígitos"
     ),
-    motivo: str = Body(
-        ...,
-        min_length=15,
-        max_length=255,
-        embed=True,
-        description="Motivo do cancelamento (mínimo 15 caracteres)"
-    ),
+    request: NFeCancelamentoRequest = Body(...),
     usuario: dict = Depends(get_current_user),
     db: Client = Depends(get_db),
 ):
@@ -459,21 +545,17 @@ async def cancelar_nfe(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_encrypted = empresa.get("certificado_senha_encrypted")
-        if not senha_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Senha do certificado não configurada. Faça o reupload do certificado."
-            )
-        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+        # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
+        senha_cert = request.certificado_senha
 
         # 5. Cancelar na SEFAZ
-        logger.info(f"Cancelando NF-e {chave_acesso}: {motivo}")
+        logger.info(f"Cancelando NF-e {chave_acesso}: {request.motivo}")
 
         sefaz_response = sefaz_service.cancelar_nfe(
             chave_acesso=chave_acesso,
             protocolo=nota["protocolo"],
-            motivo=motivo,
+            motivo=request.motivo,
             empresa_cnpj=empresa["cnpj"],
             empresa_uf=empresa["uf"],
             cert_bytes=cert_bytes,
@@ -515,6 +597,45 @@ async def cancelar_nfe(
 # ============================================
 # FUNÇÕES AUXILIARES
 # ============================================
+
+async def _verificar_duplicidade_nfe(
+    db: Client,
+    empresa_id: str,
+    numero: int,
+    serie: str
+) -> tuple[bool, Optional[dict]]:
+    """
+    Verifica se já existe uma NF-e com o mesmo número/série para esta empresa.
+
+    Returns:
+        Tupla (existe_duplicata, dados_nota_existente)
+        - existe_duplicata: True se já existe uma nota com este número/série
+        - dados_nota_existente: Dados da nota existente ou None
+
+    Raises:
+        HTTPException: Se erro na consulta ao banco
+    """
+    try:
+        result = db.table("notas_fiscais") \
+            .select("id, chave_acesso, status, situacao") \
+            .eq("empresa_id", empresa_id) \
+            .eq("numero_nf", numero) \
+            .eq("serie", serie) \
+            .execute()
+
+        if result.data and len(result.data) > 0:
+            return True, result.data[0]
+        return False, None
+
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"Erro ao verificar duplicidade de NF-e: {str(e)}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao verificar duplicidade: {str(e)}"
+        )
+
 
 async def _validar_empresa_usuario(
     db: Client,
@@ -663,14 +784,43 @@ async def _buscar_nfe_por_chave(
     chave_acesso: str,
     user_id: str
 ) -> Optional[dict]:
-    """Busca NF-e por chave de acesso"""
+    """
+    Busca NF-e por chave de acesso.
+
+    ✅ VALIDAÇÃO DE SEGURANÇA:
+    Verifica se a nota pertence a uma empresa do usuário autenticado.
+    """
     response = db.table("notas_fiscais") \
         .select("*") \
         .eq("chave_acesso", chave_acesso) \
         .single() \
         .execute()
 
-    return response.data if response.data else None
+    if not response.data:
+        return None
+
+    nota = response.data
+
+    # ✅ Validar que nota pertence ao usuário autenticado
+    empresa_result = db.table("empresas").select("usuario_id").eq(
+        "id", nota["empresa_id"]
+    ).execute()
+
+    if not empresa_result.data:
+        logger.error(f"Empresa {nota['empresa_id']} da nota {chave_acesso} não encontrada")
+        return None
+
+    empresa = empresa_result.data[0]
+
+    # Se empresa não pertence ao usuário, retornar None (não encontrada)
+    if empresa["usuario_id"] != user_id:
+        logger.warning(
+            f"🚨 Tentativa de acesso não autorizado: "
+            f"user={user_id} tentou acessar nota da empresa={nota['empresa_id']}"
+        )
+        return None
+
+    return nota
 
 
 async def _atualizar_status_nfe(
@@ -765,11 +915,7 @@ async def gerar_danfe(
     summary="Inutilizar numeração de NF-e",
 )
 async def inutilizar_numeracao(
-    empresa_id: str = Body(..., embed=True),
-    serie: str = Body(..., embed=True),
-    numero_inicio: int = Body(..., embed=True, ge=1),
-    numero_fim: int = Body(..., embed=True, ge=1),
-    justificativa: str = Body(..., embed=True, min_length=15, max_length=255),
+    request: NFeInutilizacaoRequest = Body(...),
     usuario: dict = Depends(get_current_user),
     db: Client = Depends(get_db),
 ):
@@ -782,26 +928,30 @@ async def inutilizar_numeracao(
     user_id = usuario["id"]
 
     try:
-        empresa = await _validar_empresa_usuario(db, empresa_id, user_id)
+        # Verificar permissão de emissão em produção
+        verificar_permissao_emissao(
+            empresa_id=request.empresa_id,
+            tipo_documento="NFe",
+            raise_on_block=True
+        )
+
+        empresa = await _validar_empresa_usuario(db, request.empresa_id, user_id)
 
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_encrypted = empresa.get("certificado_senha_encrypted")
-        if not senha_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Senha do certificado não configurada. Faça o reupload do certificado."
-            )
-        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+        # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
+        senha_cert = request.certificado_senha
 
         sefaz_response = sefaz_service.inutilizar_numeracao(
             empresa_cnpj=empresa["cnpj"],
             empresa_uf=empresa["uf"],
-            serie=serie,
-            numero_inicio=numero_inicio,
-            numero_fim=numero_fim,
-            justificativa=justificativa,
+            serie=request.serie,
+            numero_inicial=request.numero_inicio,
+            numero_final=request.numero_fim,
+            ano=datetime.now().year % 100,
+            motivo=request.justificativa,
             cert_bytes=cert_bytes,
             senha_cert=senha_cert,
         )
@@ -810,6 +960,13 @@ async def inutilizar_numeracao(
 
     except HTTPException:
         raise
+    except EmissionBlockedError as e:
+        logger.error(f"Emissão bloqueada por segurança: {e}")
+        raise HTTPException(
+            status_code=403,
+            detail="Emissão bloqueada por configuração de segurança. " \
+                   "Verifique as variáveis SEFAZ_AMBIENTE e ALLOW_PRODUCTION_EMISSION."
+        )
     except SefazException as e:
         raise HTTPException(status_code=502, detail={"message": str(e)})
     except Exception as e:

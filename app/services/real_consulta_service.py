@@ -28,6 +28,33 @@ logger = logging.getLogger(__name__)
 # Namespace NFe
 NFE_NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
+# Segurança: Parser XML seguro contra XXE Injection
+MAX_XML_SIZE = 10 * 1024 * 1024  # 10MB
+SECURE_XML_PARSER = etree.XMLParser(
+    resolve_entities=False,
+    no_network=True,
+    huge_tree=False,
+    remove_comments=True,
+)
+
+
+def _sanitizar_termo_busca(termo: str) -> str:
+    """
+    Remove caracteres perigosos do termo de busca.
+    Previne SQL injection e PostgREST injection.
+
+    Args:
+        termo: Termo de busca fornecido pelo usuario
+
+    Returns:
+        Termo sanitizado (max 100 caracteres)
+    """
+    # Remove caracteres de controle e especiais para PostgREST
+    # Permite apenas: letras, numeros, espacos, pontos, hifens e barras
+    termo_sanitizado = re.sub(r'[^\w\s\.\-\/\d]', '', termo, flags=re.UNICODE)
+    # Limita tamanho maximo para evitar DoS
+    return termo_sanitizado[:100]
+
 
 class RealConsultaService:
     """
@@ -160,8 +187,12 @@ class RealConsultaService:
             ValueError: Se XML invalido ou modelo nao suportado
         """
         try:
-            # Parse XML
-            root = etree.fromstring(xml_content)
+            # Validacao de tamanho maximo (seguranca contra DoS)
+            if len(xml_content) > MAX_XML_SIZE:
+                raise ValueError(f"XML muito grande: {len(xml_content)} bytes (maximo: {MAX_XML_SIZE})")
+
+            # Parse XML com parser seguro (XXE Injection Prevention)
+            root = etree.fromstring(xml_content, parser=SECURE_XML_PARSER)
 
             # Detectar tipo de documento
             tipo_doc = self._detectar_tipo_documento(root)
@@ -359,6 +390,9 @@ class RealConsultaService:
             Lista de NotaFiscalResponse
         """
         try:
+            # SEGURANÇA: Usa supabase_admin mas query é filtrada por empresa_id
+            # para prevenir vazamento entre tenants. Validação adicional deve ser
+            # feita no endpoint via require_empresa_access().
             from app.db.supabase_client import supabase_admin
 
             # Query base
@@ -385,7 +419,8 @@ class RealConsultaService:
                     query = query.lte("data_emissao", filtros['data_fim'])
 
                 if filtros.get('search_term'):
-                    termo = filtros['search_term']
+                    # Sanitizar termo de busca para prevenir injection
+                    termo = _sanitizar_termo_busca(filtros['search_term'])
                     # Busca por numero, nome emitente ou chave
                     query = query.or_(
                         f"numero_nf.ilike.%{termo}%,"
@@ -441,6 +476,8 @@ class RealConsultaService:
     ) -> Optional[NFeBuscadaMetadata]:
         """Busca nota no banco local por chave de acesso"""
         try:
+            # SEGURANÇA: Usa supabase_admin mas query é filtrada por empresa_id + chave_acesso
+            # para prevenir vazamento entre tenants.
             from app.db.supabase_client import supabase_admin
 
             result = supabase_admin.table("notas_fiscais")\

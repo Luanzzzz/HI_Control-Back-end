@@ -102,9 +102,12 @@ async def upload_certificado(
 
     **Requer módulo**: `emissor_notas`
 
-    **Segurança**:
+    **Segurança** (CRÍTICO):
     - Certificado criptografado com Fernet antes de armazenar
-    - Senha nunca é armazenada (será solicitada ao usuário ou mantida em cache seguro)
+    - **IMPORTANTE**: Senha NÃO é armazenada no banco de dados
+    - Senha deve ser fornecida pelo usuário a cada operação de emissão
+    - Endpoints de emissão (POST /nfe/autorizar, POST /nfce/autorizar, POST /cte/autorizar)
+      exigem campo `certificado_senha` no request
     - Apenas o dono da empresa pode fazer upload
 
     **Validações**:
@@ -177,14 +180,15 @@ async def upload_certificado(
         cert_criptografado = resultado["cert_criptografado"]
         info = resultado["info"]
 
-        # 3. Armazenar na empresa (inclui senha criptografada para emissão automática)
-        senha_encrypted = certificado_service.criptografar_senha(request.senha)
+        # 3. Armazenar na empresa (SEGURANÇA: senha NÃO é persistida no banco)
+        # SEGURANÇA: Senha do certificado não é persistida no banco.
+        # A senha deve ser fornecida pelo usuário a cada operação de emissão.
+        # Salvamos apenas o certificado (criptografado) e seus metadados.
         db.table("empresas").update({
             "certificado_a1": cert_criptografado,
             "certificado_validade": info["data_fim"].isoformat(),
             "certificado_titular": info["titular"],
             "certificado_emissor": info["emissor"],
-            "certificado_senha_encrypted": senha_encrypted,
         }).eq("id", empresa_id).execute()
 
         logger.info(
@@ -224,16 +228,16 @@ async def upload_certificado(
             detail=f"Certificado inválido: {str(e)}"
         )
     except CertificadoError as e:
-        logger.error(f"Erro ao processar certificado: {e}", exc_info=True)
+        logger.error(f"Erro ao processar certificado", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Erro ao processar certificado: {str(e)}"
+            detail="Erro interno ao processar certificado. Contate o suporte."
         )
     except Exception as e:
-        logger.error(f"Erro interno ao fazer upload de certificado: {e}", exc_info=True)
+        logger.error(f"Erro interno ao fazer upload de certificado", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Erro interno: {str(e)}"
+            detail="Erro interno ao processar certificado. Contate o suporte."
         )
 
 
@@ -357,10 +361,10 @@ async def verificar_status_certificado(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao verificar status do certificado: {e}", exc_info=True)
+        logger.error(f"Erro ao verificar status do certificado", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Erro interno: {str(e)}"
+            detail="Erro interno ao verificar status do certificado. Contate o suporte."
         )
 
 
@@ -405,8 +409,8 @@ async def _validar_empresa_usuario(
         raise
     except Exception as e:
         # Log e lançar erro genérico para outros erros
-        logger.error(f"Erro ao validar empresa {empresa_id}: {str(e)}")
+        logger.error(f"Erro ao validar empresa {empresa_id}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Erro ao validar empresa: {str(e)}"
+            detail="Erro ao validar empresa. Contate o suporte."
         )

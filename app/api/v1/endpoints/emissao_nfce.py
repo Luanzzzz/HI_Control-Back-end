@@ -57,6 +57,15 @@ class NFCeDestinatarioCreate(BaseModel):
 class NFCeCreate(BaseModel):
     """Dados para emissão de NFC-e."""
     empresa_id: str = Field(..., description="ID da empresa emitente")
+
+    # SEGURANÇA: Senha do certificado A1 não é armazenada no banco.
+    # Deve ser fornecida a cada requisição de emissão.
+    certificado_senha: str = Field(
+        ...,
+        min_length=1,
+        description="Senha do certificado A1 para assinatura digital da NFC-e"
+    )
+
     serie: str = Field(default="1", max_length=3)
     numero_nf: Optional[str] = Field(
         None, description="Número da NFC-e (auto-incremento se vazio)"
@@ -171,13 +180,9 @@ async def autorizar_nfce(
         cert_bytes = certificado_service.descriptografar_certificado(
             empresa["certificado_a1"]
         )
-        senha_encrypted = empresa.get("certificado_senha_encrypted")
-        if not senha_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Senha do certificado não configurada. Faça o reupload do certificado."
-            )
-        senha_cert = certificado_service.descriptografar_senha(senha_encrypted)
+
+        # SEGURANÇA: Senha vem do request (não do banco) para evitar exposição
+        senha_cert = nfce.certificado_senha
 
         # 4. Auto-incremento de numeração
         numero_nf = nfce.numero_nf
@@ -267,6 +272,34 @@ async def gerar_danfce(
             raise HTTPException(status_code=404, detail="NFC-e não encontrada")
 
         nota = result.data[0]
+
+        # ✅ CORREÇÃO DE SEGURANÇA: Validar que nota pertence ao usuário autenticado
+        user_id = usuario["id"]
+
+        # Buscar empresa da nota
+        empresa_result_validacao = db.table("empresas").select("usuario_id").eq(
+            "id", nota["empresa_id"]
+        ).execute()
+
+        if not empresa_result_validacao.data:
+            raise HTTPException(
+                status_code=500,
+                detail="Empresa da nota não encontrada"
+            )
+
+        empresa_da_nota = empresa_result_validacao.data[0]
+
+        # Verificar se empresa pertence ao usuário autenticado
+        if empresa_da_nota["usuario_id"] != user_id:
+            logger.warning(
+                f"🚨 Tentativa de acesso não autorizado: "
+                f"user={user_id} tentou acessar DANFCE da empresa={nota['empresa_id']}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Acesso negado: esta nota pertence a outra empresa"
+            )
+
         xml_content = nota.get("xml_completo") or nota.get("xml_resumo")
 
         if not xml_content:

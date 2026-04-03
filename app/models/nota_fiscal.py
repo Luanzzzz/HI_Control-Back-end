@@ -152,7 +152,7 @@ class NotaFiscalSearchParams(BaseModel):
     data_fim: Optional[datetime] = Field(None, description="Data final")
     cnpj_emitente: Optional[str] = Field(None, description="Filtro por CNPJ emitente")
     skip: int = Field(0, ge=0, description="Paginação - offset")
-    limit: int = Field(100, ge=1, le=1000, description="Paginação - limite")
+    limit: int = Field(100, ge=1, le=100, description="Paginação - limite maximo de 100 registros")
 
 
 class BuscaNotaFilter(BaseModel):

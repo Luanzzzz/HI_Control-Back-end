@@ -42,19 +42,16 @@ async def log_requests(request: Request, call_next):
 
 
 # Configurar CORS - MUST come AFTER other middlewares to be OUTERMOST
-# allow_origin_regex matches Vercel production AND preview URLs
+# ✅ SEGURANÇA: CORS restrito a domínios específicos (sem wildcard)
+# Usa settings.CORS_ORIGINS para permitir configuração via variáveis de ambiente
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://hi-control.vercel.app",
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
-    allow_origin_regex=r"https://.*\.vercel\.app",  # Aceita TODOS os domínios Vercel (produção + preview)
+    allow_origins=settings.CORS_ORIGINS,
+    # ✅ allow_origin_regex REMOVIDO - usar apenas lista explícita de origens
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
 )
 
 # Incluir routers

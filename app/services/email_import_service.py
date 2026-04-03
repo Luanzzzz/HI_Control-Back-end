@@ -50,21 +50,26 @@ class EmailImportService:
             except Exception as e:
                 logger.error(f"Erro ao inicializar Fernet para email: {e}")
 
+    def _require_fernet(self, operation: str) -> Fernet:
+        if not self._fernet:
+            raise RuntimeError(
+                "CERTIFICATE_ENCRYPTION_KEY inválida ou ausente. "
+                f"Não foi possível {operation}."
+            )
+        return self._fernet
+
     # ============================================
     # CRIPTOGRAFIA DE CREDENCIAIS
     # ============================================
 
     def encrypt(self, value: str) -> str:
-        if not self._fernet:
-            logger.warning("Fernet não disponível, armazenando sem criptografia")
-            return value
-        return self._fernet.encrypt(value.encode()).decode()
+        fernet = self._require_fernet("criptografar credenciais de email")
+        return fernet.encrypt(value.encode()).decode()
 
     def decrypt(self, value: str) -> str:
-        if not self._fernet:
-            return value
+        fernet = self._require_fernet("descriptografar credenciais de email")
         try:
-            return self._fernet.decrypt(value.encode()).decode()
+            return fernet.decrypt(value.encode()).decode()
         except Exception:
             return value
 

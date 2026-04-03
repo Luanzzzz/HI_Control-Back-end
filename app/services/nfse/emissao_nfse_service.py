@@ -2,19 +2,26 @@
 Serviço de emissão e cancelamento de NFS-e.
 
 Complementa o nfse_service (que faz busca) com capacidade de:
-- Emitir NFS-e via APIs municipais
+- Emitir NFS-e via APIs municipais (padrão ABRASF 2.04 - LEGADO)
+- Emitir NFS-e via API Nacional (padrão SEFIN - LC 214/2025)
 - Cancelar NFS-e emitidas
 - Substituir NFS-e
+
+IMPORTANTE:
+- USE_MUNICIPAL_LEGACY=true: Usa APIs municipais antigas (ABRASF 2.04)
+- USE_MUNICIPAL_LEGACY=false: Usa API Nacional (padrão obrigatório desde 01/01/2026)
 
 Utiliza os mesmos adapters municipais, estendendo a interface base
 com métodos de emissão e cancelamento.
 """
+import os
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 from app.db.supabase_client import get_supabase_admin
 from app.services.nfse.nfse_service import nfse_service
+from app.services.nfse.emissao_nfse_nacional_service import nfse_nacional_service
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +45,26 @@ class EmissaoNFSeService:
         empresa_id: str,
         nfse_data: dict,
         usuario_id: Optional[str] = None,
+        usar_nacional: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
-        Emite NFS-e via API municipal.
+        Emite NFS-e via API Nacional ou Municipal (legado).
 
-        O processo varia por município mas o fluxo padrão é:
-        1. Construir XML RPS (Recibo Provisório de Serviço)
-        2. Assinar XML (quando necessário)
-        3. Enviar lote de RPS para a API municipal
-        4. Processar resposta e obter número da NFS-e
+        ROTAS DISPONÍVEIS:
+        1. **API Nacional (SEFIN)** - Padrão obrigatório desde 01/01/2026
+           - Usa: emissao_nfse_nacional_service
+           - DPS com tributos IBS/CBS
+           - mTLS com certificado A1
+
+        2. **API Municipal (ABRASF)** - Legado para municípios não migrados
+           - Usa: RPS padrão ABRASF 2.04
+           - APIs municipais específicas
 
         Args:
             empresa_id: ID da empresa emitente
             nfse_data: Dados da NFS-e a emitir
             usuario_id: ID do usuário que solicita
+            usar_nacional: True=API Nacional, False=Municipal, None=auto (flag env)
 
         Returns:
             Resultado da emissão
@@ -66,6 +79,157 @@ class EmissaoNFSeService:
             tipo_documento="NFSe"
         )
 
+        # ============================================
+        # ROTEAMENTO: Nacional vs Municipal
+        # ============================================
+        use_municipal_legacy = os.getenv("USE_MUNICIPAL_LEGACY", "false").lower() == "true"
+
+        # Sobrescrever flag se parâmetro explícito
+        if usar_nacional is not None:
+            use_municipal_legacy = not usar_nacional
+
+        # Por padrão, usar Nacional (LC 214/2025 obrigatória desde 2026)
+        if not use_municipal_legacy:
+            logger.info(f"Roteando emissão NFS-e para API Nacional (SEFIN) - Empresa: {empresa_id}")
+            return await self._emitir_via_nacional(empresa_id, nfse_data, usuario_id)
+
+        # Fallback: API Municipal (legado)
+        logger.warning(
+            f"⚠️ Usando API Municipal LEGADA (ABRASF 2.04) - Empresa: {empresa_id}. "
+            "Recomenda-se migrar para API Nacional."
+        )
+        return await self._emitir_via_municipal(empresa_id, nfse_data, usuario_id)
+
+    # ============================================
+    # EMISSÃO VIA NACIONAL (SEFIN)
+    # ============================================
+
+    async def _emitir_via_nacional(
+        self,
+        empresa_id: str,
+        nfse_data: dict,
+        usuario_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Emite NFS-e via API Nacional (SEFIN).
+
+        Fluxo:
+        1. Buscar empresa + certificado A1
+        2. Montar DPS (com IBS/CBS)
+        3. Emitir via POST /nfse
+        4. Salvar no banco
+        """
+        db = get_supabase_admin()
+
+        try:
+            # 1. Buscar empresa
+            empresa = db.table("empresas").select("*").eq("id", empresa_id).single().execute()
+
+            if not empresa.data:
+                return {"sucesso": False, "erro": "Empresa não encontrada"}
+
+            emp = empresa.data
+
+            # 2. Obter certificado A1
+            from app.services.certificado_service import certificado_service
+
+            cert_info = await certificado_service.obter_certificado_a1(empresa_id)
+            if not cert_info:
+                return {
+                    "sucesso": False,
+                    "erro": "Certificado A1 não configurado para emissão NFS-e Nacional"
+                }
+
+            # 3. Montar DPS
+            from app.core.config import settings
+            ambiente = "producao" if settings.SEFAZ_AMBIENTE == "producao" else "homologacao"
+
+            dps_xml = nfse_nacional_service.montar_dps(
+                dados_emissao=nfse_data,
+                empresa=emp,
+                ambiente=ambiente
+            )
+
+            logger.debug(f"DPS montado para empresa {empresa_id}: {len(dps_xml)} bytes")
+
+            # 4. Emitir via SEFIN
+            resultado = await nfse_nacional_service.emitir_nfse(
+                dps_xml=dps_xml,
+                cert_path=cert_info["cert_path"],
+                cert_password=cert_info["senha"],
+                ambiente=ambiente,
+                empresa_id=empresa_id
+            )
+
+            # 5. Salvar no banco se sucesso
+            if resultado.get("sucesso"):
+                nota_id = await self._salvar_nfse_nacional(
+                    db, empresa_id, nfse_data, resultado
+                )
+                resultado["nota_id"] = nota_id
+
+            return resultado
+
+        except Exception as e:
+            logger.error(f"Erro ao emitir NFS-e Nacional: {e}", exc_info=True)
+            return {
+                "sucesso": False,
+                "erro": str(e),
+                "tipo": "emissao_nacional"
+            }
+
+    async def _salvar_nfse_nacional(
+        self,
+        db,
+        empresa_id: str,
+        nfse_data: dict,
+        resultado: dict,
+    ) -> str:
+        """Salva NFS-e Nacional no banco."""
+        tomador = nfse_data.get("tomador", {})
+        servico = nfse_data.get("servico", {})
+
+        nota_db = {
+            "empresa_id": empresa_id,
+            "tipo_nf": "NFSE",
+            "numero_nf": resultado.get("numero_nfse", ""),
+            "serie": nfse_data.get("serie", "NACIONAL"),
+            "situacao": "autorizada",
+            "chave_acesso": resultado.get("chave_acesso", ""),
+            "cnpj_destinatario": tomador.get("cnpj") or tomador.get("cpf", ""),
+            "nome_destinatario": tomador.get("nome", tomador.get("razao_social", "")),
+            "valor_total": float(servico.get("valor_servicos", 0)),
+            "data_emissao": datetime.now().isoformat(),
+            "descricao_servico": servico.get("discriminacao", ""),
+            "codigo_servico": servico.get("codigo_tributacao_nacional", ""),
+            "protocolo": resultado.get("protocolo", ""),
+            "xml_content": resultado.get("xml_nfse", ""),
+            "fonte": "emissao_nacional_sefin",
+        }
+
+        result = db.table("notas_fiscais").insert(nota_db).execute()
+
+        if not result.data:
+            raise Exception("Erro ao salvar NFS-e Nacional no banco")
+
+        return result.data[0]["id"]
+
+    # ============================================
+    # EMISSÃO VIA MUNICIPAL (LEGADO ABRASF)
+    # ============================================
+
+    async def _emitir_via_municipal(
+        self,
+        empresa_id: str,
+        nfse_data: dict,
+        usuario_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Emite NFS-e via API Municipal (ABRASF 2.04 - LEGADO).
+
+        ATENÇÃO: Este fluxo é mantido apenas para municípios que ainda
+        não aderiram ao Sistema Nacional. Preferir emissão via Nacional.
+        """
         db = get_supabase_admin()
 
         try:

@@ -3,7 +3,70 @@ Validadores de dados fiscais brasileiros
 """
 from datetime import date, datetime, timedelta
 import re
-from typing import Optional
+from typing import Iterable, Optional
+
+
+def calcular_digito_verificador_chave(chave_sem_dv: str) -> str:
+    """
+    Calcula o dígito verificador da chave fiscal usando módulo 11.
+
+    Args:
+        chave_sem_dv: Primeiros 43 dígitos da chave
+
+    Returns:
+        Dígito verificador calculado como string
+    """
+    if not isinstance(chave_sem_dv, str):
+        raise ValueError("Chave deve ser uma string")
+
+    chave = chave_sem_dv.strip().replace(" ", "")
+    if not chave.isdigit() or len(chave) != 43:
+        raise ValueError("Chave sem DV deve conter exatamente 43 dígitos numéricos")
+
+    pesos = [4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    soma = sum(int(chave[idx]) * pesos[idx] for idx in range(43))
+    resto = soma % 11
+    dv = 0 if resto in [0, 1] else 11 - resto
+    return str(dv)
+
+
+def _validar_chave_fiscal(chave: str, modelos_validos: Iterable[str]) -> bool:
+    """
+    Valida estrutura e dígito verificador de uma chave fiscal.
+
+    Args:
+        chave: Chave de acesso completa com 44 dígitos
+        modelos_validos: Modelos aceitos para a validação
+
+    Returns:
+        True se a chave for válida
+    """
+    if not isinstance(chave, str):
+        return False
+
+    chave = chave.strip().replace(' ', '')
+
+    if not chave.isdigit() or len(chave) != 44:
+        return False
+
+    uf = chave[0:2]
+    modelo = chave[22:24]
+
+    ufs_validas = [
+        '11', '12', '13', '14', '15', '16', '17',
+        '21', '22', '23', '24', '25', '26', '27', '28', '29',
+        '31', '32', '33', '35',
+        '41', '42', '43',
+        '50', '51', '52', '53'
+    ]
+    if uf not in ufs_validas:
+        return False
+
+    if modelo not in set(modelos_validos):
+        return False
+
+    dv_calculado = calcular_digito_verificador_chave(chave[:43])
+    return chave[43] == dv_calculado
 
 
 def validar_cnpj(cnpj: str) -> bool:
@@ -16,6 +79,9 @@ def validar_cnpj(cnpj: str) -> bool:
     Returns:
         True se CNPJ válido, False caso contrário
     """
+    if not isinstance(cnpj, str):
+        return False
+
     # Remover formatação
     cnpj_digits = re.sub(r'[^\d]', '', cnpj)
 
@@ -75,49 +141,7 @@ def validar_chave_nfe(chave: str) -> bool:
     Returns:
         True se chave válida, False caso contrário
     """
-    # Remover espaços e formatação
-    chave = chave.strip().replace(' ', '')
-
-    # Verificar se tem exatamente 44 dígitos
-    if not chave.isdigit() or len(chave) != 44:
-        return False
-
-    # Extrair componentes
-    uf = chave[0:2]
-    aamm = chave[2:8]
-    cnpj = chave[8:22]
-    modelo = chave[22:24]
-    serie = chave[24:27]
-    numero = chave[27:36]
-    codigo = chave[36:43]
-    dv = int(chave[43])
-
-    # Validar UF (códigos IBGE válidos)
-    ufs_validas = [
-        '11', '12', '13', '14', '15', '16', '17',  # Norte
-        '21', '22', '23', '24', '25', '26', '27', '28', '29',  # Nordeste
-        '31', '32', '33', '35',  # Sudeste
-        '41', '42', '43',  # Sul
-        '50', '51', '52', '53'  # Centro-Oeste
-    ]
-    if uf not in ufs_validas:
-        return False
-
-    # Validar modelo (55=NF-e, 65=NFC-e)
-    if modelo not in ['55', '65']:
-        return False
-
-    # Calcular dígito verificador (módulo 11)
-    pesos = [4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
-    soma = 0
-
-    for i in range(43):
-        soma += int(chave[i]) * pesos[i]
-
-    resto = soma % 11
-    dv_calculado = 0 if resto in [0, 1] else 11 - resto
-
-    return dv == dv_calculado
+    return _validar_chave_fiscal(chave, modelos_validos=("55", "65"))
 
 
 def validar_periodo_busca(data_inicio: date, data_fim: date, max_dias: int = 90) -> tuple[bool, Optional[str]]:
@@ -183,12 +207,7 @@ def validar_chave_cte(chave: str) -> bool:
     Returns:
         True se chave válida, False caso contrário
     """
-    if not validar_chave_nfe(chave):
-        return False
-
-    # Verificar se modelo é 57 (CT-e)
-    modelo = chave[22:24]
-    return modelo == '57'
+    return _validar_chave_fiscal(chave, modelos_validos=("57",))
 
 
 def extrair_info_chave_nfe(chave: str) -> dict:

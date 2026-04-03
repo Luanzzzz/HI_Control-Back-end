@@ -1,11 +1,10 @@
 -- ============================================
 -- SCRIPT DE CONFIGURAÇÃO DO USUÁRIO ADMIN ÚNICO
 -- ============================================
--- Este script limpa a tabela de usuários e cria um único administrador
--- Email: luan.valentino78@gmail.com
--- Senha: 2520@Selu
--- Plano: Premium (Profissional)
---
+-- Este script serve como TEMPLATE.
+-- Substitua os placeholders antes de executar.
+-- Gere o hash bcrypt fora do repositório e nunca registre a senha em texto plano.
+-- 
 -- IMPORTANTE: Execute este script no SQL Editor do Supabase
 -- Dashboard > SQL Editor > New Query > Cole e Execute
 -- ============================================
@@ -19,7 +18,10 @@ DELETE FROM notas_fiscais;
 DELETE FROM usuarios;
 
 -- Passo 3: Criar o usuário administrador único
--- Hash da senha '2520@Selu' gerado com bcrypt
+-- Substitua:
+--   <ADMIN_EMAIL>
+--   <ADMIN_NAME>
+--   <BCRYPT_HASH>
 INSERT INTO usuarios (
     id,
     email,
@@ -32,9 +34,9 @@ INSERT INTO usuarios (
 )
 VALUES (
     gen_random_uuid(),
-    'luan.valentino78@gmail.com',
-    'Luan Valentino',
-    '$2b$12$l5XuXtzigdE/jstnqmsChuapednBbnDd1MwHuMXqEH9f2ivWinSea',
+    '<ADMIN_EMAIL>',
+    '<ADMIN_NAME>',
+    '<BCRYPT_HASH>',
     true,
     true,
     NOW(),
@@ -70,7 +72,7 @@ SELECT
     NOW()
 FROM usuarios u
 CROSS JOIN planos p
-WHERE u.email = 'luan.valentino78@gmail.com'
+WHERE u.email = '<ADMIN_EMAIL>'
   AND p.nome = 'profissional'
 LIMIT 1;
 
@@ -89,13 +91,13 @@ SELECT
 FROM usuarios u
 LEFT JOIN assinaturas a ON u.id = a.usuario_id AND a.status = 'ativa'
 LEFT JOIN planos p ON a.plano_id = p.id
-WHERE u.email = 'luan.valentino78@gmail.com';
+WHERE u.email = '<ADMIN_EMAIL>';
 
 -- ============================================
 -- FIM DO SCRIPT
 -- ============================================
 -- Resultado esperado:
--- - 1 usuário criado: luan.valentino78@gmail.com
+-- - 1 usuário criado: <ADMIN_EMAIL>
 -- - Plano: profissional (premium)
 -- - Status: ativa
 -- - Módulos: ["dashboard", "buscador_notas", "emissor_notas", "tarefas", "whatsapp", "clientes", "estoque", "faturamento"]

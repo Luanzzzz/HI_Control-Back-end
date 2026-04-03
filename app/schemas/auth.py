@@ -1,13 +1,29 @@
 """
 Schemas Pydantic para Autenticação
 """
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, AliasChoices
 
 
 class LoginRequest(BaseModel):
     """Schema de requisição de login"""
-    email: EmailStr = Field(..., description="Email do usuário")
-    password: str = Field(..., min_length=6, description="Senha do usuário")
+    email: EmailStr = Field(
+        ...,
+        validation_alias=AliasChoices("email", "username"),
+        serialization_alias="email",
+        description="Email do usuário",
+    )
+    password: str = Field(
+        ...,
+        min_length=6,
+        validation_alias=AliasChoices("password", "senha"),
+        serialization_alias="password",
+        description="Senha do usuário",
+    )
+
+
+class RefreshTokenRequest(BaseModel):
+    """Schema de requisição para renovação de tokens"""
+    refresh_token: str = Field(..., min_length=1, description="JWT refresh token")
 
 
 class TokenResponse(BaseModel):

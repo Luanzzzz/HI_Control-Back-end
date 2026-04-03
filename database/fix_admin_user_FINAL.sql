@@ -1,6 +1,8 @@
 -- ============================================
 -- SCRIPT DEFINITIVO - CRIAR USUÁRIO ADMIN
 -- ============================================
+-- TEMPLATE: substitua os placeholders antes de executar.
+-- Não registre email real, hash definitivo ou senha em texto plano no repositório.
 -- Execute este script no SQL Editor do Supabase
 -- ============================================
 
@@ -12,6 +14,10 @@ DELETE FROM usuarios;
 
 -- Passo 2: Criar usuário admin
 -- IMPORTANTE: Este INSERT não usa ON CONFLICT
+-- Substitua:
+--   <ADMIN_EMAIL>
+--   <ADMIN_NAME>
+--   <BCRYPT_HASH>
 INSERT INTO usuarios (
     email,
     nome_completo,
@@ -22,9 +28,9 @@ INSERT INTO usuarios (
     updated_at
 )
 VALUES (
-    'luan.valentino78@gmail.com',
-    'Luan Valentino',
-    '$2b$12$l5XuXtzigdE/jstnqmsChuapednBbnDd1MwHuMXqEH9f2ivWinSea',
+    '<ADMIN_EMAIL>',
+    '<ADMIN_NAME>',
+    '<BCRYPT_HASH>',
     true,
     true,
     NOW(),
@@ -57,7 +63,7 @@ SELECT
     NOW()
 FROM usuarios u
 CROSS JOIN planos p
-WHERE u.email = 'luan.valentino78@gmail.com'
+WHERE u.email = '<ADMIN_EMAIL>'
   AND p.nome = 'profissional';
 
 -- Passo 4: Verificar criação
@@ -73,7 +79,7 @@ SELECT
 FROM usuarios u
 LEFT JOIN assinaturas a ON u.id = a.usuario_id
 LEFT JOIN planos p ON a.plano_id = p.id
-WHERE u.email = 'luan.valentino78@gmail.com';
+WHERE u.email = '<ADMIN_EMAIL>';
 
 -- ============================================
 -- FIM - Deve retornar 1 linha com os dados do usuário

@@ -16,6 +16,7 @@ from app.models.nota_fiscal import (
     BuscaNotaFilter
 )
 from app.services.busca_nf_service import busca_nf_service
+from app.services.nota_service import buscar_notas_fiscais as buscar_notas_fiscais_service
 
 router = APIRouter(tags=["Notas Fiscais"])
 
@@ -77,7 +78,10 @@ async def buscar_notas_avancado(
     )
 
     # Buscar notas
-    notas = await busca_nf_service.buscar_notas(filtro, usuario_id=usuario["id"])
+    notas = await busca_nf_service.buscar_notas(
+        filtro,
+        usuario_id=usuario["id"]
+    )
 
     return notas
 
@@ -139,7 +143,7 @@ async def buscar_notas(
     )
 
     # Buscar notas
-    notas = await busca_nf_service.buscar_notas_params(params, usuario_id=usuario["id"])
+    notas = await buscar_notas_fiscais_service(db, params, usuario)
 
     return notas
 
@@ -181,7 +185,10 @@ async def obter_nota_por_chave(
     await verificar_acesso_modulo("buscador_notas", usuario, db)
 
     # Buscar detalhes
-    nota = await busca_nf_service.obter_detalhes_nota(chave_acesso)
+    nota = await busca_nf_service.obter_detalhes_nota(
+        chave_acesso,
+        usuario_id=usuario["id"]
+    )
 
     return nota
 
@@ -221,7 +228,10 @@ async def baixar_xml_nota(
     await verificar_acesso_modulo("buscador_notas", usuario, db)
 
     # Baixar XML
-    xml_bytes = await busca_nf_service.baixar_xml(chave_acesso)
+    xml_bytes = await busca_nf_service.baixar_xml(
+        chave_acesso,
+        usuario_id=usuario["id"]
+    )
 
     # Criar response com XML
     return StreamingResponse(

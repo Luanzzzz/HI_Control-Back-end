@@ -102,7 +102,9 @@ async def get_user_com_plano(db: Client, user_id: str) -> Optional[UsuarioComPla
             created_at=user["created_at"],
             plano_nome=plano_nome,
             plano_ativo=plano_ativo,
-            modulos_disponiveis=modulos_disponiveis
+            modulos_disponiveis=modulos_disponiveis,
+            is_admin=user.get("is_admin"),
+            role=user.get("role")
         )
 
     except Exception:

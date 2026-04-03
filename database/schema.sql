@@ -345,64 +345,12 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- ============================================
--- 9. DADOS MOCK PARA DESENVOLVIMENTO
+-- 9. DADOS OPCIONAIS DE DESENVOLVIMENTO
 -- ============================================
--- Inserir usuário de teste (apenas desenvolvimento)
--- Senha: HiControl@2024 (hash bcrypt)
-INSERT INTO usuarios (id, email, nome_completo, cpf, hashed_password, ativo, email_verificado)
-VALUES (
-    '00000000-0000-0000-0000-000000000001',
-    'teste@hicontrol.com.br',
-    'Usuário Teste',
-    '123.456.789-00',
-    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5gzTU9TQY1Vze', -- senha: HiControl@2024
-    true,
-    true
-) ON CONFLICT DO NOTHING;
+-- Não versionar credenciais reais ou senhas conhecidas neste schema.
+-- Se precisar popular ambiente local, use scripts/seeds separados fora do schema base.
 
--- Criar assinatura teste (plano profissional)
-INSERT INTO assinaturas (usuario_id, plano_id, data_inicio, data_fim, status, tipo_cobranca, valor_pago)
-SELECT
-    '00000000-0000-0000-0000-000000000001',
-    id,
-    CURRENT_DATE,
-    CURRENT_DATE + INTERVAL '1 year',
-    'ativa',
-    'anual',
-    1970.00
-FROM planos WHERE nome = 'profissional'
-LIMIT 1
-ON CONFLICT DO NOTHING;
-
--- Empresa de teste
-INSERT INTO empresas (id, usuario_id, razao_social, nome_fantasia, cnpj, regime_tributario)
-VALUES (
-    '00000000-0000-0000-0000-000000000002',
-    '00000000-0000-0000-0000-000000000001',
-    'Empresa Teste LTDA',
-    'Teste Corp',
-    '12.345.678/0001-90',
-    'simples_nacional'
-) ON CONFLICT DO NOTHING;
-
--- Notas fiscais de teste
-INSERT INTO notas_fiscais (
-    empresa_id, numero_nf, serie, tipo_nf, chave_acesso,
-    data_emissao, valor_total, cnpj_emitente, nome_emitente, situacao
-)
-SELECT
-    '00000000-0000-0000-0000-000000000002',
-    LPAD((ROW_NUMBER() OVER ())::TEXT, 9, '0'),
-    '1',
-    (ARRAY['NFe', 'NFSe', 'NFCe'])[FLOOR(RANDOM() * 3 + 1)],
-    LPAD(FLOOR(RANDOM() * 10000000000000000000)::TEXT, 44, '0'),
-    NOW() - (RANDOM() * INTERVAL '90 days'),
-    ROUND((RANDOM() * 10000)::NUMERIC, 2),
-    '12.345.678/0001-90',
-    'Empresa Teste LTDA',
-    (ARRAY['autorizada', 'cancelada', 'denegada'])[FLOOR(RANDOM() * 3 + 1)]
-FROM generate_series(1, 50)
-ON CONFLICT DO NOTHING;
+-- Seeds de desenvolvimento intencionais devem viver fora deste schema base.
 
 -- ============================================
 -- FIM DO SCHEMA

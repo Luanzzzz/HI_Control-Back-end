@@ -304,6 +304,15 @@ class NotaFiscalCompletaCreate(BaseModel):
     # ===== IDENTIFICAÇÃO =====
     empresa_id: str = Field(..., description="UUID da empresa emitente")
 
+    # ===== SEGURANÇA: SENHA DO CERTIFICADO =====
+    # SEGURANÇA: Senha do certificado A1 não é armazenada no banco.
+    # Deve ser fornecida a cada requisição de emissão.
+    certificado_senha: str = Field(
+        ...,
+        min_length=1,
+        description="Senha do certificado A1 para assinatura digital da NF-e"
+    )
+
     numero_nf: str = Field(..., pattern=r'^\d{1,9}$', description="1 a 999999999")
     serie: str = Field(..., pattern=r'^\d{1,3}$', description="1 a 999")
     modelo: Literal["55", "65"] = Field(..., description="55-NFe, 65-NFCe")
@@ -398,7 +407,7 @@ class NotaFiscalCompletaCreate(BaseModel):
         }
 
         for item in self.itens:
-            totais["valor_produtos"] += item.valor_total_bruto
+            totais["valor_produtos"] += item.quantidade_comercial * item.valor_unitario_comercial
             totais["valor_frete"] += item.valor_frete
             totais["valor_seguro"] += item.valor_seguro
             totais["valor_desconto"] += item.valor_desconto
