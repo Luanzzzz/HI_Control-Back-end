@@ -12,9 +12,13 @@ Ambiente: Homologação (decisão do usuário)
 Cache: In-memory com TTL de 5 minutos (decisão do usuário)
 """
 import base64
+import gzip
+import html
 import logging
+import os
+import tempfile
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List
 from decimal import Decimal
 
 try:
@@ -48,6 +52,7 @@ from app.core.sefaz_config import (
     obter_endpoints_por_ambiente,
     obter_endpoint_distribuicao,
 )
+from app.core.config import settings
 from app.services.certificado_service import certificado_service
 from app.models.nfe_completa import (
     NotaFiscalCompletaCreate,
@@ -100,7 +105,16 @@ class SefazService:
 
     def __init__(self):
         """Inicializa serviço SEFAZ"""
-        self.ambiente = AMBIENTE_PADRAO  # "homologacao"
+        ambiente_configurado = (
+            (getattr(settings, "SEFAZ_AMBIENTE", None) or AMBIENTE_PADRAO or "homologacao")
+            .strip()
+            .lower()
+        )
+        self.ambiente = (
+            ambiente_configurado
+            if ambiente_configurado in {"producao", "homologacao"}
+            else "homologacao"
+        )
         self._cache = _query_cache
         logger.info(f"SefazService inicializado - Ambiente: {self.ambiente}")
 
@@ -538,7 +552,7 @@ class SefazService:
         """Constrói XML de consulta de protocolo"""
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <consSitNFe versao="4.00" xmlns="http://www.portalfiscal.inf.br/nfe">
-    <tpAmb>{AMBIENTE_PADRAO == 'homologacao' and '2' or '1'}</tpAmb>
+    <tpAmb>{self.ambiente == 'homologacao' and '2' or '1'}</tpAmb>
     <xServ>CONSULTAR</xServ>
     <chNFe>{chave_acesso}</chNFe>
 </consSitNFe>"""
@@ -555,7 +569,7 @@ class SefazService:
 <envEvento versao="1.00" xmlns="http://www.portalfiscal.inf.br/nfe">
     <evento versao="1.00">
         <infEvento>
-            <tpAmb>{AMBIENTE_PADRAO == 'homologacao' and '2' or '1'}</tpAmb>
+            <tpAmb>{self.ambiente == 'homologacao' and '2' or '1'}</tpAmb>
             <CNPJ>{cnpj}</CNPJ>
             <chNFe>{chave_acesso}</chNFe>
             <dhEvento>{datetime.now().isoformat()}</dhEvento>
@@ -584,7 +598,7 @@ class SefazService:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <inutNFe versao="4.00" xmlns="http://www.portalfiscal.inf.br/nfe">
     <infInut>
-        <tpAmb>{AMBIENTE_PADRAO == 'homologacao' and '2' or '1'}</tpAmb>
+        <tpAmb>{self.ambiente == 'homologacao' and '2' or '1'}</tpAmb>
         <xServ>INUTILIZAR</xServ>
         <cUF>{self._obter_codigo_uf(uf)}</cUF>
         <ano>{ano}</ano>
@@ -960,17 +974,11 @@ class SefazService:
         Raises:
             SefazException: Se UF/operacao invalida
         """
-        from app.core.sefaz_config import (
-            obter_endpoints_por_ambiente,
-            obter_endpoint_distribuicao,
-            AMBIENTE_PADRAO,
-        )
-
         # DistribuicaoDFe e centralizado (Ambiente Nacional), nao por UF
         if operacao == "distribuicao":
-            return obter_endpoint_distribuicao(AMBIENTE_PADRAO)
+            return self._obter_url_distribuicao()
 
-        endpoints_map = obter_endpoints_por_ambiente(AMBIENTE_PADRAO)
+        endpoints_map = obter_endpoints_por_ambiente(self.ambiente)
 
         if uf not in endpoints_map:
             raise SefazException(
@@ -990,6 +998,27 @@ class SefazService:
             )
 
         return endpoints[operacao]
+
+    def _obter_url_distribuicao(self, ambiente: Optional[str] = None) -> str:
+        """Resolve o endpoint nacional de distribuicao para o ambiente informado."""
+        ambiente_resolvido = (ambiente or self.ambiente or "homologacao").strip().lower()
+        if ambiente_resolvido not in {"producao", "homologacao"}:
+            ambiente_resolvido = "homologacao"
+        return obter_endpoint_distribuicao(ambiente_resolvido)
+
+    def _ambientes_consulta_distribuicao(self) -> List[str]:
+        """
+        Define os ambientes candidatos para distribuicao.
+
+        Quando o sistema estiver em homologacao, tenta producao em seguida
+        para manter a busca funcional mesmo sem configuracao explicita.
+        """
+        ambientes: List[str] = []
+        for ambiente in [self.ambiente, "producao"]:
+            ambiente_normalizado = (ambiente or "").strip().lower()
+            if ambiente_normalizado in {"producao", "homologacao"} and ambiente_normalizado not in ambientes:
+                ambientes.append(ambiente_normalizado)
+        return ambientes or ["homologacao"]
 
     def _obter_codigo_uf(self, uf: str) -> str:
         """Obtém código IBGE da UF"""
@@ -1025,6 +1054,749 @@ class SefazService:
         )
         # TODO: Inserir no banco de dados na tabela sefaz_log
 
+    def _normalizar_cnpj(self, valor: Optional[str]) -> str:
+        """Remove formatacao e mantem apenas os digitos do CNPJ."""
+        return "".join(ch for ch in str(valor or "") if ch.isdigit())
+
+    def _safe_int(self, valor: Optional[str]) -> int:
+        """Converte string numerica para int sem propagar erro."""
+        try:
+            return int(str(valor or "0").strip())
+        except (TypeError, ValueError):
+            return 0
+
+    def _tag_localname(self, element: Any) -> str:
+        """Retorna o localname da tag XML, com ou sem namespace."""
+        if element is None:
+            return ""
+        try:
+            return etree.QName(element).localname
+        except Exception:
+            tag = getattr(element, "tag", "")
+            return str(tag).split("}", 1)[-1]
+
+    def _find_first(self, element: Any, *local_names: str) -> Any:
+        """Busca o primeiro elemento por localname ignorando namespace."""
+        if element is None:
+            return None
+
+        nomes = set(local_names)
+        for child in element.iter():
+            if self._tag_localname(child) in nomes:
+                return child
+        return None
+
+    def _find_text(self, element: Any, *local_names: str) -> Optional[str]:
+        """Extrai o texto do primeiro elemento encontrado."""
+        found = self._find_first(element, *local_names)
+        if found is None or found.text is None:
+            return None
+        texto = found.text.strip()
+        return texto or None
+
+    def _parse_datetime(self, valor: Optional[str]) -> datetime:
+        """Converte string ISO para datetime com fallback seguro."""
+        if not valor:
+            return datetime.now()
+
+        normalizado = valor.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalizado)
+        except ValueError:
+            try:
+                return datetime.strptime(normalizado[:19], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                logger.warning("Nao foi possivel converter data SEFAZ: %s", valor)
+                return datetime.now()
+
+    def _obter_uf_empresa(self, empresa_id: str) -> str:
+        """Obtém a UF da empresa para montar a consulta de distribuicao."""
+        from app.db.supabase_client import supabase_admin
+
+        try:
+            response = supabase_admin.table("empresas")\
+                .select("estado")\
+                .eq("id", empresa_id)\
+                .limit(1)\
+                .execute()
+
+            if response.data:
+                uf = (response.data[0].get("estado") or "SP").upper()
+                if len(uf) == 2:
+                    return uf
+        except Exception as exc:
+            logger.warning(
+                "Nao foi possivel obter UF da empresa %s para distribuicao: %s",
+                empresa_id,
+                exc,
+            )
+
+        return "SP"
+
+    def _obter_maior_nsu_empresa(self, empresa_id: str) -> int:
+        """Lê o maior NSU ja persistido para retomar a distribuicao."""
+        from app.db.supabase_client import supabase_admin
+
+        try:
+            response = supabase_admin.table("notas_fiscais")\
+                .select("nsu,chave_acesso")\
+                .eq("empresa_id", empresa_id)\
+                .in_("tipo_nf", ["NFe", "NFCe"])\
+                .gt("nsu", 0)\
+                .order("nsu", desc=True)\
+                .limit(500)\
+                .execute()
+
+            for row in response.data or []:
+                chave_acesso = str(row.get("chave_acesso") or "").strip()
+                nsu = self._safe_int(row.get("nsu"))
+
+                if nsu <= 0:
+                    continue
+
+                if chave_acesso.isdigit() and len(chave_acesso) == 44:
+                    return nsu
+        except Exception as exc:
+            logger.warning(
+                "Nao foi possivel recuperar NSU da empresa %s. "
+                "A busca automatica vai reiniciar do zero: %s",
+                empresa_id,
+                exc,
+            )
+
+        return 0
+
+    def _construir_xml_distribuicao(
+        self,
+        cnpj: str,
+        empresa_uf: str,
+        ult_nsu: int,
+        ambiente: Optional[str] = None,
+    ) -> str:
+        """Monta o payload distDFeInt para consulta incremental."""
+        ambiente_resolvido = (ambiente or self.ambiente or "homologacao").strip().lower()
+        tp_amb = "1" if ambiente_resolvido == "producao" else "2"
+        c_uf = self._obter_codigo_uf((empresa_uf or "SP").upper())
+        ult_nsu_formatado = f"{max(0, int(ult_nsu)):015d}"
+
+        return (
+            f'<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">'
+            f"<tpAmb>{tp_amb}</tpAmb>"
+            f"<cUFAutor>{c_uf}</cUFAutor>"
+            f"<CNPJ>{cnpj}</CNPJ>"
+            f"<distNSU><ultNSU>{ult_nsu_formatado}</ultNSU></distNSU>"
+            f"</distDFeInt>"
+        )
+
+    def _construir_envelope_soap_distribuicao(self, xml_distribuicao: str) -> str:
+        """Envolve o distDFeInt no envelope SOAP 1.1 esperado pelo AN."""
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+      <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+        {xml_distribuicao}
+      </nfeDadosMsg>
+    </nfeDistDFeInteresse>
+  </soap:Body>
+</soap:Envelope>"""
+
+    def _enviar_distribuicao_dfe(
+        self,
+        url: str,
+        xml_distribuicao: str,
+        cert_bytes: bytes,
+        senha_cert: str,
+    ) -> str:
+        """
+        Envia o envelope de distribuicao ao Ambiente Nacional usando mTLS.
+        """
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        cert_pem_path = None
+        key_pem_path = None
+
+        try:
+            cert_pem, key_pem = certificado_service.pfx_para_pem(cert_bytes, senha_cert)
+            envelope = self._construir_envelope_soap_distribuicao(xml_distribuicao)
+
+            cert_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
+            key_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
+
+            cert_pem_file.write(cert_pem)
+            cert_pem_file.flush()
+            cert_pem_path = cert_pem_file.name
+            cert_pem_file.close()
+
+            key_pem_file.write(key_pem)
+            key_pem_file.flush()
+            key_pem_path = key_pem_file.name
+            key_pem_file.close()
+
+            retry_strategy = Retry(
+                total=RETRY_ATTEMPTS,
+                backoff_factor=RETRY_BACKOFF,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["POST"],
+            )
+
+            session = requests.Session()
+            session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+
+            headers = {
+                "Content-Type": "text/xml; charset=utf-8",
+                "SOAPAction": (
+                    '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/'
+                    'nfeDistDFeInteresse"'
+                ),
+            }
+
+            response = session.post(
+                url,
+                data=envelope.encode("utf-8"),
+                headers=headers,
+                timeout=TIMEOUT_SEFAZ,
+                verify=True,
+                cert=(cert_pem_path, key_pem_path),
+            )
+            response.raise_for_status()
+            return response.text
+
+        except requests.Timeout as exc:
+            raise SefazTimeoutError(
+                "999",
+                f"Timeout ao consultar distribuicao DF-e ({TIMEOUT_SEFAZ}s)",
+            ) from exc
+        except requests.exceptions.SSLError as exc:
+            raise SefazAuthorizationError(
+                "539",
+                f"Falha no uso do certificado digital para distribuicao: {exc}",
+            ) from exc
+        except requests.RequestException as exc:
+            raise SefazException(
+                "999",
+                f"Erro HTTP ao consultar distribuicao DF-e: {exc}",
+            ) from exc
+        finally:
+            for path in (cert_pem_path, key_pem_path):
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        logger.warning("Nao foi possivel remover arquivo temporario: %s", path)
+
+    def _extrair_xml_doczip(self, doc_zip: Any) -> Optional[str]:
+        """Extrai o XML interno do docZip real ou do mock inline."""
+        if doc_zip is None:
+            return None
+
+        for child in doc_zip:
+            if getattr(child, "tag", None) and self._tag_localname(child) != "NSU":
+                return etree.tostring(child, encoding="unicode")
+
+        conteudo = (doc_zip.text or "").strip()
+        if not conteudo:
+            return None
+
+        try:
+            payload = base64.b64decode(conteudo)
+            try:
+                payload = gzip.decompress(payload)
+            except OSError:
+                pass
+            return payload.decode("utf-8", errors="ignore")
+        except Exception:
+            return conteudo
+
+    def _parsear_resumo_ou_proc_nfe(
+        self,
+        xml_nota: str,
+        nsu: int,
+    ):
+        """Converte resNFe/procNFe em NFeBuscadaMetadata."""
+        from app.models.nfe_busca import NFeBuscadaMetadata, mapear_situacao_nfe
+
+        if etree is None:
+            raise SefazException("999", "lxml nao disponivel para parse da distribuicao")
+
+        root = etree.fromstring(xml_nota.encode("utf-8"))
+
+        resumo = self._find_first(root, "resNFe")
+        if resumo is not None:
+            chave = (self._find_text(resumo, "chNFe") or "").strip()
+            cnpj_emitente = self._normalizar_cnpj(self._find_text(resumo, "CNPJEmit"))
+            tipo_operacao = (self._find_text(resumo, "tpNF") or "1").strip()
+            valor_total = Decimal(str(self._find_text(resumo, "vNF") or "0"))
+            situacao_codigo = (self._find_text(resumo, "cSitNFe") or "1").strip()
+
+            if len(chave) != 44 or not chave.isdigit() or len(cnpj_emitente) != 14:
+                return None
+
+            cnpj_dest = self._normalizar_cnpj(self._find_text(resumo, "CNPJDest"))
+            cpf_dest = self._normalizar_cnpj(self._find_text(resumo, "CPFDest"))
+
+            return NFeBuscadaMetadata(
+                chave_acesso=chave,
+                nsu=nsu,
+                data_emissao=self._parse_datetime(self._find_text(resumo, "dhEmi")),
+                tipo_operacao="0" if tipo_operacao == "0" else "1",
+                valor_total=valor_total,
+                cnpj_emitente=cnpj_emitente,
+                nome_emitente=(self._find_text(resumo, "xNomeEmit") or "Emitente nao informado")[:255],
+                cnpj_destinatario=cnpj_dest if len(cnpj_dest) == 14 else None,
+                cpf_destinatario=cpf_dest if len(cpf_dest) == 11 else None,
+                nome_destinatario=(self._find_text(resumo, "xNomeDest") or None),
+                situacao=mapear_situacao_nfe(situacao_codigo),
+                situacao_codigo=situacao_codigo,
+                protocolo=self._find_text(resumo, "nProt"),
+                xml_resumo=xml_nota,
+            )
+
+        emit = self._find_first(root, "emit")
+        inf_prot = self._find_first(root, "infProt")
+        chave = (self._find_text(root, "chNFe") or "").strip()
+        cnpj_emitente = self._normalizar_cnpj(self._find_text(emit, "CNPJ"))
+
+        if len(chave) != 44 or not chave.isdigit() or len(cnpj_emitente) != 14:
+            return None
+
+        dest = self._find_first(root, "dest")
+        c_stat = (self._find_text(inf_prot, "cStat") or "100").strip()
+        situacao_codigo_map = {
+            "100": "1",
+            "150": "1",
+            "101": "3",
+            "151": "3",
+            "155": "3",
+            "301": "2",
+            "302": "2",
+            "303": "2",
+        }
+        situacao_codigo = situacao_codigo_map.get(c_stat, "1")
+        cnpj_dest = self._normalizar_cnpj(self._find_text(dest, "CNPJ"))
+        cpf_dest = self._normalizar_cnpj(self._find_text(dest, "CPF"))
+
+        return NFeBuscadaMetadata(
+            chave_acesso=chave,
+            nsu=nsu,
+            data_emissao=self._parse_datetime(
+                self._find_text(root, "dhEmi") or self._find_text(root, "dhRecbto")
+            ),
+            tipo_operacao="0" if (self._find_text(root, "tpNF") or "1").strip() == "0" else "1",
+            valor_total=Decimal(str(self._find_text(root, "vNF") or "0")),
+            cnpj_emitente=cnpj_emitente,
+            nome_emitente=(self._find_text(emit, "xNome") or "Emitente nao informado")[:255],
+            cnpj_destinatario=cnpj_dest if len(cnpj_dest) == 14 else None,
+            cpf_destinatario=cpf_dest if len(cpf_dest) == 11 else None,
+            nome_destinatario=(self._find_text(dest, "xNome") or None),
+            situacao={"1": "autorizada", "2": "denegada", "3": "cancelada"}.get(
+                situacao_codigo,
+                "autorizada",
+            ),
+            situacao_codigo=situacao_codigo,
+            protocolo=self._find_text(inf_prot, "nProt"),
+            xml_resumo=xml_nota,
+        )
+
+    def _parsear_resposta_distribuicao(self, xml_response: str):
+        """Parseia o SOAP/XML da distribuicao DF-e e extrai os resumos."""
+        from app.models.nfe_busca import DistribuicaoResponseModel
+
+        if etree is None:
+            raise SefazException("999", "lxml nao disponivel para parse da distribuicao")
+
+        root = etree.fromstring(xml_response.encode("utf-8"))
+        retorno = self._find_first(root, "retDistDFeInt")
+        if retorno is None:
+            resultado_msg = self._find_first(root, "nfeResultMsg")
+            xml_embutido = (resultado_msg.text or "").strip() if resultado_msg is not None else ""
+
+            if xml_embutido:
+                root_embutido = etree.fromstring(html.unescape(xml_embutido).encode("utf-8"))
+                retorno = self._find_first(root_embutido, "retDistDFeInt")
+
+            if retorno is None:
+                raise SefazException(
+                    "999",
+                    "Resposta da distribuicao DF-e nao contem retDistDFeInt",
+                )
+
+        status_codigo = (self._find_text(retorno, "cStat") or "999").strip()
+        motivo = (
+            self._find_text(retorno, "xMotivo")
+            or obter_mensagem_sefaz(status_codigo)
+            or "Resposta da distribuicao processada"
+        )
+        ultimo_nsu = self._safe_int(self._find_text(retorno, "ultNSU"))
+        max_nsu = self._safe_int(self._find_text(retorno, "maxNSU"))
+
+        notas_encontradas = []
+        for doc_zip in retorno.iter():
+            if self._tag_localname(doc_zip) != "docZip":
+                continue
+
+            nsu = self._safe_int(doc_zip.get("NSU") or self._find_text(doc_zip, "NSU"))
+            xml_nota = self._extrair_xml_doczip(doc_zip)
+            if not xml_nota:
+                continue
+
+            try:
+                nota = self._parsear_resumo_ou_proc_nfe(xml_nota, nsu)
+                if nota is not None:
+                    notas_encontradas.append(nota)
+            except Exception as exc:
+                logger.warning("Documento distribuido ignorado por falha no parse: %s", exc)
+
+        return DistribuicaoResponseModel(
+            status_codigo=status_codigo,
+            motivo=motivo,
+            notas_encontradas=notas_encontradas,
+            ultimo_nsu=ultimo_nsu,
+            max_nsu=max_nsu,
+            total_notas=len(notas_encontradas),
+        )
+
+    def _persistir_notas_distribuicao(
+        self,
+        empresa_id: str,
+        notas_encontradas: List[Any],
+    ) -> int:
+        """Persiste as notas retornadas pela distribuicao antes da leitura final."""
+        if not notas_encontradas:
+            return 0
+
+        from app.db.supabase_client import supabase_admin
+        from app.repositories.nota_fiscal_repository import NotaFiscalRepository
+        from app.services.nfe_mapper import map_nfe_buscada_to_nota_fiscal
+
+        repository = NotaFiscalRepository(supabase_admin)
+        notas_para_upsert = []
+
+        for nota in notas_encontradas:
+            try:
+                nota_create = map_nfe_buscada_to_nota_fiscal(nota, empresa_id).model_copy(
+                    update={
+                        "tipo_operacao": "saida" if nota.tipo_operacao == "1" else "entrada",
+                        "cpf_destinatario": nota.cpf_destinatario,
+                        "fonte": "sefaz",
+                        "xml_completo": nota.xml_resumo,
+                    }
+                )
+                notas_para_upsert.append(nota_create)
+            except Exception as exc:
+                logger.warning(
+                    "Nota distribuida ignorada durante persistencia (%s): %s",
+                    getattr(nota, "chave_acesso", "sem_chave"),
+                    exc,
+                )
+
+        if not notas_para_upsert:
+            return 0
+
+        repository.upsert_lote(notas_para_upsert)
+        self._atualizar_nsu_persistido(empresa_id, notas_encontradas)
+        return len(notas_para_upsert)
+
+    def _atualizar_nsu_persistido(
+        self,
+        empresa_id: str,
+        notas_encontradas: List[Any],
+    ) -> None:
+        """Atualiza o NSU persistido quando a coluna existir no banco."""
+        from app.db.supabase_client import supabase_admin
+
+        coluna_nsu_indisponivel = False
+        for nota in notas_encontradas:
+            if coluna_nsu_indisponivel:
+                break
+
+            try:
+                supabase_admin.table("notas_fiscais").update({
+                    "nsu": nota.nsu,
+                }).eq("empresa_id", empresa_id)\
+                    .eq("chave_acesso", nota.chave_acesso)\
+                    .execute()
+            except Exception as exc:
+                mensagem = str(exc).lower()
+                if "nsu" in mensagem and ("column" in mensagem or "schema" in mensagem):
+                    coluna_nsu_indisponivel = True
+                    logger.warning(
+                        "Coluna nsu ausente em notas_fiscais. "
+                        "Execute a migration 011 para sincronizacao incremental completa."
+                    )
+                else:
+                    logger.warning(
+                        "Falha ao atualizar NSU da nota %s: %s",
+                        nota.chave_acesso,
+                        exc,
+                    )
+
+    def _registrar_log_distribuicao(
+        self,
+        empresa_id: str,
+        uf: str,
+        request_xml: Optional[str],
+        response_xml: Optional[str],
+        status_codigo: str,
+        status_descricao: str,
+        sucesso: bool,
+        tempo_resposta_ms: int,
+        mensagem_erro: Optional[str] = None,
+        ambiente_consulta: Optional[str] = None,
+    ) -> None:
+        """Registra auditoria basica da consulta de distribuicao."""
+        from app.db.supabase_client import supabase_admin
+
+        try:
+            supabase_admin.table("sefaz_log").insert({
+                "empresa_id": empresa_id,
+                "operacao": "consulta_distribuicao",
+                "uf": uf,
+                "ambiente": ambiente_consulta or self.ambiente,
+                "request_xml": request_xml,
+                "response_xml": response_xml,
+                "status_codigo": status_codigo,
+                "status_descricao": status_descricao,
+                "sucesso": sucesso,
+                "mensagem_erro": mensagem_erro,
+                "tempo_resposta_ms": tempo_resposta_ms,
+                "response_timestamp": datetime.now().isoformat(),
+            }).execute()
+        except Exception as exc:
+            logger.warning("Nao foi possivel registrar sefaz_log de distribuicao: %s", exc)
+
+    async def _sincronizar_notas_novas(
+        self,
+        cnpj: str,
+        empresa_id: str,
+        contador_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Consulta a SEFAZ primeiro e persiste as notas novas antes da leitura do banco.
+        """
+        from app.adapters.mock_sefaz_client import get_distribuicao_client
+        from app.services.certificado_service import (
+            CertificadoAusenteError,
+            CertificadoError,
+            CertificadoExpiradoError,
+        )
+
+        empresa_uf = self._obter_uf_empresa(empresa_id)
+        ultimo_nsu_local = self._obter_maior_nsu_empresa(empresa_id)
+        inicio = datetime.now()
+        ambiente_utilizado = self.ambiente
+        xml_request = self._construir_xml_distribuicao(
+            cnpj,
+            empresa_uf,
+            ultimo_nsu_local,
+            ambiente=ambiente_utilizado,
+        )
+
+        try:
+            mock_client = get_distribuicao_client()
+            certificado_usado = "mock"
+
+            if mock_client is not None:
+                xml_response = mock_client.consultar(
+                    cnpj=cnpj,
+                    nsu_inicial=ultimo_nsu_local,
+                    uf=empresa_uf,
+                )
+                distribuicao = self._parsear_resposta_distribuicao(xml_response)
+            else:
+                cert_bytes, senha_cert, certificado_usado = await certificado_service.obter_certificado_para_busca(
+                    empresa_id=empresa_id,
+                    contador_id=contador_id,
+                )
+                distribuicao = None
+                xml_response = None
+
+                for ambiente_consulta in self._ambientes_consulta_distribuicao():
+                    ambiente_utilizado = ambiente_consulta
+                    nsu_consulta = ultimo_nsu_local
+
+                    while True:
+                        xml_request = self._construir_xml_distribuicao(
+                            cnpj,
+                            empresa_uf,
+                            nsu_consulta,
+                            ambiente=ambiente_consulta,
+                        )
+                        xml_response = self._enviar_distribuicao_dfe(
+                            self._obter_url_distribuicao(ambiente_consulta),
+                            xml_request,
+                            cert_bytes,
+                            senha_cert,
+                        )
+                        distribuicao = self._parsear_resposta_distribuicao(xml_response)
+
+                        if distribuicao.status_codigo == "589" and nsu_consulta > 0:
+                            logger.warning(
+                                "SEFAZ retornou cStat 589 para empresa %s no ambiente %s. "
+                                "Reiniciando distribuicao a partir do NSU zero.",
+                                empresa_id,
+                                ambiente_consulta,
+                            )
+                            nsu_consulta = 0
+                            continue
+
+                        break
+
+                    if distribuicao.status_codigo != "137":
+                        break
+
+                if distribuicao is None or xml_response is None:
+                    raise SefazException(
+                        "999",
+                        "Nao foi possivel obter resposta da distribuicao DF-e",
+                    )
+
+            sincronizacao_ok = distribuicao.status_codigo in {"137", "138"}
+            novas_notas = 0
+
+            if sincronizacao_ok and distribuicao.notas_encontradas:
+                novas_notas = self._persistir_notas_distribuicao(
+                    empresa_id,
+                    distribuicao.notas_encontradas,
+                )
+
+            tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
+            self._registrar_log_distribuicao(
+                empresa_id=empresa_id,
+                uf=empresa_uf,
+                request_xml=xml_request,
+                response_xml=xml_response,
+                status_codigo=distribuicao.status_codigo,
+                status_descricao=distribuicao.motivo,
+                sucesso=sincronizacao_ok,
+                tempo_resposta_ms=tempo_ms,
+                mensagem_erro=None if sincronizacao_ok else distribuicao.motivo,
+                ambiente_consulta=ambiente_utilizado,
+            )
+
+            return {
+                "fonte": "sefaz" if sincronizacao_ok else "banco_local",
+                "sincronizacao_realizada": sincronizacao_ok,
+                "certificado_usado": certificado_usado,
+                "novas_notas_sincronizadas": novas_notas,
+                "mensagem_sincronizacao": distribuicao.motivo,
+                "status_codigo_sincronizacao": distribuicao.status_codigo,
+                "ultimo_nsu_sincronizacao": distribuicao.ultimo_nsu,
+                "max_nsu_sincronizacao": distribuicao.max_nsu,
+                "ambiente_consulta": ambiente_utilizado,
+            }
+
+        except (CertificadoAusenteError, CertificadoExpiradoError, CertificadoError) as exc:
+            tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
+            self._registrar_log_distribuicao(
+                empresa_id=empresa_id,
+                uf=empresa_uf,
+                request_xml=xml_request,
+                response_xml=None,
+                status_codigo="0",
+                status_descricao="Certificado indisponivel para distribuicao",
+                sucesso=False,
+                tempo_resposta_ms=tempo_ms,
+                mensagem_erro=str(exc),
+                ambiente_consulta=ambiente_utilizado,
+            )
+            return {
+                "fonte": "banco_local",
+                "sincronizacao_realizada": False,
+                "certificado_usado": "indisponivel",
+                "novas_notas_sincronizadas": 0,
+                "mensagem_sincronizacao": str(exc),
+                "status_codigo_sincronizacao": "0",
+                "ultimo_nsu_sincronizacao": ultimo_nsu_local,
+                "max_nsu_sincronizacao": ultimo_nsu_local,
+                "ambiente_consulta": ambiente_utilizado,
+            }
+        except Exception as exc:
+            tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
+            self._registrar_log_distribuicao(
+                empresa_id=empresa_id,
+                uf=empresa_uf,
+                request_xml=xml_request,
+                response_xml=None,
+                status_codigo="999",
+                status_descricao="Falha tecnica na distribuicao",
+                sucesso=False,
+                tempo_resposta_ms=tempo_ms,
+                mensagem_erro=str(exc),
+                ambiente_consulta=ambiente_utilizado,
+            )
+            logger.warning(
+                "Falha na sincronizacao automatica SEFAZ da empresa %s: %s",
+                empresa_id,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "fonte": "banco_local",
+                "sincronizacao_realizada": False,
+                "certificado_usado": certificado_usado,
+                "novas_notas_sincronizadas": 0,
+                "mensagem_sincronizacao": f"Falha tecnica ao consultar SEFAZ: {exc}",
+                "status_codigo_sincronizacao": "999",
+                "ultimo_nsu_sincronizacao": ultimo_nsu_local,
+                "max_nsu_sincronizacao": ultimo_nsu_local,
+                "ambiente_consulta": ambiente_utilizado,
+            }
+
+    async def sincronizar_e_buscar_notas_por_cnpj(
+        self,
+        cnpj: str,
+        empresa_id: str,
+        contador_id: str,
+        nsu_inicial: Optional[int] = None,
+        max_notas: int = 50,
+    ) -> Dict[str, Any]:
+        """
+        Fluxo principal: sincroniza notas novas na SEFAZ e depois consulta o banco.
+
+        A sincronizacao automatica so roda na primeira pagina para manter a
+        paginacao estavel durante o carregamento de resultados adicionais.
+        """
+        metadata = {
+            "fonte": "banco_local",
+            "sincronizacao_realizada": False,
+            "certificado_usado": "nao_aplicado",
+            "novas_notas_sincronizadas": 0,
+            "mensagem_sincronizacao": None,
+            "status_codigo_sincronizacao": None,
+            "ultimo_nsu_sincronizacao": None,
+            "max_nsu_sincronizacao": None,
+            "ambiente_consulta": None,
+        }
+
+        consulta_inicial = nsu_inicial in (None, 0)
+        cnpj_normalizado = self._normalizar_cnpj(cnpj)
+
+        if consulta_inicial:
+            metadata.update(
+                await self._sincronizar_notas_novas(
+                    cnpj=cnpj_normalizado,
+                    empresa_id=empresa_id,
+                    contador_id=contador_id,
+                )
+            )
+
+        response = self.buscar_notas_por_cnpj(
+            cnpj=cnpj_normalizado,
+            empresa_id=empresa_id,
+            nsu_inicial=nsu_inicial,
+            max_notas=max_notas,
+        )
+
+        return {
+            "response": response,
+            **metadata,
+        }
+
     # ============================================
     # BUSCA DE NOTAS (BANCO DE DADOS LOCAL)
     # ============================================
@@ -1034,6 +1806,7 @@ class SefazService:
         cnpj: str,
         empresa_id: str,
         nsu_inicial: Optional[int] = None,
+        max_notas: int = 50,
     ):
         """
         Busca notas fiscais cadastradas no BANCO DE DADOS LOCAL para um CNPJ/Empresa.
@@ -1073,11 +1846,13 @@ class SefazService:
             # 1. Consultar banco de dados (APENAS banco local, sem SEFAZ)
             offset = nsu_inicial if nsu_inicial else 0
 
+            limite = max(1, min(max_notas, 500))  # Entre 1 e 500
             resultado = supabase_admin.table("notas_fiscais")\
                 .select("*")\
                 .eq("empresa_id", empresa_id)\
+                .in_("tipo_nf", ["NFe", "NFCe"])\
                 .order("data_emissao", desc=True)\
-                .range(offset, offset + 49)\
+                .range(offset, offset + limite - 1)\
                 .execute()
 
             # 2. Contar total de notas
@@ -1086,6 +1861,7 @@ class SefazService:
                 count_result = supabase_admin.table("notas_fiscais")\
                     .select("id", count="exact")\
                     .eq("empresa_id", empresa_id)\
+                    .in_("tipo_nf", ["NFe", "NFCe"])\
                     .execute()
                 total_notas = count_result.count if hasattr(count_result, 'count') and count_result.count is not None else len(resultado.data or [])
             except Exception:
@@ -1122,6 +1898,9 @@ class SefazService:
                         if len(cnpj_emit) != 14:
                             cnpj_emit = cnpj_emit.ljust(14, "0")
 
+                        cnpj_dest = self._normalizar_cnpj(row.get("cnpj_destinatario"))
+                        cpf_dest = self._normalizar_cnpj(row.get("cpf_destinatario"))
+
                         nfe_metadata = NFeBuscadaMetadata(
                             chave_acesso=chave_acesso,
                             nsu=row.get("nsu", 0) or 0,
@@ -1130,8 +1909,8 @@ class SefazService:
                             valor_total=Decimal(str(row.get("valor_total", 0))),
                             cnpj_emitente=cnpj_emit,
                             nome_emitente=row.get("nome_emitente", ""),
-                            cnpj_destinatario=row.get("cnpj_destinatario"),
-                            cpf_destinatario=row.get("cpf_destinatario"),
+                            cnpj_destinatario=cnpj_dest if len(cnpj_dest) == 14 else None,
+                            cpf_destinatario=cpf_dest if len(cpf_dest) == 11 else None,
                             nome_destinatario=row.get("nome_destinatario"),
                             situacao=row.get("situacao", "autorizada"),
                             situacao_codigo="1" if row.get("situacao") == "autorizada" else "3",

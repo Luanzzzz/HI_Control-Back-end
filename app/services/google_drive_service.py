@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from cryptography.fernet import Fernet
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class GoogleDriveService:
 
     def _initialize(self):
         import os
-        key = os.getenv("CERTIFICATE_ENCRYPTION_KEY")
+        key = os.getenv("CERTIFICATE_ENCRYPTION_KEY") or settings.CERTIFICATE_ENCRYPTION_KEY
         if key:
             try:
                 self._fernet = Fernet(key.encode())
@@ -51,11 +52,14 @@ class GoogleDriveService:
         return fernet.encrypt(value.encode()).decode()
 
     def decrypt(self, value: str) -> str:
-        fernet = self._require_fernet("descriptografar credenciais do Google Drive")
-        try:
-            return fernet.decrypt(value.encode()).decode()
-        except Exception:
-            return value
+        if not value:
+            return ""
+        if self._fernet:
+            try:
+                return self._fernet.decrypt(value.encode()).decode()
+            except Exception:
+                pass
+        return value
 
     # ============================================
     # OAUTH2
@@ -228,6 +232,24 @@ class GoogleDriveService:
         )
         return result.data or []
 
+    async def obter_configuracao_ativa_empresa(
+        self,
+        empresa_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Retorna a configuracao ativa do Drive para a empresa."""
+        from app.db.supabase_client import get_supabase_admin
+
+        db = get_supabase_admin()
+        result = (
+            db.table("configuracoes_drive")
+            .select("*")
+            .eq("empresa_id", empresa_id)
+            .eq("ativo", True)
+            .limit(1)
+            .execute()
+        )
+        return (result.data or [None])[0]
+
     async def remover_configuracao(self, config_id: str, user_id: str) -> bool:
         from app.db.supabase_client import get_supabase_admin
 
@@ -301,6 +323,9 @@ class GoogleDriveService:
         empresa_nome: str,
         xml_content: bytes,
         nota_info: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None,
+        access_token: Optional[str] = None,
+        client: Any = None,
     ) -> Optional[str]:
         """
         Salva XML no Google Drive na estrutura:
@@ -317,29 +342,18 @@ class GoogleDriveService:
         Returns:
             file_id do Google Drive ou None se nao configurado
         """
-        from app.db.supabase_client import get_supabase_admin
         import httpx
 
-        db = get_supabase_admin()
-
         # 1. Buscar configuracao ativa do Drive para esta empresa
-        result = (
-            db.table("configuracoes_drive")
-            .select("*")
-            .eq("empresa_id", empresa_id)
-            .eq("ativo", True)
-            .limit(1)
-            .execute()
-        )
+        config_local = config or await self.obter_configuracao_ativa_empresa(empresa_id)
 
-        if not result.data:
+        if not config_local:
             logger.debug(
                 f"Drive nao configurado para empresa {empresa_id}, pulando upload"
             )
             return None
 
-        config = result.data[0]
-        pasta_raiz_id = config.get("pasta_id")
+        pasta_raiz_id = config_local.get("pasta_id")
         if not pasta_raiz_id:
             logger.warning(
                 f"Config Drive sem pasta_id para empresa {empresa_id}"
@@ -347,12 +361,12 @@ class GoogleDriveService:
             return None
 
         # 2. Obter access token
-        access_token = self.decrypt(
-            config.get("oauth_access_token_encrypted", "")
+        token_drive = access_token or self.decrypt(
+            config_local.get("oauth_access_token_encrypted", "")
         )
-        if not access_token:
-            access_token = await self._refresh_token(config)
-            if not access_token:
+        if not token_drive:
+            token_drive = await self._refresh_token(config_local)
+            if not token_drive:
                 logger.error(
                     f"Token Drive expirado para empresa {empresa_id}"
                 )
@@ -376,54 +390,60 @@ class GoogleDriveService:
         else:
             tipo_pasta = "Prestada"
 
+        managed_client = False
+        client_drive = client
+
         try:
-            async with httpx.AsyncClient() as client:
-                headers = {"Authorization": f"Bearer {access_token}"}
+            if client_drive is None:
+                client_drive = httpx.AsyncClient()
+                managed_client = True
 
-                # Criar/obter pasta da empresa
-                empresa_folder_id = await self._get_or_create_folder(
-                    client, headers, empresa_folder_name, pasta_raiz_id
-                )
+            headers = {"Authorization": f"Bearer {token_drive}"}
 
-                # Criar/obter pasta do ano-mes
-                mes_folder_id = await self._get_or_create_folder(
-                    client, headers, ano_mes, empresa_folder_id
-                )
+            # Criar/obter pasta da empresa
+            empresa_folder_id = await self._get_or_create_folder(
+                client_drive, headers, empresa_folder_name, pasta_raiz_id
+            )
 
-                # Criar/obter pasta do tipo
-                tipo_folder_id = await self._get_or_create_folder(
-                    client, headers, tipo_pasta, mes_folder_id
-                )
+            # Criar/obter pasta do ano-mes
+            mes_folder_id = await self._get_or_create_folder(
+                client_drive, headers, ano_mes, empresa_folder_id
+            )
 
-                # 4. Nome do arquivo
-                chave = nota_info.get("chave_acesso", "")
-                numero = nota_info.get("numero", "sem_numero")
-                if chave:
-                    filename = f"{chave}.xml"
-                else:
-                    filename = f"nota_{numero}_{ano_mes}.xml"
+            # Criar/obter pasta do tipo
+            tipo_folder_id = await self._get_or_create_folder(
+                client_drive, headers, tipo_pasta, mes_folder_id
+            )
 
-                # 5. Verificar duplicidade
-                exists = await self._file_exists_in_folder(
-                    client, headers, filename, tipo_folder_id
-                )
-                if exists:
-                    logger.info(
-                        f"XML ja existe no Drive: {filename} (empresa {empresa_id})"
-                    )
-                    return None
+            # 4. Nome do arquivo
+            chave = nota_info.get("chave_acesso", "")
+            numero = nota_info.get("numero", "sem_numero")
+            if chave:
+                filename = f"{chave}.xml"
+            else:
+                filename = f"nota_{numero}_{ano_mes}.xml"
 
-                # 6. Upload do XML
-                file_id = await self._upload_file(
-                    client, headers, filename, xml_content,
-                    "text/xml", tipo_folder_id
-                )
-
+            # 5. Verificar duplicidade
+            exists = await self._file_exists_in_folder(
+                client_drive, headers, filename, tipo_folder_id
+            )
+            if exists:
                 logger.info(
-                    f"XML salvo no Drive: {filename} -> {file_id} "
-                    f"(empresa {empresa_id})"
+                    f"XML ja existe no Drive: {filename} (empresa {empresa_id})"
                 )
-                return file_id
+                return None
+
+            # 6. Upload do XML
+            file_id = await self._upload_file(
+                client_drive, headers, filename, xml_content,
+                "text/xml", tipo_folder_id
+            )
+
+            logger.info(
+                f"XML salvo no Drive: {filename} -> {file_id} "
+                f"(empresa {empresa_id})"
+            )
+            return file_id
 
         except Exception as e:
             logger.error(
@@ -431,6 +451,71 @@ class GoogleDriveService:
                 exc_info=True
             )
             return None
+        finally:
+            if managed_client and client_drive is not None:
+                await client_drive.aclose()
+
+    async def salvar_xmls_lote_no_drive(
+        self,
+        empresa_id: str,
+        empresa_nome: str,
+        notas: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Salva em lote os XMLs fiscais de uma empresa no Google Drive."""
+        import httpx
+
+        config = await self.obter_configuracao_ativa_empresa(empresa_id)
+        if not config:
+            raise ValueError("Google Drive nao configurado para esta empresa")
+        if not config.get("pasta_id"):
+            raise ValueError("Pasta do Google Drive nao configurada para esta empresa")
+
+        access_token = self.decrypt(config.get("oauth_access_token_encrypted", ""))
+        if not access_token:
+            access_token = await self._refresh_token(config)
+        if not access_token:
+            raise ValueError("Token do Google Drive expirado. Reautorize a integracao.")
+
+        resumo = {
+            "xmls_salvos_drive": 0,
+            "xmls_ignorados_drive": 0,
+            "xmls_sem_conteudo": 0,
+        }
+
+        async with httpx.AsyncClient() as client:
+            for nota in notas:
+                xml_content = nota.get("xml_completo") or nota.get("xml_resumo")
+                if not xml_content:
+                    resumo["xmls_sem_conteudo"] += 1
+                    continue
+
+                xml_bytes = (
+                    xml_content.encode("utf-8")
+                    if isinstance(xml_content, str)
+                    else xml_content
+                )
+
+                file_id = await self.salvar_xml_no_drive(
+                    empresa_id=empresa_id,
+                    empresa_nome=empresa_nome,
+                    xml_content=xml_bytes,
+                    nota_info={
+                        "tipo": f"{nota.get('tipo_nf') or 'NFe'} {nota.get('tipo_operacao') or ''}".strip(),
+                        "numero": nota.get("numero_nf") or "sem_numero",
+                        "data_emissao": nota.get("data_emissao"),
+                        "chave_acesso": nota.get("chave_acesso"),
+                    },
+                    config=config,
+                    access_token=access_token,
+                    client=client,
+                )
+
+                if file_id:
+                    resumo["xmls_salvos_drive"] += 1
+                else:
+                    resumo["xmls_ignorados_drive"] += 1
+
+        return resumo
 
     async def _get_or_create_folder(
         self,

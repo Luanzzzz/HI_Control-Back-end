@@ -1,16 +1,24 @@
 """
 Endpoints REST para busca e importacao de notas fiscais.
 
-A busca principal consulta o banco de dados local (Supabase).
-Para popular o banco, use os endpoints de importacao de XML.
+A busca principal sincroniza notas novas na SEFAZ e consolida o resultado
+no banco local da empresa antes de responder.
 
-Fase 2 (futuro): DistribuicaoDFe para busca automatica no SEFAZ
-(REQUER certificado digital A1).
+Os endpoints de importacao de XML continuam disponiveis como fallback manual
+e para cargas historicas.
 """
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
-from supabase import Client
-from typing import Optional, Dict
+import json
 import logging
+import re
+import zipfile
+from datetime import datetime
+from io import BytesIO
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
+from supabase import Client
 
 from app.models.nfe_busca import (
     ConsultaDistribuicaoRequest,
@@ -32,6 +40,7 @@ from app.services.plan_validation import (
     validar_limite_consultas_dia,
     obter_resumo_plano
 )
+from app.services.google_drive_service import google_drive_service
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +94,213 @@ def _enriquecer_nota(nota: NFeBuscadaMetadata) -> dict:
     }
 
 
+async def _obter_ultima_sincronizacao_empresa(
+    db: Client,
+    empresa_id: str,
+) -> Optional[str]:
+    """Obtém a data da última nota importada para a empresa."""
+    try:
+        response = db.table("notas_fiscais")\
+            .select("created_at")\
+            .eq("empresa_id", empresa_id)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+
+        if response.data:
+            return response.data[0].get("created_at")
+    except Exception as exc:
+        logger.warning(
+            "Não foi possível obter última sincronização da empresa %s: %s",
+            empresa_id,
+            exc,
+        )
+
+    return None
+
+
+async def _montar_contexto_busca_hibrida(
+    db: Client,
+    empresa_id: str,
+    possui_notas_locais: bool,
+    sincronizacao_disponivel: bool = False,
+    acao_sugerida: Optional[str] = None,
+    sincronizacao_pendente: Optional[bool] = None,
+) -> Dict[str, object]:
+    """Monta metadados estáveis para o front do fluxo híbrido."""
+    return {
+        "modo_busca": "hibrido",
+        "tem_dados_locais": possui_notas_locais,
+        "sincronizacao_disponivel": sincronizacao_disponivel,
+        "sincronizacao_pendente": (
+            sincronizacao_pendente
+            if sincronizacao_pendente is not None
+            else (sincronizacao_disponivel and not possui_notas_locais)
+        ),
+        "acao_sugerida": acao_sugerida,
+        "ultima_sincronizacao": await _obter_ultima_sincronizacao_empresa(db, empresa_id),
+    }
+
+
+class ExportacaoXmlLoteRequest(BaseModel):
+    """Payload para exportacao em lote dos XMLs do buscador."""
+
+    cnpj: str = Field(..., min_length=14, max_length=18)
+    sincronizar_antes: bool = True
+
+
+def _normalizar_cnpj_busca(cnpj: str) -> str:
+    """Remove formatacao do CNPJ recebido nas rotas do buscador."""
+    return re.sub(r"\D", "", cnpj or "")
+
+
+def _sanitizar_nome_arquivo(valor: Optional[str], fallback: str) -> str:
+    """Produz nome de arquivo seguro para ZIP e downloads."""
+    valor_limpo = re.sub(r"[^\w\-]+", "_", (valor or "").strip(), flags=re.UNICODE)
+    valor_limpo = valor_limpo.strip("_")
+    return (valor_limpo or fallback)[:80]
+
+
+def _montar_nome_xml_lote(nota: Dict[str, Any]) -> str:
+    """Gera nome consistente para o XML exportado em lote."""
+    tipo_nf = _sanitizar_nome_arquivo(str(nota.get("tipo_nf") or "NFe"), "NFe")
+    numero = _sanitizar_nome_arquivo(str(nota.get("numero_nf") or "sem_numero"), "sem_numero")
+    serie = _sanitizar_nome_arquivo(str(nota.get("serie") or "1"), "1")
+    emitente = _sanitizar_nome_arquivo(str(nota.get("nome_emitente") or "emitente"), "emitente")
+    chave = _sanitizar_nome_arquivo(str(nota.get("chave_acesso") or nota.get("id") or "sem_chave"), "sem_chave")
+    return f"{tipo_nf}_{numero}_Serie{serie}_{emitente}_{chave}.xml"
+
+
+async def _sincronizar_busca_empresa_para_lote(
+    empresa_id: str,
+    cnpj: str,
+    current_user: dict,
+) -> Dict[str, Any]:
+    """Sincroniza a empresa antes da exportacao, quando solicitado."""
+    cnpj_normalizado = _normalizar_cnpj_busca(cnpj)
+    if len(cnpj_normalizado) != 14:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="CNPJ invalido. Deve conter 14 digitos numericos.",
+        )
+
+    return await sefaz_service.sincronizar_e_buscar_notas_por_cnpj(
+        cnpj=cnpj_normalizado,
+        empresa_id=empresa_id,
+        contador_id=current_user["id"],
+        nsu_inicial=0,
+        max_notas=200,
+    )
+
+
+async def _listar_notas_empresa_para_exportacao(
+    db: Client,
+    empresa_id: str,
+    page_size: int = 500,
+) -> List[Dict[str, Any]]:
+    """
+    Lista todas as NF-es/NFC-es da empresa, paginando o banco local.
+
+    O objetivo aqui e garantir cobertura do historico inteiro ja persistido,
+    nao apenas da pagina atualmente exibida no front.
+    """
+    notas: List[Dict[str, Any]] = []
+    offset = 0
+
+    while True:
+        resultado = (
+            db.table("notas_fiscais")
+            .select(
+                "id, chave_acesso, numero_nf, serie, tipo_nf, tipo_operacao, "
+                "data_emissao, nome_emitente, valor_total, xml_completo, xml_resumo"
+            )
+            .eq("empresa_id", empresa_id)
+            .in_("tipo_nf", ["NFe", "NFCe"])
+            .order("data_emissao", desc=True)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+
+        lote = resultado.data or []
+        if not lote:
+            break
+
+        notas.extend(lote)
+        if len(lote) < page_size:
+            break
+
+        offset += page_size
+
+    return notas
+
+
+def _filtrar_notas_com_xml(notas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Mantem apenas notas com chave fiscal valida e XML disponivel."""
+    filtradas: List[Dict[str, Any]] = []
+
+    for nota in notas:
+        chave_acesso = str(nota.get("chave_acesso") or "").strip()
+        xml_content = nota.get("xml_completo") or nota.get("xml_resumo")
+
+        if not chave_acesso.isdigit() or len(chave_acesso) != 44:
+            continue
+        if not xml_content:
+            continue
+
+        filtradas.append(nota)
+
+    return filtradas
+
+
+def _gerar_zip_xmls(notas: List[Dict[str, Any]], empresa_id: str) -> bytes:
+    """Gera ZIP com todos os XMLs exportaveis da empresa."""
+    buffer = BytesIO()
+    nomes_utilizados: Dict[str, int] = {}
+
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        resumo = {
+            "empresa_id": empresa_id,
+            "gerado_em": datetime.now().isoformat(),
+            "total_xmls": len(notas),
+            "arquivos": [],
+        }
+
+        for nota in notas:
+            nome_base = _montar_nome_xml_lote(nota)
+            contador = nomes_utilizados.get(nome_base, 0)
+            nomes_utilizados[nome_base] = contador + 1
+            nome_arquivo = (
+                nome_base
+                if contador == 0
+                else nome_base.replace(".xml", f"_{contador + 1}.xml")
+            )
+
+            xml_content = nota.get("xml_completo") or nota.get("xml_resumo") or ""
+            xml_bytes = (
+                xml_content.encode("utf-8")
+                if isinstance(xml_content, str)
+                else xml_content
+            )
+
+            zip_file.writestr(nome_arquivo, xml_bytes)
+            resumo["arquivos"].append(
+                {
+                    "arquivo": nome_arquivo,
+                    "chave_acesso": nota.get("chave_acesso"),
+                    "numero_nf": nota.get("numero_nf"),
+                    "serie": nota.get("serie"),
+                }
+            )
+
+        zip_file.writestr(
+            "resumo_exportacao.json",
+            json.dumps(resumo, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # ============================================
 # ENDPOINT PRINCIPAL
 # ============================================
@@ -94,10 +310,10 @@ def _enriquecer_nota(nota: NFeBuscadaMetadata) -> dict:
     response_model=dict,
     summary="Buscar notas fiscais no banco de dados",
     description="""
-    Busca notas fiscais cadastradas no banco de dados local.
+    Sincroniza notas novas na SEFAZ e retorna o consolidado da empresa.
     
-    **Fonte de dados:** Banco de dados local (notas importadas via XML).
-    Para popular o banco, use POST /importar-xml ou POST /importar-lote.
+    **Fonte de dados:** Consulta automatica SEFAZ + historico local.
+    Para cargas manuais, use POST /importar-xml ou POST /importar-lote.
     
     **Limites por plano:**
     - Basico: Ultimos 30 dias, max 3 empresas
@@ -116,10 +332,7 @@ async def buscar_notas_fiscais(
     db: Client = Depends(get_admin_db)
 ):
     """
-    Busca notas fiscais no banco de dados local.
-
-    Este endpoint consulta APENAS o banco de dados local (Supabase).
-    Para popular o banco com notas reais, use /importar-xml ou /importar-lote.
+    Busca notas fiscais da empresa com sincronizacao automatica na SEFAZ.
 
     Args:
         request: Dados da consulta (CNPJ, NSU/offset inicial, etc)
@@ -186,12 +399,17 @@ async def buscar_notas_fiscais(
 
         logger.info(f"[EMPRESA] {empresa.get('razao_social')} | ID: {empresa_id}")
 
-        # 5. Executar busca no BANCO DE DADOS LOCAL (nao SEFAZ)
-        response = sefaz_service.buscar_notas_por_cnpj(
+        # 5. Fluxo principal: sincronizar notas novas na SEFAZ e depois
+        # montar a resposta com historico + notas recem-importadas.
+        busca_resultado = await sefaz_service.sincronizar_e_buscar_notas_por_cnpj(
             cnpj=cnpj_normalizado,
             empresa_id=empresa_id,
+            contador_id=current_user["id"],
             nsu_inicial=request.nsu_inicial,
+            max_notas=request.max_notas,
         )
+        response = busca_resultado["response"]
+        consulta_inicial = request.nsu_inicial in (None, 0)
 
         # 6. Aplicar limite de quantidade solicitado
         notas_limitadas = response.notas_encontradas[:request.max_notas]
@@ -204,12 +422,19 @@ async def buscar_notas_fiscais(
 
         # 7. Formatar resposta
         resultado = {
-            "success": response.status_codigo == "138",
+            "success": (
+                bool(notas_limitadas)
+                or not consulta_inicial
+                or bool(busca_resultado["sincronizacao_realizada"])
+            ),
             "status_codigo": response.status_codigo,
             "motivo": response.motivo,
-            "fonte": "banco_local",
+            "fonte": busca_resultado["fonte"],
             "plano": plano_info["nome"],
             "plano_limites": obter_resumo_plano(plano_info),
+            "certificado_usado": busca_resultado["certificado_usado"],
+            "sincronizacao_automatica": busca_resultado["sincronizacao_realizada"],
+            "novas_notas_sincronizadas": busca_resultado["novas_notas_sincronizadas"],
             "notas": [_enriquecer_nota(nota) for nota in notas_limitadas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
@@ -218,26 +443,58 @@ async def buscar_notas_fiscais(
             "tem_mais_notas": response.tem_mais_notas,
         }
 
-        # 8. Quando banco vazio, adicionar orientacao de importacao
-        if not notas_limitadas:
-            resultado["mensagem"] = (
-                "Nenhuma nota fiscal encontrada no periodo. "
-                "Importe XMLs de notas fiscais usando o botao 'Importar XML' "
-                "ou faca upload em lote atraves de 'Importar Lote (ZIP)'."
+        resultado.update(
+            await _montar_contexto_busca_hibrida(
+                db,
+                empresa_id,
+                bool(notas_limitadas),
+                sincronizacao_disponivel=(
+                    not busca_resultado["sincronizacao_realizada"]
+                    and not notas_limitadas
+                ),
+                acao_sugerida=(
+                    "solicitar_sincronizacao_bot"
+                    if not busca_resultado["sincronizacao_realizada"] and not notas_limitadas
+                    else None
+                ),
             )
+        )
+
+        # 8. Quando nao houver notas, explicar o que ocorreu no fluxo automatico
+        if not notas_limitadas:
+            if busca_resultado["sincronizacao_realizada"]:
+                resultado["mensagem"] = (
+                    "Nenhuma nota foi encontrada apos a consulta automatica na SEFAZ "
+                    "e a verificacao do historico local."
+                )
+            else:
+                resultado["mensagem"] = (
+                    busca_resultado["mensagem_sincronizacao"]
+                    or "Nao foi possivel sincronizar novas notas na SEFAZ. "
+                    "O resultado abaixo reflete apenas o banco local."
+                )
+
             resultado["orientacao"] = {
-                "titulo": "Como obter notas fiscais?",
+                "titulo": "Como recuperar notas nesta busca?",
                 "passos": [
-                    "1. Acesse o Portal da NF-e (www.nfe.fazenda.gov.br)",
-                    "2. Baixe os XMLs das notas emitidas",
-                    "3. Volte ao Hi-Control e importe os XMLs",
-                    "4. As notas aparecerao automaticamente neste buscador"
+                    "1. Verifique se a empresa possui certificado digital valido para consulta automatica",
+                    "2. Se o certificado estiver indisponivel, solicite uma sincronizacao assistida ou importe XMLs manualmente",
+                    "3. Aguarde o processamento da sincronizacao",
+                    "4. Execute a busca novamente neste modulo"
+                ],
+                "acoes_sugeridas": [
+                    "solicitar_sincronizacao_bot",
+                    "importar_xml_manual"
                 ],
                 "endpoints_disponiveis": {
+                    "sincronizar_bot": "/api/v1/bot/sincronizar-agora",
                     "importar_xml": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-xml",
                     "importar_lote": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-lote"
                 }
             }
+
+        if busca_resultado["mensagem_sincronizacao"] and notas_limitadas:
+            resultado["mensagem"] = busca_resultado["mensagem_sincronizacao"]
 
         return resultado
 
@@ -624,11 +881,7 @@ async def buscar_notas_empresa(
     db: Client = Depends(get_admin_db)
 ):
     """
-    Busca notas no banco de dados local para uma empresa.
-
-    IMPORTANTE: Este endpoint consulta APENAS o banco local.
-    Ele NAO chama o SEFAZ diretamente. Para popular o banco,
-    o usuario deve importar XMLs via /importar-xml ou /importar-lote.
+    Busca notas da empresa sincronizando primeiro com a SEFAZ quando aplicavel.
     """
     inicio = datetime.now()
     filtros = request.model_dump() if hasattr(request, 'model_dump') else request.dict()
@@ -655,45 +908,25 @@ async def buscar_notas_empresa(
                 "mensagem": f"Nao foi possivel verificar certificado: {str(cert_err)}"
             }
 
-        # NOTA: Para busca no banco local, certificado NAO e obrigatorio.
-        # O certificado sera necessario na Fase 2 (DistribuicaoDFe).
-        # Por isso, nao bloqueamos a busca se certificado estiver ausente/vencido.
-
-        # 4. Verificar cache
-        chave_cache = cache_service.gerar_chave_cache(empresa_id, filtros)
-        cache_hit = await cache_service.buscar(chave_cache)
-
-        if cache_hit:
-            # Registrar no historico (source: cache)
-            tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
-            await _registrar_historico(
-                db, empresa_id, current_user["id"], filtros,
-                cache_hit.get("quantidade", 0), "cache", tempo_ms, True, None,
-                "banco_local"
-            )
-
-            return {
-                "success": True,
-                "fonte": "cache",
-                "cached_at": cache_hit["cached_at"],
-                "empresa_id": empresa_id,
-                "certificado_status": status_cert.get("status", "nao_verificado"),
-                **cache_hit["dados"]
-            }
-
-        # 5. Buscar no BANCO DE DADOS LOCAL (nao SEFAZ)
-        # NOTA: DistribuicaoDFe REQUER certificado digital A1.
-        # (Contrario ao que se pensava anteriormente.)
-        # Fase 2 implementara chamada real ao SEFAZ.
+        # 4. Fluxo oficial: sincronizar primeiro com a SEFAZ e depois
+        # consultar o banco local consolidado. Nao usamos cache de leitura
+        # aqui para nao esconder notas novas recem-disponibilizadas.
         cnpj = request.cnpj.replace(".", "").replace("/", "").replace("-", "")
 
-        response = sefaz_service.buscar_notas_por_cnpj(
+        busca_resultado = await sefaz_service.sincronizar_e_buscar_notas_por_cnpj(
             cnpj=cnpj,
             empresa_id=empresa_id,
-            nsu_inicial=request.nsu_inicial
+            contador_id=current_user["id"],
+            nsu_inicial=request.nsu_inicial,
+            max_notas=request.max_notas,
         )
+        response = busca_resultado["response"]
+        consulta_inicial = request.nsu_inicial in (None, 0)
 
-        # 6. Aplicar limite de quantidade solicitado
+        if consulta_inicial:
+            await cache_service.invalidar(empresa_id=empresa_id)
+
+        # 5. Aplicar limite de quantidade solicitado
         notas_limitadas = response.notas_encontradas[:request.max_notas]
 
         logger.info(
@@ -701,8 +934,17 @@ async def buscar_notas_empresa(
             f"Limite: {request.max_notas} | Retornando: {len(notas_limitadas)}"
         )
 
-        # 7. Formatar resultado
+        # 6. Formatar resultado
         resultado = {
+            "success": (
+                bool(notas_limitadas)
+                or not consulta_inicial
+                or bool(busca_resultado["sincronizacao_realizada"])
+            ),
+            "fonte": busca_resultado["fonte"],
+            "certificado_usado": busca_resultado["certificado_usado"],
+            "sincronizacao_automatica": busca_resultado["sincronizacao_realizada"],
+            "novas_notas_sincronizadas": busca_resultado["novas_notas_sincronizadas"],
             "notas": [_enriquecer_nota(nota) for nota in notas_limitadas],
             "ultimo_nsu": response.ultimo_nsu,
             "max_nsu": response.max_nsu,
@@ -711,40 +953,71 @@ async def buscar_notas_empresa(
             "tem_mais_notas": response.tem_mais_notas,
         }
 
-        # 8. Quando banco vazio, adicionar orientacao
+        contexto_hibrido = await _montar_contexto_busca_hibrida(
+            db,
+            empresa_id,
+            bool(notas_limitadas),
+            sincronizacao_disponivel=(
+                not busca_resultado["sincronizacao_realizada"]
+                and not notas_limitadas
+            ),
+            acao_sugerida=(
+                "solicitar_sincronizacao_bot"
+                if not busca_resultado["sincronizacao_realizada"] and not notas_limitadas
+                else None
+            ),
+        )
+        resultado.update(contexto_hibrido)
+
+        # 7. Quando nao houver notas, explicar o resultado da busca automatica
         if not notas_limitadas:
-            resultado["mensagem"] = (
-                "Nenhuma nota fiscal encontrada no periodo. "
-                "Importe XMLs de notas fiscais usando o botao 'Importar XML' "
-                "ou faca upload em lote atraves de 'Importar Lote (ZIP)'."
-            )
+            if busca_resultado["sincronizacao_realizada"]:
+                resultado["mensagem"] = (
+                    "Nenhuma nota foi encontrada apos a consulta automatica na SEFAZ "
+                    "e a verificacao do historico local desta empresa."
+                )
+            else:
+                resultado["mensagem"] = (
+                    busca_resultado["mensagem_sincronizacao"]
+                    or "Nao foi possivel consultar novas notas na SEFAZ. "
+                    "O retorno abaixo reflete apenas o banco local."
+                )
+
             resultado["orientacao"] = {
-                "titulo": "Como obter notas fiscais?",
+                "titulo": "Como recuperar notas nesta busca?",
                 "passos": [
-                    "1. Acesse o Portal da NF-e (www.nfe.fazenda.gov.br)",
-                    "2. Baixe os XMLs das notas emitidas",
-                    "3. Volte ao Hi-Control e importe os XMLs",
-                    "4. As notas aparecerao automaticamente neste buscador"
+                    "1. Verifique se o certificado digital da empresa esta valido",
+                    "2. Se a consulta automatica estiver indisponivel, solicite sincronizacao assistida ou importe XMLs",
+                    "3. Aguarde a sincronizacao/processamento",
+                    "4. Execute a busca novamente neste modulo"
+                ],
+                "acoes_sugeridas": [
+                    "solicitar_sincronizacao_bot",
+                    "importar_xml_manual"
                 ],
                 "endpoints_disponiveis": {
+                    "sincronizar_bot": "/api/v1/bot/sincronizar-agora",
                     "importar_xml": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-xml",
                     "importar_lote": f"/api/v1/nfe/empresas/{empresa_id}/notas/importar-lote"
                 }
             }
 
-        # 9. Salvar no cache (mesmo vazio, para evitar reprocessar)
-        await cache_service.salvar(empresa_id, chave_cache, resultado)
+        if busca_resultado["mensagem_sincronizacao"] and notas_limitadas:
+            resultado["mensagem"] = busca_resultado["mensagem_sincronizacao"]
 
-        # 10. Registrar no historico
+        # 8. Registrar no historico
         tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
         await _registrar_historico(
             db, empresa_id, current_user["id"], filtros,
-            response.total_notas, "banco_local", tempo_ms, True, None, "banco_local"
+            response.total_notas,
+            busca_resultado["fonte"],
+            tempo_ms,
+            bool(resultado["success"]),
+            None if resultado["success"] else busca_resultado["mensagem_sincronizacao"],
+            busca_resultado["certificado_usado"],
         )
 
         return {
-            "success": True,
-            "fonte": "banco_local",
             "empresa_id": empresa_id,
             "certificado_status": status_cert.get("status", "nao_verificado"),
             **resultado
@@ -767,6 +1040,9 @@ async def buscar_notas_empresa(
             "success": False,
             "fonte": "banco_local",
             "empresa_id": empresa_id,
+            "certificado_status": "indisponivel",
+            "certificado_usado": "indisponivel",
+            **(await _montar_contexto_busca_hibrida(db, empresa_id, False)),
             "notas": [],
             "total_notas": 0,
             "total_encontradas": 0,
@@ -864,6 +1140,164 @@ async def _registrar_historico(
 
 
 # ============================================
+# ENDPOINTS: EXPORTACAO DE XMLS EM LOTE
+# ============================================
+
+@router.post(
+    "/empresas/{empresa_id}/notas/xmls/lote/baixar",
+    summary="Baixar XMLs em lote da empresa",
+    tags=["NFe - Exportacao"],
+)
+async def baixar_xmls_lote_empresa(
+    empresa_id: str,
+    request: ExportacaoXmlLoteRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db),
+):
+    """
+    Gera um ZIP com todos os XMLs fiscais (NFe/NFCe) ja persistidos para a empresa.
+
+    Antes da exportacao, opcionalmente sincroniza com a SEFAZ para incluir notas novas.
+    """
+    try:
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Voce nao tem permissao para acessar esta empresa",
+            )
+
+        await verificar_acesso_modulo("buscador_notas", current_user, db)
+
+        sync_result: Optional[Dict[str, Any]] = None
+        if request.sincronizar_antes:
+            sync_result = await _sincronizar_busca_empresa_para_lote(
+                empresa_id=empresa_id,
+                cnpj=request.cnpj,
+                current_user=current_user,
+            )
+
+        notas = await _listar_notas_empresa_para_exportacao(db, empresa_id)
+        notas_com_xml = _filtrar_notas_com_xml(notas)
+
+        if not notas_com_xml:
+            mensagem_sync = sync_result["mensagem_sincronizacao"] if sync_result else None
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    mensagem_sync
+                    or "Nenhum XML fiscal disponivel para exportacao nesta empresa."
+                ),
+            )
+
+        zip_bytes = _gerar_zip_xmls(notas_com_xml, empresa_id)
+        filename = f"xmls_empresa_{empresa_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+
+        return StreamingResponse(
+            BytesIO(zip_bytes),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Total-XMLs": str(len(notas_com_xml)),
+                "X-Total-Notas": str(len(notas)),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Erro ao gerar lote de XMLs da empresa %s: %s", empresa_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao exportar XMLs em lote: {str(e)}",
+        )
+
+
+@router.post(
+    "/empresas/{empresa_id}/notas/xmls/lote/salvar-drive",
+    summary="Salvar XMLs em lote no Google Drive",
+    tags=["NFe - Exportacao"],
+)
+async def salvar_xmls_lote_drive(
+    empresa_id: str,
+    request: ExportacaoXmlLoteRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_admin_db),
+):
+    """
+    Salva todos os XMLs fiscais (NFe/NFCe) da empresa no Google Drive configurado.
+    """
+    try:
+        if not await verificar_acesso_empresa(current_user["id"], empresa_id, db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Voce nao tem permissao para acessar esta empresa",
+            )
+
+        await verificar_acesso_modulo("buscador_notas", current_user, db)
+
+        sync_result: Optional[Dict[str, Any]] = None
+        if request.sincronizar_antes:
+            sync_result = await _sincronizar_busca_empresa_para_lote(
+                empresa_id=empresa_id,
+                cnpj=request.cnpj,
+                current_user=current_user,
+            )
+
+        empresa_result = (
+            db.table("empresas")
+            .select("id, razao_social")
+            .eq("id", empresa_id)
+            .limit(1)
+            .execute()
+        )
+        empresa = (empresa_result.data or [{}])[0]
+        empresa_nome = empresa.get("razao_social") or f"empresa_{empresa_id}"
+
+        notas = await _listar_notas_empresa_para_exportacao(db, empresa_id)
+        notas_com_xml = _filtrar_notas_com_xml(notas)
+
+        if not notas_com_xml:
+            mensagem_sync = sync_result["mensagem_sincronizacao"] if sync_result else None
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    mensagem_sync
+                    or "Nenhum XML fiscal disponivel para salvar no Drive."
+                ),
+            )
+
+        resultado_drive = await google_drive_service.salvar_xmls_lote_no_drive(
+            empresa_id=empresa_id,
+            empresa_nome=empresa_nome,
+            notas=notas_com_xml,
+        )
+
+        return {
+            "success": True,
+            "empresa_id": empresa_id,
+            "total_notas_consideradas": len(notas),
+            "total_xmls_processados": len(notas_com_xml),
+            "sincronizacao_automatica": bool(sync_result and sync_result.get("sincronizacao_realizada")),
+            "novas_notas_sincronizadas": int((sync_result or {}).get("novas_notas_sincronizadas") or 0),
+            **resultado_drive,
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.error("Erro ao salvar lote de XMLs no Drive da empresa %s: %s", empresa_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao salvar XMLs no Drive: {str(e)}",
+        )
+
+
+# ============================================
 # ENDPOINT: Download XML da Nota
 # ============================================
 
@@ -890,8 +1324,6 @@ async def baixar_xml_nota(
         404: XML não encontrado
         422: Chave de acesso inválida
     """
-    from fastapi.responses import Response
-
     try:
         logger.info(f"📥 Download XML solicitado - Chave: {chave_acesso}")
 
@@ -905,7 +1337,7 @@ async def baixar_xml_nota(
         # 2. Buscar nota no banco de dados
         try:
             resultado = db.table("notas_fiscais")\
-                .select("xml_resumo, numero_nf, serie, tipo_nf, nome_emitente")\
+                .select("xml_resumo, xml_completo, numero_nf, serie, tipo_nf, nome_emitente")\
                 .eq("chave_acesso", chave_acesso)\
                 .limit(1)\
                 .execute()
@@ -928,7 +1360,7 @@ async def baixar_xml_nota(
             )
 
         # 3. Validar se tem XML
-        xml_content = nota.get("xml_resumo")
+        xml_content = nota.get("xml_completo") or nota.get("xml_resumo")
         if not xml_content:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

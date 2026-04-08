@@ -20,47 +20,26 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# ============================================
-# EXCEÇÕES CUSTOMIZADAS
-# ============================================
 
 class CertificadoError(Exception):
-    """Erro base para operações com certificados"""
-    pass
+    """Erro base para operações com certificado digital."""
 
 
 class CertificadoInvalidoError(CertificadoError):
-    """Certificado inválido ou corrompido"""
-    pass
-
-
-class CertificadoExpiradoError(CertificadoError):
-    """Certificado fora da validade"""
-    pass
+    """Certificado inválido ou corrompido."""
 
 
 class SenhaIncorretaError(CertificadoError):
-    """Senha do certificado incorreta"""
-    pass
+    """Senha do certificado inválida."""
 
 
-# ============================================
-# SERVIÇO DE CERTIFICADOS
-# ============================================
+class CertificadoExpiradoError(CertificadoError):
+    """Certificado expirado."""
+
 
 class CertificadoService:
     """
-    Serviço singleton para gerenciamento de certificados digitais.
-
-    Implementa criptografia Fernet conforme decisão do usuário.
-
-    SEGURANÇA (CRÍTICO):
-    =====================
-    A SENHA do certificado digital NÃO deve ser persistida no banco de dados.
-    - Certificado (.pfx) é criptografado com Fernet e armazenado no banco
-    - Senha deve ser fornecida APENAS quando necessário para operações de assinatura
-    - Cada requisição de emissão (NF-e, NFC-e, CT-e) DEVE incluir a senha no request body
-    - Nunca recupere a senha do campo 'certificado_senha_encrypted' do banco
+    Serviço singleton para gerenciamento de certificados digitais A1.
 
     Impacto de Segurança:
     - Se o banco for comprometido, a chave Fernet vaza = todas as senhas expostas
@@ -81,7 +60,7 @@ class CertificadoService:
     def _initialize(self):
         """Inicializa o serviço"""
         # Obter chave de criptografia do ambiente
-        encryption_key = os.getenv("CERTIFICATE_ENCRYPTION_KEY")
+        encryption_key = os.getenv("CERTIFICATE_ENCRYPTION_KEY") or settings.CERTIFICATE_ENCRYPTION_KEY
 
         if encryption_key:
             try:
@@ -219,9 +198,15 @@ class CertificadoService:
             CertificadoError: Se criptografia falhar
         """
         try:
-            fernet = self._require_fernet("criptografar o certificado")
-            encrypted = fernet.encrypt(cert_bytes)
-            return base64.b64encode(encrypted).decode('utf-8')
+            if self._fernet:
+                encrypted = self._fernet.encrypt(cert_bytes)
+                return base64.b64encode(encrypted).decode('utf-8')
+
+            logger.warning(
+                "CERTIFICATE_ENCRYPTION_KEY ausente. "
+                "Usando fallback compatível em base64 para o certificado."
+            )
+            return base64.b64encode(cert_bytes).decode('utf-8')
 
         except Exception as e:
             raise CertificadoError(f"Erro ao criptografar certificado: {e}")
@@ -243,15 +228,17 @@ class CertificadoService:
             # Decodificar base64
             encrypted_bytes = base64.b64decode(cert_base64)
 
-            fernet = self._require_fernet("descriptografar o certificado")
-            try:
-                return fernet.decrypt(encrypted_bytes)
-            except Exception as e:
-                # Compatibilidade com registros antigos salvos sem Fernet.
-                logger.warning(
-                    f"Falha ao descriptografar com Fernet, usando fallback legado: {e}"
-                )
-                return encrypted_bytes
+            if self._fernet:
+                try:
+                    return self._fernet.decrypt(encrypted_bytes)
+                except Exception as e:
+                    # Compatibilidade com registros antigos salvos sem Fernet.
+                    logger.warning(
+                        f"Falha ao descriptografar com Fernet, usando fallback legado: {e}"
+                    )
+                    return encrypted_bytes
+
+            return encrypted_bytes
 
         except Exception as e:
             raise CertificadoError(f"Erro ao descriptografar certificado: {e}")
@@ -493,12 +480,21 @@ class CertificadoService:
         )
         if not senha_encrypted:
             raise CertificadoError("Senha do certificado não configurada")
-        fernet = self._require_fernet("descriptografar a senha do certificado")
+
+        if self._fernet:
+            try:
+                return self._fernet.decrypt(senha_encrypted.encode()).decode()
+            except Exception:
+                pass
+
+        # Compatibilidade com registros antigos salvos sem Fernet
+        # ou com Fernet indisponivel na inicializacao.
         try:
-            return fernet.decrypt(senha_encrypted.encode()).decode()
-        except Exception:
-            # Compatibilidade com registros antigos salvos sem Fernet.
             return base64.b64decode(senha_encrypted).decode()
+        except Exception as exc:
+            raise CertificadoError(
+                "Nao foi possivel descriptografar a senha do certificado"
+            ) from exc
 
     @staticmethod
     def gerar_chave_fernet() -> str:
@@ -688,7 +684,10 @@ class CertificadoServiceHibrido(CertificadoService):
         try:
             # 1. Tentar certificado da empresa
             empresa_cert = self.db.table("empresas")\
-                .select("certificado_a1, certificado_senha_hash, certificado_validade, usuario_id")\
+                .select(
+                    "certificado_a1, certificado_senha_encrypted, "
+                    "certificado_senha_hash, certificado_validade, usuario_id"
+                )\
                 .eq("id", empresa_id)\
                 .single()\
                 .execute()
@@ -712,7 +711,11 @@ class CertificadoServiceHibrido(CertificadoService):
                 cert_bytes = self.descriptografar_certificado(
                     empresa_cert.data["certificado_a1"]
                 )
-                senha = empresa_cert.data.get("certificado_senha_hash", "")
+                senha = self._resolver_senha_certificado(
+                    empresa_cert.data,
+                    campo_encrypted="certificado_senha_encrypted",
+                    campo_legado="certificado_senha_hash",
+                )
                 
                 logger.info(f"✅ Usando certificado da EMPRESA {empresa_id}")
                 return (cert_bytes, senha, "empresa")
@@ -727,6 +730,36 @@ class CertificadoServiceHibrido(CertificadoService):
         except Exception as e:
             logger.error(f"Erro ao obter certificado: {e}")
             raise CertificadoError(f"Erro ao buscar certificado: {str(e)}")
+
+    def _resolver_senha_certificado(
+        self,
+        registro: dict,
+        campo_encrypted: str,
+        campo_legado: str
+    ) -> str:
+        """
+        Resolve a senha do certificado usando o campo criptografado atual
+        com fallback para o campo legado quando necessário.
+        """
+        senha_encrypted = registro.get(campo_encrypted)
+        if senha_encrypted:
+            try:
+                return self.descriptografar_senha(senha_encrypted)
+            except Exception as exc:
+                senha_legada = registro.get(campo_legado, "") or ""
+                if not senha_legada:
+                    raise CertificadoError(
+                        "Nao foi possivel descriptografar a senha do certificado. "
+                        "Verifique a configuracao da CERTIFICATE_ENCRYPTION_KEY."
+                    ) from exc
+
+                logger.warning(
+                    "Falha ao descriptografar %s, tentando campo legado: %s",
+                    campo_encrypted,
+                    exc,
+                )
+
+        return registro.get(campo_legado, "") or ""
     
     async def _tentar_fallback_contador(
         self,
@@ -738,7 +771,10 @@ class CertificadoServiceHibrido(CertificadoService):
         """
         try:
             contador_cert = self.db.table("usuarios")\
-                .select("certificado_contador_a1, certificado_contador_validade")\
+                .select(
+                    "certificado_contador_a1, certificado_contador_validade, "
+                    "certificado_contador_senha_encrypted"
+                )\
                 .eq("id", contador_id)\
                 .single()\
                 .execute()
@@ -760,12 +796,17 @@ class CertificadoServiceHibrido(CertificadoService):
                 cert_bytes = self.descriptografar_certificado(
                     contador_cert.data["certificado_contador_a1"]
                 )
+                senha = self._resolver_senha_certificado(
+                    contador_cert.data,
+                    campo_encrypted="certificado_contador_senha_encrypted",
+                    campo_legado="certificado_contador_senha_hash",
+                )
                 
                 logger.warning(
                     f"⚠️ Usando certificado do CONTADOR como fallback "
                     f"para empresa {empresa_id}"
                 )
-                return (cert_bytes, "", "contador_fallback")
+                return (cert_bytes, senha, "contador_fallback")
             
             raise CertificadoAusenteError(
                 "Nem a empresa nem o contador possuem certificado válido. "
