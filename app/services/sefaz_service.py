@@ -1607,6 +1607,12 @@ class SefazService:
                     uf=empresa_uf,
                 )
                 distribuicao = self._parsear_resposta_distribuicao(xml_response)
+                novas_notas = 0
+                if distribuicao.notas_encontradas:
+                    novas_notas = self._persistir_notas_distribuicao(
+                        empresa_id,
+                        distribuicao.notas_encontradas,
+                    )
             else:
                 cert_bytes, senha_cert, certificado_usado = await certificado_service.obter_certificado_para_busca(
                     empresa_id=empresa_id,
@@ -1614,12 +1620,17 @@ class SefazService:
                 )
                 distribuicao = None
                 xml_response = None
+                novas_notas = 0
+                # Limite de segurança: evita loop infinito (200 páginas × ~50 notas = ~10k notas)
+                MAX_PAGINAS_SYNC = 200
 
                 for ambiente_consulta in self._ambientes_consulta_distribuicao():
                     ambiente_utilizado = ambiente_consulta
                     nsu_consulta = ultimo_nsu_local
+                    pagina = 0
 
-                    while True:
+                    while pagina < MAX_PAGINAS_SYNC:
+                        pagina += 1
                         xml_request = self._construir_xml_distribuicao(
                             cnpj,
                             empresa_uf,
@@ -1642,11 +1653,36 @@ class SefazService:
                                 ambiente_consulta,
                             )
                             nsu_consulta = 0
+                            pagina = 0
                             continue
 
-                        break
+                        # Persistir batch atual (deduplicação via upsert por chave_acesso)
+                        if distribuicao.notas_encontradas:
+                            batch = self._persistir_notas_distribuicao(
+                                empresa_id,
+                                distribuicao.notas_encontradas,
+                            )
+                            novas_notas += batch
+                            logger.info(
+                                "[SYNC SEFAZ] Página %d: %d notas salvas "
+                                "(NSU %d → %d / max %d, empresa %s)",
+                                pagina,
+                                batch,
+                                nsu_consulta,
+                                distribuicao.ultimo_nsu,
+                                distribuicao.max_nsu,
+                                empresa_id,
+                            )
 
-                    if distribuicao.status_codigo != "137":
+                        # Sem mais páginas — encerrar
+                        if distribuicao.status_codigo == "137" or not distribuicao.tem_mais_notas:
+                            break
+
+                        # Avançar para a próxima página
+                        nsu_consulta = distribuicao.ultimo_nsu
+
+                    # Se obtivemos uma resposta válida neste ambiente, não tentar outros
+                    if distribuicao is not None and distribuicao.status_codigo != "137":
                         break
 
                 if distribuicao is None or xml_response is None:
@@ -1656,13 +1692,6 @@ class SefazService:
                     )
 
             sincronizacao_ok = distribuicao.status_codigo in {"137", "138"}
-            novas_notas = 0
-
-            if sincronizacao_ok and distribuicao.notas_encontradas:
-                novas_notas = self._persistir_notas_distribuicao(
-                    empresa_id,
-                    distribuicao.notas_encontradas,
-                )
 
             tempo_ms = int((datetime.now() - inicio).total_seconds() * 1000)
             self._registrar_log_distribuicao(
