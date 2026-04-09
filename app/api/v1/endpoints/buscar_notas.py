@@ -65,14 +65,16 @@ def _enriquecer_nota(nota: NFeBuscadaMetadata) -> dict:
         numero_nf = extrair_numero_da_chave(nota.chave_acesso)
         serie = extrair_serie_da_chave(nota.chave_acesso)
         modelo = extrair_modelo_da_chave(nota.chave_acesso)
-        tipo_nf = modelo_to_tipo_nf(modelo, nota.tipo_operacao)
+        # Usar apenas o tipo base (sem operação) para compatibilidade com o frontend
+        tipo_nf_completo = modelo_to_tipo_nf(modelo, nota.tipo_operacao)
+        tipo_nf = tipo_nf_completo.split(" ")[0]  # "NFe Entrada" → "NFe"
         id_nota = gerar_id_from_chave(nota.chave_acesso)
     except (ValueError, IndexError) as e:
         logger.warning(f"⚠️ Erro ao extrair dados da chave {nota.chave_acesso}: {e}")
         # Fallback para valores padrão
         numero_nf = "N/A"
         serie = "N/A"
-        tipo_nf = f"NFe {nota.tipo_operacao.capitalize()}"
+        tipo_nf = "NFe"
         id_nota = nota.chave_acesso[-12:]
 
     return {
