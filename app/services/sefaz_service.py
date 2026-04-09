@@ -1628,6 +1628,7 @@ class SefazService:
                     ambiente_utilizado = ambiente_consulta
                     nsu_consulta = ultimo_nsu_local
                     pagina = 0
+                    ambiente_teve_erro = False
 
                     while pagina < MAX_PAGINAS_SYNC:
                         pagina += 1
@@ -1637,13 +1638,22 @@ class SefazService:
                             nsu_consulta,
                             ambiente=ambiente_consulta,
                         )
-                        xml_response = self._enviar_distribuicao_dfe(
-                            self._obter_url_distribuicao(ambiente_consulta),
-                            xml_request,
-                            cert_bytes,
-                            senha_cert,
-                        )
-                        distribuicao = self._parsear_resposta_distribuicao(xml_response)
+                        try:
+                            xml_response = self._enviar_distribuicao_dfe(
+                                self._obter_url_distribuicao(ambiente_consulta),
+                                xml_request,
+                                cert_bytes,
+                                senha_cert,
+                            )
+                            distribuicao = self._parsear_resposta_distribuicao(xml_response)
+                        except Exception as req_exc:
+                            logger.warning(
+                                "[SYNC SEFAZ] Erro no ambiente %s (tentando próximo): %s",
+                                ambiente_consulta,
+                                req_exc,
+                            )
+                            ambiente_teve_erro = True
+                            break
 
                         if distribuicao.status_codigo == "589" and nsu_consulta > 0:
                             logger.warning(
@@ -1656,6 +1666,18 @@ class SefazService:
                             pagina = 0
                             continue
 
+                        # Códigos de erro SEFAZ — tentar próximo ambiente
+                        if distribuicao.status_codigo not in {"137", "138"}:
+                            logger.warning(
+                                "[SYNC SEFAZ] Ambiente %s retornou cStat %s (%s) — "
+                                "tentando próximo ambiente.",
+                                ambiente_consulta,
+                                distribuicao.status_codigo,
+                                distribuicao.motivo,
+                            )
+                            ambiente_teve_erro = True
+                            break
+
                         # Persistir batch atual (deduplicação via upsert por chave_acesso)
                         if distribuicao.notas_encontradas:
                             batch = self._persistir_notas_distribuicao(
@@ -1665,24 +1687,25 @@ class SefazService:
                             novas_notas += batch
                             logger.info(
                                 "[SYNC SEFAZ] Página %d: %d notas salvas "
-                                "(NSU %d → %d / max %d, empresa %s)",
+                                "(NSU %d → %d / max %d, empresa %s, ambiente %s)",
                                 pagina,
                                 batch,
                                 nsu_consulta,
                                 distribuicao.ultimo_nsu,
                                 distribuicao.max_nsu,
                                 empresa_id,
+                                ambiente_consulta,
                             )
 
-                        # Sem mais páginas — encerrar
+                        # Sem mais páginas — encerrar paginação
                         if distribuicao.status_codigo == "137" or not distribuicao.tem_mais_notas:
                             break
 
                         # Avançar para a próxima página
                         nsu_consulta = distribuicao.ultimo_nsu
 
-                    # Se obtivemos uma resposta válida neste ambiente, não tentar outros
-                    if distribuicao is not None and distribuicao.status_codigo != "137":
+                    # Parar de tentar ambientes só se teve sucesso real (138)
+                    if not ambiente_teve_erro and distribuicao is not None and distribuicao.status_codigo in {"137", "138"}:
                         break
 
                 if distribuicao is None or xml_response is None:
