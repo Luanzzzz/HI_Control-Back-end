@@ -1209,9 +1209,14 @@ class SefazService:
         xml_distribuicao: str,
         cert_bytes: bytes,
         senha_cert: str,
+        timeout_seconds: int = 15,
+        max_retries: int = 0,
     ) -> str:
         """
         Envia o envelope de distribuicao ao Ambiente Nacional usando mTLS.
+
+        timeout_seconds: tempo máximo por requisição (padrão 15s para sync na Vercel).
+        max_retries: tentativas extras em caso de 5xx (padrão 0 — fail-fast no sync).
         """
         import requests
         from requests.adapters import HTTPAdapter
@@ -1238,7 +1243,7 @@ class SefazService:
             key_pem_file.close()
 
             retry_strategy = Retry(
-                total=RETRY_ATTEMPTS,
+                total=max_retries,
                 backoff_factor=RETRY_BACKOFF,
                 status_forcelist=[429, 500, 502, 503, 504],
                 allowed_methods=["POST"],
@@ -1259,7 +1264,7 @@ class SefazService:
                 url,
                 data=envelope.encode("utf-8"),
                 headers=headers,
-                timeout=TIMEOUT_SEFAZ,
+                timeout=timeout_seconds,
                 verify=True,
                 cert=(cert_pem_path, key_pem_path),
             )
@@ -1269,7 +1274,7 @@ class SefazService:
         except requests.Timeout as exc:
             raise SefazTimeoutError(
                 "999",
-                f"Timeout ao consultar distribuicao DF-e ({TIMEOUT_SEFAZ}s)",
+                f"Timeout ao consultar distribuicao DF-e ({timeout_seconds}s)",
             ) from exc
         except requests.exceptions.SSLError as exc:
             raise SefazAuthorizationError(
@@ -1623,6 +1628,10 @@ class SefazService:
                 novas_notas = 0
                 # Limite de segurança: evita loop infinito (200 páginas × ~50 notas = ~10k notas)
                 MAX_PAGINAS_SYNC = 200
+                # Orçamento de tempo para caber dentro do maxDuration da Vercel (60s)
+                # Reserva 10s para processar a resposta do banco após o sync.
+                TEMPO_MAX_SYNC_SEGUNDOS = 45
+                inicio_sync = datetime.now()
 
                 for ambiente_consulta in self._ambientes_consulta_distribuicao():
                     ambiente_utilizado = ambiente_consulta
@@ -1631,6 +1640,19 @@ class SefazService:
                     ambiente_teve_erro = False
 
                     while pagina < MAX_PAGINAS_SYNC:
+                        # Para o sync se o orçamento de tempo estiver esgotado
+                        tempo_decorrido = (datetime.now() - inicio_sync).total_seconds()
+                        if tempo_decorrido >= TEMPO_MAX_SYNC_SEGUNDOS:
+                            logger.warning(
+                                "[SYNC SEFAZ] Orçamento de tempo atingido (%.1fs >= %ds) "
+                                "— parando sync após %d páginas. Empresa %s.",
+                                tempo_decorrido,
+                                TEMPO_MAX_SYNC_SEGUNDOS,
+                                pagina,
+                                empresa_id,
+                            )
+                            break
+
                         pagina += 1
                         xml_request = self._construir_xml_distribuicao(
                             cnpj,
@@ -1644,6 +1666,8 @@ class SefazService:
                                 xml_request,
                                 cert_bytes,
                                 senha_cert,
+                                timeout_seconds=15,
+                                max_retries=0,
                             )
                             distribuicao = self._parsear_resposta_distribuicao(xml_response)
                         except Exception as req_exc:

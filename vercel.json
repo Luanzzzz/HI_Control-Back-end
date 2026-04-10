@@ -10,6 +10,11 @@
       }
     }
   ],
+  "functions": {
+    "app/main.py": {
+      "maxDuration": 60
+    }
+  },
   "rewrites": [
     {
       "source": "/api/v1/:path*",
