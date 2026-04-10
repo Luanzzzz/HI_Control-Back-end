@@ -242,7 +242,7 @@ class NFSeNacionalService:
     async def emitir_nfse(
         self,
         dps_xml: str,
-        cert_path: str,
+        cert_bytes: bytes,
         cert_password: str,
         ambiente: str = "homologacao",
         empresa_id: Optional[str] = None
@@ -284,18 +284,14 @@ class NFSeNacionalService:
         logger.info(f"Emitindo NFS-e Nacional via {base_url}")
 
         try:
-            # CORREÇÃO SSL: Converter PFX para PEM para mTLS
+            # Converter PFX (bytes) → PEM para mTLS
             # httpx.AsyncClient exige certificado em formato PEM, não PFX
             from app.services.certificado_service import certificado_service
             import tempfile
             import os as os_module
 
-            # Ler arquivo PFX
-            with open(cert_path, 'rb') as f:
-                pfx_bytes = f.read()
-
-            # Converter PFX → PEM
-            cert_pem, key_pem = certificado_service.pfx_para_pem(pfx_bytes, cert_password)
+            # Converter PFX bytes → PEM
+            cert_pem, key_pem = certificado_service.pfx_para_pem(cert_bytes, cert_password)
 
             # Criar arquivos temporários PEM
             cert_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
@@ -495,7 +491,7 @@ class NFSeNacionalService:
     async def consultar_nfse_por_chave(
         self,
         chave_acesso: str,
-        cert_path: str,
+        cert_bytes: bytes,
         cert_password: str,
         ambiente: str = "homologacao"
     ) -> Dict[str, Any]:
@@ -521,15 +517,11 @@ class NFSeNacionalService:
         logger.info(f"Consultando NFS-e chave {chave_acesso}")
 
         try:
-            # CORREÇÃO SSL: Converter PFX para PEM
             from app.services.certificado_service import certificado_service
             import tempfile
             import os as os_module
 
-            with open(cert_path, 'rb') as f:
-                pfx_bytes = f.read()
-
-            cert_pem, key_pem = certificado_service.pfx_para_pem(pfx_bytes, cert_password)
+            cert_pem, key_pem = certificado_service.pfx_para_pem(cert_bytes, cert_password)
 
             cert_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
             key_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
@@ -604,7 +596,7 @@ class NFSeNacionalService:
         self,
         chave_acesso: str,
         motivo: str,
-        cert_path: str,
+        cert_bytes: bytes,
         cert_password: str,
         ambiente: str = "homologacao"
     ) -> Dict[str, Any]:
@@ -665,15 +657,11 @@ class NFSeNacionalService:
         evento_xml = self._montar_evento_cancelamento(chave_acesso, motivo)
 
         try:
-            # CORREÇÃO SSL: Converter PFX para PEM
             from app.services.certificado_service import certificado_service
             import tempfile
             import os as os_module
 
-            with open(cert_path, 'rb') as f:
-                pfx_bytes = f.read()
-
-            cert_pem, key_pem = certificado_service.pfx_para_pem(pfx_bytes, cert_password)
+            cert_pem, key_pem = certificado_service.pfx_para_pem(cert_bytes, cert_password)
 
             cert_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
             key_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
@@ -718,7 +706,7 @@ class NFSeNacionalService:
                         # Endpoint não encontrado - tentar URL alternativa
                         logger.warning("Endpoint /evento não encontrado, tentando /cancelar")
                         return await self._tentar_cancelamento_alternativo(
-                            chave_acesso, motivo, cert_path, cert_password, base_url
+                            chave_acesso, motivo, cert_bytes, cert_password, base_url
                         )
 
                     else:
@@ -752,7 +740,7 @@ class NFSeNacionalService:
         self,
         chave_acesso: str,
         motivo: str,
-        cert_path: str,
+        cert_bytes: bytes,
         cert_password: str,
         base_url: str
     ) -> Dict[str, Any]:
@@ -764,15 +752,11 @@ class NFSeNacionalService:
         }
 
         try:
-            # CORREÇÃO SSL: Converter PFX para PEM
             from app.services.certificado_service import certificado_service
             import tempfile
             import os as os_module
 
-            with open(cert_path, 'rb') as f:
-                pfx_bytes = f.read()
-
-            cert_pem, key_pem = certificado_service.pfx_para_pem(pfx_bytes, cert_password)
+            cert_pem, key_pem = certificado_service.pfx_para_pem(cert_bytes, cert_password)
 
             cert_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
             key_pem_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')

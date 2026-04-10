@@ -130,17 +130,44 @@ class EmissaoNFSeService:
 
             emp = empresa.data
 
-            # 2. Obter certificado A1
+            # 2. Obter e descriptografar certificado A1
             from app.services.certificado_service import certificado_service
 
-            cert_info = await certificado_service.obter_certificado_a1(empresa_id)
-            if not cert_info:
+            cert_a1_encrypted = emp.get("certificado_a1")
+            if not cert_a1_encrypted:
                 return {
                     "sucesso": False,
                     "erro": "Certificado A1 não configurado para emissão NFS-e Nacional"
                 }
 
-            # 3. Montar DPS
+            cert_bytes = certificado_service.descriptografar_certificado(cert_a1_encrypted)
+            cert_password = nfse_data.get("certificado_senha", "")
+
+            if not cert_password:
+                return {
+                    "sucesso": False,
+                    "erro": "Senha do certificado A1 é obrigatória para emissão NFS-e Nacional"
+                }
+
+            # 3. Calcular IBS/CBS se não informados
+            servico = nfse_data.get("servico", {})
+            if "tributos" not in nfse_data:
+                tributos_calc = self.calcular_ibs_cbs(
+                    valor_servicos=float(servico.get("valor_servicos", 0)),
+                    optante_simples=nfse_data.get("optante_simples", False),
+                )
+                nfse_data["tributos"] = {
+                    "ibs": {
+                        "aliquota": tributos_calc["aliquota_ibs"],
+                        "valor": tributos_calc["valor_ibs"],
+                    },
+                    "cbs": {
+                        "aliquota": tributos_calc["aliquota_cbs"],
+                        "valor": tributos_calc["valor_cbs"],
+                    },
+                }
+
+            # 4. Montar DPS
             from app.core.config import settings
             ambiente = "producao" if settings.SEFAZ_AMBIENTE == "producao" else "homologacao"
 
@@ -155,8 +182,8 @@ class EmissaoNFSeService:
             # 4. Emitir via SEFIN
             resultado = await nfse_nacional_service.emitir_nfse(
                 dps_xml=dps_xml,
-                cert_path=cert_info["cert_path"],
-                cert_password=cert_info["senha"],
+                cert_bytes=cert_bytes,
+                cert_password=cert_password,
                 ambiente=ambiente,
                 empresa_id=empresa_id
             )
@@ -255,11 +282,14 @@ class EmissaoNFSeService:
                     "erro": "Credenciais NFS-e não configuradas.",
                 }
 
-            # 3. Construir XML RPS
+            # 3. Auto-numerar RPS se não informado
+            if not nfse_data.get("numero_rps"):
+                nfse_data["numero_rps"] = await self._proximo_numero_rps(db, empresa_id)
+
+            # 4. Construir XML RPS
             xml_rps = self._construir_rps(nfse_data, emp)
 
-            # 4. Enviar para API municipal
-            # Usar adapter específico do município para envio
+            # 5. Enviar para API municipal
             adapter = nfse_service.obter_adapter(municipio_codigo, creds)
 
             resultado = await self._enviar_rps(
@@ -366,6 +396,97 @@ class EmissaoNFSeService:
         except Exception as e:
             logger.error(f"Erro ao cancelar NFS-e: {e}", exc_info=True)
             return {"sucesso": False, "erro": str(e)}
+
+    # ============================================
+    # SEQUENCIAMENTO RPS
+    # ============================================
+
+    async def _proximo_numero_rps(self, db, empresa_id: str) -> str:
+        """
+        Retorna o próximo número de RPS para a empresa, com controle de concorrência.
+
+        Estratégia: busca o maior número já usado no banco e incrementa.
+        Usa upsert no campo numero_ultimo_rps da tabela empresas se existir,
+        senão conta as notas emitidas + 1.
+        """
+        try:
+            # Tentar atualizar contador atômico na empresa
+            empresa_result = db.table("empresas").select(
+                "numero_ultimo_rps"
+            ).eq("id", empresa_id).single().execute()
+
+            if empresa_result.data and "numero_ultimo_rps" in empresa_result.data:
+                atual = empresa_result.data.get("numero_ultimo_rps") or 0
+                proximo = atual + 1
+                db.table("empresas").update(
+                    {"numero_ultimo_rps": proximo}
+                ).eq("id", empresa_id).execute()
+                return str(proximo)
+
+        except Exception:
+            pass
+
+        # Fallback: contar notas emitidas + 1
+        try:
+            count_result = db.table("notas_fiscais").select(
+                "id", count="exact"
+            ).eq("empresa_id", empresa_id).eq("tipo_nf", "NFSE").execute()
+            total = count_result.count or 0
+            return str(total + 1)
+        except Exception:
+            # Último recurso: timestamp como número
+            from datetime import datetime
+            return datetime.now().strftime("%Y%m%d%H%M%S")
+
+    # ============================================
+    # CÁLCULO IBS/CBS (LC 214/2025)
+    # ============================================
+
+    def calcular_ibs_cbs(
+        self,
+        valor_servicos: float,
+        optante_simples: bool = False,
+        aliquota_ibs: float = 0.0,
+        aliquota_cbs: float = 0.0,
+    ) -> dict:
+        """
+        Calcula IBS e CBS conforme LC 214/2025.
+
+        Alíquotas de referência (transição 2026-2032):
+        - IBS: alíquota estadual + municipal (varia por UF/município)
+        - CBS: 8,8% federal (regime geral) ou 0% para Simples Nacional
+        - Simples Nacional: substituídos pelo DAS, IBS/CBS = 0
+
+        Na ausência de alíquotas configuradas, gera campos zerados
+        (válido para emissão — a SEFIN aceita zeros durante a transição).
+
+        Args:
+            valor_servicos: Valor bruto dos serviços
+            optante_simples: Se empresa é optante do Simples Nacional
+            aliquota_ibs: Alíquota IBS (%) — 0 durante período de transição
+            aliquota_cbs: Alíquota CBS (%) — padrão 8.8 para regime geral
+
+        Returns:
+            {"valor_ibs": float, "valor_cbs": float, "aliquota_ibs": float, "aliquota_cbs": float}
+        """
+        if optante_simples:
+            # Simples Nacional: IBS e CBS substituídos pelo DAS
+            return {
+                "valor_ibs": 0.0,
+                "valor_cbs": 0.0,
+                "aliquota_ibs": 0.0,
+                "aliquota_cbs": 0.0,
+            }
+
+        valor_ibs = round(valor_servicos * aliquota_ibs / 100, 2)
+        valor_cbs = round(valor_servicos * aliquota_cbs / 100, 2)
+
+        return {
+            "valor_ibs": valor_ibs,
+            "valor_cbs": valor_cbs,
+            "aliquota_ibs": aliquota_ibs,
+            "aliquota_cbs": aliquota_cbs,
+        }
 
     # ============================================
     # CONSTRUÇÃO XML

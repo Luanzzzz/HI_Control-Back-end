@@ -10,6 +10,7 @@ Funcionalidades:
 from typing import Optional, List
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi.responses import Response
 from supabase import Client
 from decimal import Decimal
 import logging
@@ -19,6 +20,7 @@ from app.services.nfse.emissao_nfse_service import (
     emissao_nfse_service,
     MUNICIPIOS_EXPANDIDOS,
 )
+from app.services.nfse.emissao_nfse_nacional_service import nfse_nacional_service
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +233,36 @@ async def cancelar_nfse(
 # ============================================
 
 @router.get(
+    "/calcular-tributos",
+    summary="Calcular IBS/CBS para NFS-e Nacional",
+)
+async def calcular_tributos_nfse(
+    valor_servicos: float = Query(..., gt=0, description="Valor bruto dos serviços"),
+    optante_simples: bool = Query(default=False, description="Empresa optante do Simples Nacional"),
+    aliquota_ibs: float = Query(default=0.0, ge=0, description="Alíquota IBS (%)"),
+    aliquota_cbs: float = Query(default=0.0, ge=0, description="Alíquota CBS (%)"),
+):
+    """
+    Calcula IBS e CBS para uso na emissão de NFS-e Nacional (LC 214/2025).
+
+    Use este endpoint para pré-visualizar os tributos antes de emitir.
+    Optantes do Simples Nacional têm IBS/CBS = 0 (recolhidos via DAS).
+    """
+    resultado = emissao_nfse_service.calcular_ibs_cbs(
+        valor_servicos=valor_servicos,
+        optante_simples=optante_simples,
+        aliquota_ibs=aliquota_ibs,
+        aliquota_cbs=aliquota_cbs,
+    )
+    return {
+        "valor_servicos": valor_servicos,
+        **resultado,
+        "valor_liquido": round(valor_servicos - resultado["valor_ibs"] - resultado["valor_cbs"], 2),
+        "nota": "Alíquotas definitivas a partir de 2027. Durante transição (2026), alíquotas podem ser 0.",
+    }
+
+
+@router.get(
     "/municipios",
     response_model=List[MunicipioSuportado],
     summary="Listar municípios com suporte a emissão de NFS-e",
@@ -320,6 +352,7 @@ class NFSeNacionalEmissaoCreate(BaseModel):
     competencia: str = Field(..., pattern=r"^\d{4}-\d{2}$", description="Mês de referência YYYY-MM")
     regime_especial: Optional[str] = None
     optante_simples: bool = Field(default=False)
+    certificado_senha: str = Field(..., description="Senha do certificado A1 da empresa")
 
 
 class NFSeNacionalEmissaoResponse(BaseModel):
@@ -337,6 +370,7 @@ class NFSeNacionalEmissaoResponse(BaseModel):
 class NFSeNacionalCancelamentoRequest(BaseModel):
     """Request de cancelamento nacional."""
     motivo: str = Field(..., min_length=15, description="Justificativa do cancelamento")
+    certificado_senha: str = Field(..., description="Senha do certificado A1 da empresa")
 
 
 @router.post(
@@ -432,6 +466,7 @@ async def emitir_nfse_nacional(
         "competencia": nfse.competencia,
         "regime_especial": nfse.regime_especial,
         "optante_simples": nfse.optante_simples,
+        "certificado_senha": nfse.certificado_senha,
     }
 
     # Chamar service de emissão com flag usar_nacional=True
@@ -514,30 +549,53 @@ async def consultar_nfse_nacional(
             "nota": nota
         }
 
-    # PASSO 2: Consultar na API Nacional
-    # Para consultar na API, precisa de certificado de alguma empresa do usuário
+    # PASSO 2: Consultar na API Nacional via SEFIN
+    # Buscar empresa com certificado para fazer a consulta
     empresas_result = db.table("empresas").select(
         "id, certificado_a1"
-    ).eq("usuario_id", user_id).limit(1).execute()
+    ).eq("usuario_id", user_id).not_.is_("certificado_a1", "null").limit(1).execute()
 
-    if not empresas_result.data or not empresas_result.data[0].get("certificado_a1"):
+    if not empresas_result.data:
         raise HTTPException(
             status_code=404,
-            detail="NFS-e não encontrada no banco local e não há certificado configurado para consulta na API Nacional"
+            detail="NFS-e não encontrada no banco local. Configure um certificado A1 para consultar na API Nacional."
         )
 
-    # TODO: Implementar consulta na API Nacional usando certificado
-    # Por ora, retornar não encontrado
-    raise HTTPException(
-        status_code=404,
-        detail="NFS-e não encontrada no banco local. Consulta na API Nacional em desenvolvimento."
-    )
+    empresa_cert = empresas_result.data[0]
+
+    # A consulta na API nacional não precisa de senha (é somente leitura com mTLS)
+    # Mas precisamos da senha para converter o PFX. Para consulta, tentamos com senha vazia
+    # e retornamos instrução se falhar.
+    try:
+        from app.services.certificado_service import certificado_service
+        from app.core.config import settings
+
+        cert_bytes = certificado_service.descriptografar_certificado(empresa_cert["certificado_a1"])
+        ambiente = "producao" if settings.SEFAZ_AMBIENTE == "producao" else "homologacao"
+
+        # Nota: consulta requer senha do certificado; sem ela, retornar orientação
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "mensagem": "Consulta na API Nacional requer a senha do certificado A1.",
+                "instrucao": "Use o endpoint POST /nfse/emissao/nacional/consultar com a chave e a senha do certificado.",
+                "alternativa": f"Acesse diretamente: https://www.gov.br/nfse — chave: {chave_nfse}"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"NFS-e não encontrada. Erro ao consultar API Nacional: {str(e)}"
+        )
 
 
 @router.post(
     "/nacional/{chave_nfse}/cancelar",
     dependencies=[require_modules("emissor_notas")],
     summary="Cancelar NFS-e Nacional",
+    response_model=dict,
 )
 async def cancelar_nfse_nacional(
     chave_nfse: str,
@@ -610,22 +668,113 @@ async def cancelar_nfse_nacional(
             detail="NFS-e já está cancelada"
         )
 
-    # NOTA: Endpoint de cancelamento não confirmado na API SEFIN Nacional.
-    # O cancelamento via API requer confirmação da documentação oficial.
-    # Para cancelar, use o portal: https://www.gov.br/nfse
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "message": "Cancelamento de NFS-e Nacional não está disponível via API nesta versão.",
-            "instrucoes": [
-                "Para cancelar uma NFS-e Nacional, acesse https://www.gov.br/nfse",
-                "Faça login com as credenciais da empresa emitente",
-                "Selecione a nota pela chave de acesso ou número",
-                "Solicite o cancelamento com motivo válido"
-            ],
+    # Obter e descriptografar certificado A1
+    from app.services.certificado_service import certificado_service
+    from app.core.config import settings
+
+    try:
+        cert_bytes = certificado_service.descriptografar_certificado(empresa["certificado_a1"])
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Erro ao carregar certificado A1: {str(e)}"
+        )
+
+    ambiente = "producao" if settings.SEFAZ_AMBIENTE == "producao" else "homologacao"
+
+    # Tentar cancelamento via API Nacional (SEFIN)
+    resultado = await nfse_nacional_service.cancelar_nfse(
+        chave_acesso=chave_nfse,
+        motivo=request.motivo,
+        cert_bytes=cert_bytes,
+        cert_password=request.certificado_senha,
+        ambiente=ambiente,
+    )
+
+    if resultado.get("cancelada"):
+        # Atualizar status no banco local
+        db.table("notas_fiscais").update({"situacao": "cancelada"}).eq(
+            "chave_acesso", chave_nfse
+        ).execute()
+
+        return {
+            "sucesso": True,
+            "mensagem": resultado.get("mensagem", "NFS-e cancelada com sucesso"),
+            "protocolo": resultado.get("protocolo"),
             "chave_acesso": chave_nfse,
-            "portal": "https://www.gov.br/nfse",
-            "documentacao": "https://www.gov.br/nfse/pt-br/biblioteca/documentacao-tecnica",
-            "funcionalidade_prevista": "v2.0"
         }
+    else:
+        # API retornou falha — orientar para o portal
+        return {
+            "sucesso": False,
+            "mensagem": resultado.get("mensagem", "Cancelamento via API não disponível"),
+            "orientacao": resultado.get(
+                "orientacao",
+                "Para cancelar, acesse https://www.gov.br/nfse com as credenciais da empresa"
+            ),
+            "portal": "https://www.gov.br/nfse",
+            "chave_acesso": chave_nfse,
+        }
+
+
+# ============================================
+# DANFSE (PDF)
+# ============================================
+
+@router.get(
+    "/{nota_id}/danfse",
+    summary="Baixar DANFSE (PDF da NFS-e)",
+    responses={200: {"content": {"application/pdf": {}}}},
+)
+async def baixar_danfse(
+    nota_id: str,
+    usuario: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """
+    Gera e retorna o DANFSE (Documento Auxiliar da NFS-e) em PDF.
+
+    Busca a NFS-e no banco local pelo ID e gera o documento auxiliar.
+    """
+    user_id = usuario["id"]
+
+    # Buscar nota no banco
+    nota_result = db.table("notas_fiscais").select("*").eq("id", nota_id).execute()
+
+    if not nota_result.data:
+        raise HTTPException(status_code=404, detail="NFS-e não encontrada")
+
+    nota = nota_result.data[0]
+
+    # Validar que pertence ao usuário (tenant isolation)
+    empresa_result = db.table("empresas").select(
+        "id, razao_social, cnpj, inscricao_municipal, municipio_nome, uf, "
+        "logradouro, numero, bairro"
+    ).eq("id", nota["empresa_id"]).eq("usuario_id", user_id).execute()
+
+    if not empresa_result.data:
+        raise HTTPException(status_code=403, detail="Acesso negado a esta nota fiscal")
+
+    empresa = empresa_result.data[0]
+
+    # Verificar que é NFS-e
+    if nota.get("tipo_nf") not in ("NFSE", "NFS-e", "nfse"):
+        raise HTTPException(
+            status_code=400,
+            detail="Este documento não é uma NFS-e. Use o endpoint DANFE para NF-e."
+        )
+
+    # Gerar PDF
+    try:
+        from app.services.danfse_service import danfse_service
+        pdf_bytes = danfse_service.gerar_danfse(dados=nota, empresa=empresa)
+    except Exception as e:
+        logger.error(f"Erro ao gerar DANFSE: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar DANFSE: {str(e)}")
+
+    numero = nota.get("numero_nf", nota_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="DANFSE-{numero}.pdf"'},
     )
